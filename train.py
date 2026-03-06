@@ -467,6 +467,8 @@ def train(cfg, args):
             writer.add_scalar("loss/l1_refined", loss_dict["l1_refined"], step)
             writer.add_scalar("loss/perceptual", loss_dict["perceptual"], step)
             writer.add_scalar("loss/style", loss_dict["style"], step)
+            if hasattr(model.generator, "refinement_gate"):
+                writer.add_scalar("model/refinement_gate", torch.sigmoid(model.generator.refinement_gate).item(), step)
             opt_step = (step + 1) // grad_accum
             lr = get_lr(opt_step, warmup_steps, total_steps // grad_accum, max_lr, min_lr)
             writer.add_scalar("lr", lr, step)

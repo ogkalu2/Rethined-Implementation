@@ -114,6 +114,8 @@ class PatchInpainting(nn.Module):
         final_conv: bool = False,
         mask_inpainting: bool = True,
         use_argmax: bool = False,
+        residual_refinement: bool = True,
+        refinement_gate_init: float = -2.0,
         model,
     ):
         self.cross_attention = cross_attention
@@ -130,13 +132,15 @@ class PatchInpainting(nn.Module):
         self.final_conv = final_conv
         self.mask_inpainting = mask_inpainting
         self.use_argmax = use_argmax
+        self.use_residual_refinement = residual_refinement
         super().__init__()
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.pooling_layer = nn.MaxPool2d(kernel_size, stride=kernel_size)
+        self.patch_value_dim = stem_out_channels * kernel_size * kernel_size
         self.multihead_attention = MultiHeadAttention(
-            embed_dim=stem_out_channels * kernel_size * kernel_size + self.feature_dim if self.concat_features else stem_out_channels * kernel_size * kernel_size,
-            d_v=stem_out_channels * kernel_size * kernel_size,
+            embed_dim=self.patch_value_dim + self.feature_dim if self.concat_features else self.patch_value_dim,
+            d_v=self.patch_value_dim,
             n_head=self.nheads,
             split=True, dropout=dropout, d_qk=embed_dim, compute_v=compute_v, use_argmax=self.use_argmax
         )
@@ -155,12 +159,12 @@ class PatchInpainting(nn.Module):
             1, self.kernel_size ** 2 * stem_out_channels + self.feature_dim,
             int((image_size / stem_out_stride / self.kernel_size) ** 2)
         )) if use_kpos or use_qpos else None
-        self.final_conv = torch.nn.Sequential(
-            nn.Conv2d(stem_out_channels * kernel_size * kernel_size,
-                      stem_out_channels * kernel_size * kernel_size,
-                      kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-            torch.nn.Sigmoid()
+        self.patch_delta_mixer = torch.nn.Sequential(
+            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+            nn.GELU(),
+            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
         ) if self.final_conv else None
+        self.refinement_gate = nn.Parameter(torch.tensor(refinement_gate_init, dtype=torch.float32))
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -213,13 +217,6 @@ class PatchInpainting(nn.Module):
         n_w = output_size[1] // kernel_size
         B = patches.shape[0]
 
-        if use_final_conv and self.final_conv:
-            # patches: (B, n_h*n_w, C*k*k) -> (B, C*k*k, n_h, n_w)
-            patches = patches.transpose(1, 2).view(B, -1, n_h, n_w)
-            patches = self.final_conv(patches)
-            # (B, C*k*k, n_h, n_w) -> (B, n_h*n_w, C*k*k)
-            patches = patches.view(B, -1, n_h * n_w).transpose(1, 2)
-
         # patches: (B, n_h*n_w, C*k*k)
         C = patches.shape[2] // (kernel_size * kernel_size)
         # -> (B, n_h, n_w, C, k, k) -> (B, C, n_h, k, n_w, k) -> (B, C, H, W)
@@ -227,6 +224,19 @@ class PatchInpainting(nn.Module):
         patches = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
         final_image = patches.view(B, C, n_h * kernel_size, n_w * kernel_size)
         return final_image
+
+    def mix_patch_tokens(self, patches: torch.Tensor, output_size) -> torch.Tensor:
+        """Apply a lightweight learned mixer in patch-token space."""
+        if self.patch_delta_mixer is None:
+            return patches
+
+        n_h = output_size[0] // self.kernel_size
+        n_w = output_size[1] // self.kernel_size
+        B = patches.shape[0]
+
+        patches_2d = patches.transpose(1, 2).view(B, -1, n_h, n_w)
+        patches_2d = self.patch_delta_mixer(patches_2d)
+        return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
 
     def forward(self, image, mask):
         image_coarse_inpainting, features = self.encoder_decoder(image)
@@ -271,13 +281,21 @@ class PatchInpainting(nn.Module):
             image_as_patches, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
         )
 
-        out = out + blurred_flat
+        patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
+        if self.use_residual_refinement:
+            delta_hf = out - image_as_patches
+            delta_hf = self.mix_patch_tokens(delta_hf, sizes)
+            delta_hf = torch.tanh(delta_hf)
+            refinement_gate = torch.sigmoid(self.refinement_gate)
+            refined_hf = image_as_patches + patch_mask * refinement_gate * delta_hf
+            out = refined_hf + blurred_flat
+        else:
+            out = out + blurred_flat
 
-        mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        out = out * mask + full_patches_flat * (1 - mask)
+        out = out * patch_mask + full_patches_flat * (1 - patch_mask)
 
         # V2: Use native fold
-        out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=True)
+        out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
 
         return out, atten_weights, image_to_return
 
