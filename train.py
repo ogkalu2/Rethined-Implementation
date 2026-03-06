@@ -65,6 +65,11 @@ def save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, path):
     }, path)
 
 
+def composite_with_known(pred, target, mask):
+    """Preserve known pixels exactly and only use predictions inside the hole."""
+    return pred * mask + target * (1 - mask)
+
+
 def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, extra=None):
     """Write training status to JSON file for remote monitoring."""
     elapsed = time.time() - start_time
@@ -136,6 +141,8 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
         "masked_l1_refined": [],
         "valid_l1_coarse": [],
         "valid_l1_refined": [],
+        "raw_valid_l1_coarse": [],
+        "raw_valid_l1_refined": [],
         "refined_better_flags": [],
         "masked_delta_mean": [],
     }
@@ -149,10 +156,12 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
         masked_image = batch["masked_image"].to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            refined, _, coarse = model(masked_image, mask)
+            refined_raw, _, coarse_raw = model(masked_image, mask)
 
-        refined = refined.clamp(0, 1)
-        coarse = coarse.clamp(0, 1)
+        refined_raw = refined_raw.clamp(0, 1)
+        coarse_raw = coarse_raw.clamp(0, 1)
+        refined = composite_with_known(refined_raw, image, mask)
+        coarse = composite_with_known(coarse_raw, image, mask)
         valid_mask = 1 - mask
 
         hole_denom = (mask.sum(dim=(1, 2, 3)) * image.shape[1]).clamp_min(1e-8)
@@ -162,12 +171,16 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
         refined_hole = (torch.abs(refined - image) * mask).sum(dim=(1, 2, 3)) / hole_denom
         coarse_valid = (torch.abs(coarse - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
         refined_valid = (torch.abs(refined - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
+        raw_coarse_valid = (torch.abs(coarse_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
+        raw_refined_valid = (torch.abs(refined_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
         masked_delta = (torch.abs(refined - coarse) * mask).sum(dim=(1, 2, 3)) / hole_denom
 
         stats["masked_l1_coarse"].extend(coarse_hole.detach().cpu().tolist())
         stats["masked_l1_refined"].extend(refined_hole.detach().cpu().tolist())
         stats["valid_l1_coarse"].extend(coarse_valid.detach().cpu().tolist())
         stats["valid_l1_refined"].extend(refined_valid.detach().cpu().tolist())
+        stats["raw_valid_l1_coarse"].extend(raw_coarse_valid.detach().cpu().tolist())
+        stats["raw_valid_l1_refined"].extend(raw_refined_valid.detach().cpu().tolist())
         stats["masked_delta_mean"].extend(masked_delta.detach().cpu().tolist())
         stats["refined_better_flags"].extend((refined_hole < coarse_hole).detach().cpu().float().tolist())
 
@@ -191,11 +204,11 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
     if better_rate is not None and better_rate < 0.45:
         warnings.append("refinement_rarely_beats_coarse")
     if (
-        result["valid_l1_coarse"] is not None and
-        result["valid_l1_refined"] is not None and
-        result["valid_l1_refined"] > result["valid_l1_coarse"] * 1.1
+        result["raw_valid_l1_coarse"] is not None and
+        result["raw_valid_l1_refined"] is not None and
+        result["raw_valid_l1_refined"] > result["raw_valid_l1_coarse"] * 1.1
     ):
-        warnings.append("refinement_hurts_valid_region")
+        warnings.append("raw_refinement_hurts_valid_region")
     result["warnings"] = warnings
 
     model.train()
@@ -208,6 +221,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     writer.add_scalar("val/masked_l1_refined", health["masked_l1_refined"], step)
     writer.add_scalar("val/valid_l1_coarse", health["valid_l1_coarse"], step)
     writer.add_scalar("val/valid_l1_refined", health["valid_l1_refined"], step)
+    writer.add_scalar("val/raw_valid_l1_coarse", health["raw_valid_l1_coarse"], step)
+    writer.add_scalar("val/raw_valid_l1_refined", health["raw_valid_l1_refined"], step)
     writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
     writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
     writer.add_scalar("val/masked_delta_mean", health["masked_delta_mean"], step)
@@ -231,7 +246,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"gain={health['refinement_gain_pct']:.2f}%, "
         f"better_rate={health['refined_better_rate']:.2f}, "
         f"valid coarse={health['valid_l1_coarse']:.4f}, "
-        f"valid refined={health['valid_l1_refined']:.4f}{warning_suffix}"
+        f"valid refined={health['valid_l1_refined']:.4f}, "
+        f"raw valid refined={health['raw_valid_l1_refined']:.4f}{warning_suffix}"
     )
 
 
@@ -348,7 +364,9 @@ def train(cfg, args):
 
         # Forward
         with torch.amp.autocast("cuda", enabled=use_amp):
-            refined, attn, coarse = model(masked_image, mask)
+            refined_raw, attn, coarse_raw = model(masked_image, mask)
+            coarse = composite_with_known(coarse_raw, image, mask)
+            refined = composite_with_known(refined_raw, image, mask)
             loss, loss_dict = criterion(coarse, refined, image, mask)
             loss = loss / grad_accum
 
