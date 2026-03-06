@@ -115,7 +115,7 @@ class PatchInpainting(nn.Module):
         mask_inpainting: bool = True,
         use_argmax: bool = False,
         residual_refinement: bool = True,
-        refinement_gate_init: float = -2.0,
+        refinement_gate_init: float = 0.0,
         model,
     ):
         self.cross_attention = cross_attention

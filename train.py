@@ -55,14 +55,19 @@ def get_lr(step, warmup_steps, total_steps, max_lr, min_lr):
 
 def save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, path):
     """Save training checkpoint."""
-    torch.save({
-        "step": step,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scaler_state_dict": scaler.state_dict(),
-        "loss_dict": loss_dict,
-        "config": cfg,
-    }, path)
+    try:
+        torch.save({
+            "step": step,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scaler_state_dict": scaler.state_dict(),
+            "loss_dict": loss_dict,
+            "config": cfg,
+        }, path)
+        return True
+    except Exception as exc:
+        print(f"\nCheckpoint save failed at {path}: {exc}")
+        return False
 
 
 def composite_with_known(pred, target, mask):
@@ -507,20 +512,21 @@ def train(cfg, args):
 
         # Checkpoint at specific steps
         checkpoint_steps = log_cfg.get("checkpoint_steps", None)
+        save_checkpoints = log_cfg.get("save_checkpoints", True)
         should_save = False
-        if checkpoint_steps and step in checkpoint_steps:
+        if save_checkpoints and checkpoint_steps and step in checkpoint_steps:
             should_save = True
-        elif not checkpoint_steps and step > 0 and step % log_cfg["save_interval"] == 0:
+        elif save_checkpoints and not checkpoint_steps and step > 0 and step % log_cfg["save_interval"] == 0:
             should_save = True
 
         if should_save:
             ckpt_path = ckpt_dir / f"step_{step}.pth"
-            save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, ckpt_path)
-            print(f"\nSaved checkpoint: {ckpt_path}")
-            opt_step_ckpt = (step + 1) // grad_accum
-            lr_ckpt = get_lr(opt_step_ckpt, warmup_steps, total_steps // grad_accum, max_lr, min_lr)
-            write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr_ckpt, train_start_time,
-                         extra={"event": "checkpoint", "checkpoint_path": str(ckpt_path)})
+            if save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, ckpt_path):
+                print(f"\nSaved checkpoint: {ckpt_path}")
+                opt_step_ckpt = (step + 1) // grad_accum
+                lr_ckpt = get_lr(opt_step_ckpt, warmup_steps, total_steps // grad_accum, max_lr, min_lr)
+                write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr_ckpt, train_start_time,
+                             extra={"event": "checkpoint", "checkpoint_path": str(ckpt_path)})
 
             # Clean old checkpoints (keep all if using checkpoint_steps)
             if not checkpoint_steps:
@@ -531,7 +537,9 @@ def train(cfg, args):
 
     # Final checkpoint
     final_path = ckpt_dir / f"step_{total_steps}.pth"
-    save_checkpoint(model, optimizer, scaler, total_steps, loss_dict, cfg, final_path)
+    save_final_checkpoint = log_cfg.get("save_final_checkpoint", True)
+    if save_final_checkpoint:
+        save_checkpoint(model, optimizer, scaler, total_steps, loss_dict, cfg, final_path)
     final_lr = get_lr(max((total_steps + grad_accum - 1) // grad_accum, 1), warmup_steps, total_steps // grad_accum, max_lr, min_lr)
     if eval_loader is not None:
         final_health = evaluate_refinement_health(
@@ -554,7 +562,10 @@ def train(cfg, args):
             train_start_time,
             final_health,
         )
-    print(f"\nTraining complete. Final checkpoint: {final_path}")
+    if save_final_checkpoint:
+        print(f"\nTraining complete. Final checkpoint: {final_path}")
+    else:
+        print("\nTraining complete. Final checkpoint saving disabled for this run.")
     writer.close()
 
 
