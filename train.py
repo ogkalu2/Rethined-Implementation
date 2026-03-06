@@ -95,6 +95,15 @@ def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_
         json.dump(status, f, indent=2)
 
 
+def append_validation_history(log_dir, step, health):
+    """Append validation metrics to a JSONL history for later inspection."""
+    history_path = Path(log_dir) / "validation_history.jsonl"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+    row = {"step": step, **health}
+    with open(history_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+
+
 def save_vis(writer, batch, coarse, refined, step, log_dir=None):
     """Save visualization to TensorBoard and as PNG file."""
     n = min(4, batch["image"].shape[0])
@@ -193,6 +202,39 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
     return result
 
 
+def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, health):
+    """Persist validation metrics and print a compact summary."""
+    writer.add_scalar("val/masked_l1_coarse", health["masked_l1_coarse"], step)
+    writer.add_scalar("val/masked_l1_refined", health["masked_l1_refined"], step)
+    writer.add_scalar("val/valid_l1_coarse", health["valid_l1_coarse"], step)
+    writer.add_scalar("val/valid_l1_refined", health["valid_l1_refined"], step)
+    writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
+    writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
+    writer.add_scalar("val/masked_delta_mean", health["masked_delta_mean"], step)
+    write_status(
+        log_dir,
+        step,
+        total_steps,
+        loss_dict,
+        running_loss,
+        lr,
+        start_time,
+        extra={"validation": health},
+    )
+    append_validation_history(log_dir, step, health)
+
+    warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
+    print(
+        f"\nValidation step {step}: "
+        f"masked L1 coarse={health['masked_l1_coarse']:.4f}, "
+        f"refined={health['masked_l1_refined']:.4f}, "
+        f"gain={health['refinement_gain_pct']:.2f}%, "
+        f"better_rate={health['refined_better_rate']:.2f}, "
+        f"valid coarse={health['valid_l1_coarse']:.4f}, "
+        f"valid refined={health['valid_l1_refined']:.4f}{warning_suffix}"
+    )
+
+
 def train(cfg, args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -263,10 +305,15 @@ def train(cfg, args):
 
     # Logging
     log_cfg = cfg["logging"]
+    eval_interval = log_cfg.get("eval_interval", 0)
+    if args.overfit and eval_interval:
+        eval_interval = min(eval_interval, max(200, total_steps // 10))
     log_dir = Path(log_cfg["log_dir"])
     ckpt_dir = log_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer = SummaryWriter(log_dir / "tb")
+    if eval_interval:
+        print(f"Validation interval: every {eval_interval} steps")
 
     # Resume
     start_step = 0
@@ -342,16 +389,10 @@ def train(cfg, args):
             # Write status file for remote monitoring
             write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr, train_start_time)
 
-        if eval_loader is not None and step > 0 and step % log_cfg["eval_interval"] == 0:
+        if eval_loader is not None and step > 0 and step % eval_interval == 0:
             health = evaluate_refinement_health(model, eval_loader, device, use_amp, max_batches=eval_batches)
-            writer.add_scalar("val/masked_l1_coarse", health["masked_l1_coarse"], step)
-            writer.add_scalar("val/masked_l1_refined", health["masked_l1_refined"], step)
-            writer.add_scalar("val/valid_l1_coarse", health["valid_l1_coarse"], step)
-            writer.add_scalar("val/valid_l1_refined", health["valid_l1_refined"], step)
-            writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
-            writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
-            writer.add_scalar("val/masked_delta_mean", health["masked_delta_mean"], step)
-            write_status(
+            log_validation(
+                writer,
                 log_cfg["log_dir"],
                 step,
                 total_steps,
@@ -359,15 +400,7 @@ def train(cfg, args):
                 running_loss,
                 lr,
                 train_start_time,
-                extra={"validation": health},
-            )
-            warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
-            print(
-                f"\nValidation step {step}: "
-                f"masked L1 coarse={health['masked_l1_coarse']:.4f}, "
-                f"refined={health['masked_l1_refined']:.4f}, "
-                f"gain={health['refinement_gain_pct']:.2f}%, "
-                f"better_rate={health['refined_better_rate']:.2f}{warning_suffix}"
+                health,
             )
 
         # Visualization
@@ -401,6 +434,20 @@ def train(cfg, args):
     # Final checkpoint
     final_path = ckpt_dir / f"step_{total_steps}.pth"
     save_checkpoint(model, optimizer, scaler, total_steps, loss_dict, cfg, final_path)
+    final_lr = get_lr(max((total_steps + grad_accum - 1) // grad_accum, 1), warmup_steps, total_steps // grad_accum, max_lr, min_lr)
+    if eval_loader is not None:
+        final_health = evaluate_refinement_health(model, eval_loader, device, use_amp, max_batches=eval_batches)
+        log_validation(
+            writer,
+            log_cfg["log_dir"],
+            total_steps,
+            total_steps,
+            loss_dict,
+            running_loss,
+            final_lr,
+            train_start_time,
+            final_health,
+        )
     print(f"\nTraining complete. Final checkpoint: {final_path}")
     writer.close()
 
