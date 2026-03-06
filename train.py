@@ -70,6 +70,14 @@ def composite_with_known(pred, target, mask):
     return pred * mask + target * (1 - mask)
 
 
+def set_coarse_trainability(model, freeze_coarse: bool):
+    """Freeze/unfreeze coarse model parameters and batch-stat behavior."""
+    for param in model.coarse_model.parameters():
+        param.requires_grad = not freeze_coarse
+    if freeze_coarse:
+        model.coarse_model.eval()
+
+
 def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, extra=None):
     """Write training status to JSON file for remote monitoring."""
     elapsed = time.time() - start_time
@@ -132,7 +140,7 @@ def save_vis(writer, batch, coarse, refined, step, log_dir=None):
 
 
 @torch.no_grad()
-def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8):
+def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8, freeze_coarse=False):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
 
@@ -212,6 +220,7 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
     result["warnings"] = warnings
 
     model.train()
+    set_coarse_trainability(model, freeze_coarse)
     return result
 
 
@@ -263,14 +272,20 @@ def train(cfg, args):
     # Model
     model_config = build_model_config(cfg)
     model = InpaintingModel(model_config).to(device)
+    freeze_coarse = cfg["training"].get("freeze_coarse", False)
+    set_coarse_trainability(model, freeze_coarse)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
+    if freeze_coarse:
+        frozen_params = sum(p.numel() for p in model.coarse_model.parameters())
+        print(f"Frozen coarse parameters: {frozen_params:,}")
 
     # Loss
     criterion = InpaintingLoss(**cfg["loss"]).to(device)
 
     # Optimizer
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg["training"]["lr"])
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=cfg["training"]["lr"])
     scaler = torch.amp.GradScaler("cuda", enabled=cfg["training"]["mixed_precision"])
 
     # Data
@@ -343,6 +358,7 @@ def train(cfg, args):
 
     # Training loop
     model.train()
+    set_coarse_trainability(model, freeze_coarse)
     data_iter = iter(train_loader)
     optimizer.zero_grad()
 
@@ -408,7 +424,9 @@ def train(cfg, args):
             write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr, train_start_time)
 
         if eval_loader is not None and step > 0 and step % eval_interval == 0:
-            health = evaluate_refinement_health(model, eval_loader, device, use_amp, max_batches=eval_batches)
+            health = evaluate_refinement_health(
+                model, eval_loader, device, use_amp, max_batches=eval_batches, freeze_coarse=freeze_coarse
+            )
             log_validation(
                 writer,
                 log_cfg["log_dir"],
@@ -454,7 +472,9 @@ def train(cfg, args):
     save_checkpoint(model, optimizer, scaler, total_steps, loss_dict, cfg, final_path)
     final_lr = get_lr(max((total_steps + grad_accum - 1) // grad_accum, 1), warmup_steps, total_steps // grad_accum, max_lr, min_lr)
     if eval_loader is not None:
-        final_health = evaluate_refinement_health(model, eval_loader, device, use_amp, max_batches=eval_batches)
+        final_health = evaluate_refinement_health(
+            model, eval_loader, device, use_amp, max_batches=eval_batches, freeze_coarse=freeze_coarse
+        )
         log_validation(
             writer,
             log_cfg["log_dir"],

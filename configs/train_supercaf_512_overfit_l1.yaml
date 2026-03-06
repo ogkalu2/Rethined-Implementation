@@ -1,0 +1,61 @@
+# V6 SuperCAF overfit config: L1-only sanity test
+
+model:
+  coarse_model:
+    variant: "s4"
+  generator:
+    kernel_size: 8
+    nheads: 1
+    stem_out_stride: 1
+    stem_out_channels: 3
+    merge_mode: "all"
+    image_size: 512
+    embed_dim: 2048
+    use_qpos: null
+    use_kpos: null
+    dropout: 0.1
+    feature_i: 3
+    concat_features: true
+    final_conv: true
+    feature_dim: 896
+    attention_type: "MultiHeadAttention"
+    compute_v: false
+    use_argmax: false
+
+data:
+  root_dir: "."
+  manifest_path: "dataset/manifests/supercaf_manifest.csv"
+  val_dir: null
+  image_size: 512
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
+  mask_min_coverage: 0.30
+  mask_max_coverage: 0.50
+
+training:
+  total_steps: 2000
+  grad_accum_steps: 32
+  lr: 0.0001
+  warmup_steps: 1000
+  min_lr: 0.000001
+  grad_clip: 1.0
+  mixed_precision: true
+  seed: 42
+  freeze_coarse: false
+
+loss:
+  l1_hole_weight: 6.0
+  l1_valid_weight: 1.0
+  perceptual_weight: 0.0
+  style_weight: 0.0
+
+logging:
+  log_dir: "logs/train_supercaf_512_overfit_l1_v6"
+  log_interval: 100
+  vis_interval: 200
+  eval_interval: 200
+  eval_batches: 8
+  save_interval: 10000
+  checkpoint_steps: [200, 400, 600, 800, 1000, 1500, 2000]
+  keep_last_checkpoints: 10
