@@ -70,12 +70,64 @@ def composite_with_known(pred, target, mask):
     return pred * mask + target * (1 - mask)
 
 
-def set_coarse_trainability(model, freeze_coarse: bool):
-    """Freeze/unfreeze coarse model parameters and batch-stat behavior."""
-    for param in model.coarse_model.parameters():
-        param.requires_grad = not freeze_coarse
-    if freeze_coarse:
+def set_parameter_trainability(model, train_mode: str, freeze_coarse: bool = False):
+    """Configure which parts of the model should receive gradients."""
+    coarse_param_ids = {id(param) for param in model.coarse_model.parameters()}
+    for param in model.parameters():
+        is_coarse = id(param) in coarse_param_ids
+        if train_mode == "joint":
+            param.requires_grad = not (freeze_coarse and is_coarse)
+        elif train_mode == "coarse_only":
+            param.requires_grad = is_coarse
+        elif train_mode == "refine_only":
+            param.requires_grad = not is_coarse
+        else:
+            raise ValueError(f"Unknown train_mode: {train_mode}")
+
+    if train_mode == "refine_only" or freeze_coarse:
         model.coarse_model.eval()
+
+
+def compute_train_loss(criterion, coarse, refined, target, mask, train_mode: str):
+    """Compute loss according to the current staged-training mode."""
+    l1_coarse = criterion.masked_l1(coarse, target, mask)
+    l1_refined = criterion.masked_l1(refined, target, mask)
+
+    zero = refined.new_zeros(())
+    perceptual = zero
+    style = zero
+
+    if train_mode in ("joint", "refine_only") and criterion.perceptual_weight > 0:
+        perceptual = criterion.perceptual_loss(refined, target)
+    if train_mode in ("joint", "refine_only") and criterion.style_weight > 0:
+        style = criterion.style_loss(refined, target)
+
+    if train_mode == "joint":
+        total = (
+            l1_coarse
+            + l1_refined
+            + criterion.perceptual_weight * perceptual
+            + criterion.style_weight * style
+        )
+    elif train_mode == "coarse_only":
+        total = l1_coarse
+    elif train_mode == "refine_only":
+        total = (
+            l1_refined
+            + criterion.perceptual_weight * perceptual
+            + criterion.style_weight * style
+        )
+    else:
+        raise ValueError(f"Unknown train_mode: {train_mode}")
+
+    loss_dict = {
+        "l1_coarse": l1_coarse.item(),
+        "l1_refined": l1_refined.item(),
+        "perceptual": perceptual.item(),
+        "style": style.item(),
+        "total": total.item(),
+    }
+    return total, loss_dict
 
 
 def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, extra=None):
@@ -140,7 +192,7 @@ def save_vis(writer, batch, coarse, refined, step, log_dir=None):
 
 
 @torch.no_grad()
-def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8, freeze_coarse=False):
+def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8, train_mode="joint", freeze_coarse=False):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
 
@@ -220,7 +272,7 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
     result["warnings"] = warnings
 
     model.train()
-    set_coarse_trainability(model, freeze_coarse)
+    set_parameter_trainability(model, train_mode, freeze_coarse=freeze_coarse)
     return result
 
 
@@ -272,11 +324,13 @@ def train(cfg, args):
     # Model
     model_config = build_model_config(cfg)
     model = InpaintingModel(model_config).to(device)
+    train_mode = cfg["training"].get("train_mode", "joint")
     freeze_coarse = cfg["training"].get("freeze_coarse", False)
-    set_coarse_trainability(model, freeze_coarse)
+    set_parameter_trainability(model, train_mode, freeze_coarse=freeze_coarse)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
-    if freeze_coarse:
+    print(f"Train mode: {train_mode}")
+    if train_mode == "refine_only" or freeze_coarse:
         frozen_params = sum(p.numel() for p in model.coarse_model.parameters())
         print(f"Frozen coarse parameters: {frozen_params:,}")
 
@@ -358,7 +412,7 @@ def train(cfg, args):
 
     # Training loop
     model.train()
-    set_coarse_trainability(model, freeze_coarse)
+    set_parameter_trainability(model, train_mode, freeze_coarse=freeze_coarse)
     data_iter = iter(train_loader)
     optimizer.zero_grad()
 
@@ -383,7 +437,7 @@ def train(cfg, args):
             refined_raw, attn, coarse_raw = model(masked_image, mask)
             coarse = composite_with_known(coarse_raw, image, mask)
             refined = composite_with_known(refined_raw, image, mask)
-            loss, loss_dict = criterion(coarse, refined, image, mask)
+            loss, loss_dict = compute_train_loss(criterion, coarse, refined, image, mask, train_mode=train_mode)
             loss = loss / grad_accum
 
         # Backward
@@ -425,7 +479,13 @@ def train(cfg, args):
 
         if eval_loader is not None and step > 0 and step % eval_interval == 0:
             health = evaluate_refinement_health(
-                model, eval_loader, device, use_amp, max_batches=eval_batches, freeze_coarse=freeze_coarse
+                model,
+                eval_loader,
+                device,
+                use_amp,
+                max_batches=eval_batches,
+                train_mode=train_mode,
+                freeze_coarse=freeze_coarse,
             )
             log_validation(
                 writer,
@@ -473,7 +533,13 @@ def train(cfg, args):
     final_lr = get_lr(max((total_steps + grad_accum - 1) // grad_accum, 1), warmup_steps, total_steps // grad_accum, max_lr, min_lr)
     if eval_loader is not None:
         final_health = evaluate_refinement_health(
-            model, eval_loader, device, use_amp, max_batches=eval_batches, freeze_coarse=freeze_coarse
+            model,
+            eval_loader,
+            device,
+            use_amp,
+            max_batches=eval_batches,
+            train_mode=train_mode,
+            freeze_coarse=freeze_coarse,
         )
         log_validation(
             writer,
