@@ -1,4 +1,4 @@
-# V6 SuperCAF-only training config
+# V6 SuperCAF full-training config
 
 model:
   coarse_model:
@@ -27,15 +27,15 @@ data:
   manifest_path: "dataset/manifests/supercaf_manifest.csv"
   val_dir: null
   image_size: 512
-  batch_size: 4
-  eval_batch_size: 4
+  batch_size: 8
+  eval_batch_size: 8
   num_workers: 4
   mask_min_coverage: 0.30
   mask_max_coverage: 0.50
 
 training:
   total_steps: 200000
-  grad_accum_steps: 32
+  grad_accum_steps: 16
   lr: 0.0001
   warmup_steps: 1000
   min_lr: 0.000001
@@ -50,7 +50,7 @@ loss:
   style_weight: 0.0
 
 logging:
-  log_dir: "logs/train_supercaf_512_v6"
+  log_dir: "logs/train_supercaf_512_full_v6"
   log_interval: 100
   vis_interval: 1000
   eval_interval: 1000
