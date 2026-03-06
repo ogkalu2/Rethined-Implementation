@@ -1,4 +1,4 @@
-# V6 SuperCAF quick overfit config: coarse-only stage at 256px
+# V6 SuperCAF fast overfit config at 512px for architecture checks
 
 model:
   coarse_model:
@@ -9,7 +9,7 @@ model:
     stem_out_stride: 1
     stem_out_channels: 3
     merge_mode: "all"
-    image_size: 256
+    image_size: 512
     embed_dim: 2048
     use_qpos: null
     use_kpos: null
@@ -26,23 +26,23 @@ data:
   root_dir: "."
   manifest_path: "dataset/manifests/supercaf_manifest.csv"
   val_dir: null
-  image_size: 256
-  batch_size: 8
-  eval_batch_size: 8
+  image_size: 512
+  batch_size: 4
+  eval_batch_size: 4
   num_workers: 4
   mask_min_coverage: 0.30
   mask_max_coverage: 0.50
 
 training:
   total_steps: 1000
-  grad_accum_steps: 16
+  grad_accum_steps: 32
   lr: 0.0001
-  warmup_steps: 200
+  warmup_steps: 500
   min_lr: 0.000001
   grad_clip: 1.0
   mixed_precision: true
   seed: 42
-  train_mode: "coarse_only"
+  train_mode: "joint"
   freeze_coarse: false
 
 loss:
@@ -52,11 +52,11 @@ loss:
   style_weight: 0.0
 
 logging:
-  log_dir: "logs/train_supercaf_256_overfit_coarse_only_v6"
-  log_interval: 50
-  vis_interval: 100
-  eval_interval: 100
+  log_dir: "logs/train_supercaf_512_overfit_fast_v6"
+  log_interval: 100
+  vis_interval: 500
+  eval_interval: 250
   eval_batches: 2
   save_interval: 10000
-  checkpoint_steps: [100, 300, 500, 1000]
+  checkpoint_steps: [500, 1000]
   keep_last_checkpoints: 10
