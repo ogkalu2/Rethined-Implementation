@@ -152,9 +152,15 @@ def compute_selective_gate_loss(model, target, weight: float, margin: float):
     gate_target = stats["gate_target"][valid_patches]
     advantage = stats["advantage"][valid_patches]
 
-    raw_bce = F.binary_cross_entropy(gate_pred, gate_target, reduction="none")
-    advantage_weight = (advantage.abs() / advantage.abs().mean().clamp_min(1e-6)).detach().clamp(0.25, 4.0)
-    gate_loss = (raw_bce * advantage_weight).mean()
+    with torch.amp.autocast("cuda", enabled=False):
+        gate_pred = gate_pred.float()
+        gate_target = gate_target.float()
+        advantage = advantage.float()
+        raw_bce = F.binary_cross_entropy(gate_pred, gate_target, reduction="none")
+        advantage_weight = (
+            advantage.abs() / advantage.abs().mean().clamp_min(1e-6)
+        ).detach().clamp(0.25, 4.0)
+        gate_loss = (raw_bce * advantage_weight).mean()
 
     gate_binary = (gate_pred >= 0.5).float()
     gate_metrics = {
