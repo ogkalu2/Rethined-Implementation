@@ -161,6 +161,7 @@ class PatchInpainting(nn.Module):
         selector_bias_to_coarse: float = 2.0,
         use_spatial_fusion: bool = False,
         fusion_hidden_dim: int = 256,
+        fusion_bias_to_coarse: float = 0.5,
         use_region_router: bool = False,
         region_router_hidden_dim: int = 256,
         region_router_temperature: float = 1.0,
@@ -201,6 +202,7 @@ class PatchInpainting(nn.Module):
         self.selector_bias_to_coarse = selector_bias_to_coarse
         self.use_spatial_fusion = use_spatial_fusion
         self.fusion_hidden_dim = fusion_hidden_dim
+        self.fusion_bias_to_coarse = fusion_bias_to_coarse
         self.use_region_router = use_region_router
         self.region_router_hidden_dim = region_router_hidden_dim
         self.region_router_temperature = region_router_temperature
@@ -329,7 +331,7 @@ class PatchInpainting(nn.Module):
             self.patch_fusion_delta = nn.Conv2d(self.fusion_hidden_dim, self.patch_value_dim, kernel_size=1, stride=1)
             with torch.no_grad():
                 self.patch_fusion_logits.bias.zero_()
-                self.patch_fusion_logits.bias[0] = 0.5
+                self.patch_fusion_logits.bias[0] = self.fusion_bias_to_coarse
         else:
             self.patch_fusion_backbone = None
             self.patch_fusion_logits = None
