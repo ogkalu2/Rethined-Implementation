@@ -77,7 +77,18 @@ def composite_with_known(pred, target, mask):
     return pred * mask + target * (1 - mask)
 
 
-def prepare_multiscale_batch(batch, device, model_image_size: int):
+def gaussian_prefilter_downsample(image: torch.Tensor, model_image_size: int, blur_layer=None):
+    """Low-pass filter before subsampling to match the paper's Section 3.4 assumption."""
+    if image.shape[-2:] == (model_image_size, model_image_size):
+        return image
+
+    if blur_layer is not None:
+        image = blur_layer(image)
+
+    return F.interpolate(image, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
+
+
+def prepare_multiscale_batch(batch, device, model_image_size: int, blur_layer=None):
     """Prepare fixed-resolution model inputs from a possibly larger HR crop."""
     image_hr = batch["image"].to(device, non_blocking=True)
     mask_hr = batch["mask"].to(device, non_blocking=True)
@@ -86,12 +97,13 @@ def prepare_multiscale_batch(batch, device, model_image_size: int):
     if image_hr.shape[-2:] == (model_image_size, model_image_size):
         image = image_hr
         mask = mask_hr
+        masked_image = masked_image_hr
     else:
-        image = F.interpolate(image_hr, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
+        image = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
+        masked_image = gaussian_prefilter_downsample(masked_image_hr, model_image_size, blur_layer=blur_layer)
         mask = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
         mask = (mask > 0.5).to(image.dtype)
 
-    masked_image = image * (1 - mask)
     return {
         "image": image,
         "mask": mask,
@@ -742,7 +754,12 @@ def evaluate_refinement_health(
         if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
             break
 
-        batch_views = prepare_multiscale_batch(batch, device, model_image_size)
+        batch_views = prepare_multiscale_batch(
+            batch,
+            device,
+            model_image_size,
+            blur_layer=model.generator.final_gaussian_blur,
+        )
         image = batch_views["image"]
         mask = batch_views["mask"]
         masked_image = batch_views["masked_image"]
@@ -1208,7 +1225,12 @@ def train(cfg, args):
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
-        batch_views = prepare_multiscale_batch(batch, device, model_image_size)
+        batch_views = prepare_multiscale_batch(
+            batch,
+            device,
+            model_image_size,
+            blur_layer=model.generator.final_gaussian_blur,
+        )
         image = batch_views["image"]
         mask = batch_views["mask"]
         masked_image = batch_views["masked_image"]

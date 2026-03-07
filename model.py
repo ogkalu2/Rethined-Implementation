@@ -522,14 +522,18 @@ class PatchInpainting(nn.Module):
             coarse_composite = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
 
-        # V2: Use native unfold instead of CoreML conv2d hack
-        image_as_patches_full, sizes = self.unfold_native(coarse_composite, self.kernel_size)
-        image_blurred = self.final_gaussian_blur(coarse_composite)
-        image_as_patches_blurred, _ = self.unfold_native(image_blurred, self.kernel_size)
-        image_as_patches_hf = image_as_patches_full - image_as_patches_blurred
+        # Paper mode uses raw coarse patches for token construction and the masked
+        # LR input for value mixing / preservation. Other modes keep the legacy
+        # composite-path behavior.
+        coarse_patches_full, sizes = self.unfold_native(image_coarse_inpainting, self.kernel_size)
+        composite_patches_full, _ = self.unfold_native(coarse_composite, self.kernel_size)
+        known_patches_full, _ = self.unfold_native(masked_input, self.kernel_size)
+        composite_blurred = self.final_gaussian_blur(coarse_composite)
+        composite_patches_blurred, _ = self.unfold_native(composite_blurred, self.kernel_size)
+        composite_patches_hf = composite_patches_full - composite_patches_blurred
 
         pos = self.positionalencoding.repeat(
-            image_as_patches_full.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
+            coarse_patches_full.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
 
         # V2: Use native unfold for mask
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
@@ -542,17 +546,25 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
         if self.refiner_formulation == "paper":
-            match_patches = image_as_patches_full
+            match_patches = coarse_patches_full
+            value_patches_full = known_patches_full
+            preserve_patches_full = known_patches_full
         elif self.patch_match_mode == "hf":
-            match_patches = image_as_patches_hf
+            match_patches = composite_patches_hf
+            value_patches_full = composite_patches_full
+            preserve_patches_full = composite_patches_full
         elif self.patch_match_mode == "full":
-            match_patches = image_as_patches_full
+            match_patches = composite_patches_full
+            value_patches_full = composite_patches_full
+            preserve_patches_full = composite_patches_full
         else:
-            match_patches = torch.cat([image_as_patches_hf, image_as_patches_full], dim=1)
+            match_patches = torch.cat([composite_patches_hf, composite_patches_full], dim=1)
+            value_patches_full = composite_patches_full
+            preserve_patches_full = composite_patches_full
         features_to_concat = None
         if self.concat_features:
             features_to_concat = features[self.feature_i]
-            features_to_concat = F.interpolate(features_to_concat, size=image_as_patches_full.shape[-2:], mode='bilinear', align_corners=False)
+            features_to_concat = F.interpolate(features_to_concat, size=coarse_patches_full.shape[-2:], mode='bilinear', align_corners=False)
             token_map = torch.cat([match_patches, features_to_concat], dim=1)
         else:
             token_map = match_patches
@@ -564,8 +576,12 @@ class PatchInpainting(nn.Module):
         if self.refiner_formulation != "paper":
             input_attn = self.patch_token_norm(input_attn)
 
-        full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
-        self.last_base_patches_flat = full_patches_flat
+        full_patches_flat = value_patches_full.flatten(start_dim=2).transpose(1, 2)
+        preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
+        if self.refiner_formulation == "paper":
+            self.last_base_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
+        else:
+            self.last_base_patches_flat = full_patches_flat
 
         post_softmax_mask = None
         renorm_post_mask = False
@@ -623,9 +639,9 @@ class PatchInpainting(nn.Module):
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.refiner_formulation == "paper":
-            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
+            out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
             out = self.apply_paper_coherence(out, sizes)
-            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
+            out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
             self.last_refinement_gate_map = None
             self.last_candidate_patches_flat = None
             self.last_selector_logits = None
