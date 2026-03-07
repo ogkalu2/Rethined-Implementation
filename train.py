@@ -445,6 +445,24 @@ def append_validation_history(log_dir, step, health):
         f.write(json.dumps(row) + "\n")
 
 
+def add_distribution_metrics(result, values, prefix):
+    """Add quartile-style summary metrics for a list of scalar values."""
+    if not values:
+        result[f"{prefix}_p25"] = None
+        result[f"{prefix}_p50"] = None
+        result[f"{prefix}_p75"] = None
+        result[f"{prefix}_min"] = None
+        result[f"{prefix}_max"] = None
+        return
+
+    tensor = torch.tensor(values, dtype=torch.float32)
+    result[f"{prefix}_p25"] = float(torch.quantile(tensor, 0.25).item())
+    result[f"{prefix}_p50"] = float(torch.quantile(tensor, 0.50).item())
+    result[f"{prefix}_p75"] = float(torch.quantile(tensor, 0.75).item())
+    result[f"{prefix}_min"] = float(tensor.min().item())
+    result[f"{prefix}_max"] = float(tensor.max().item())
+
+
 def save_vis(writer, batch, coarse, refined, step, log_dir=None):
     """Save visualization to TensorBoard and as PNG file."""
     n = min(4, batch["image"].shape[0])
@@ -504,6 +522,8 @@ def evaluate_refinement_health(
         "head_oracle_gap": [],
         "head_oracle_margin_violations": [],
     }
+    gain_abs_values = []
+    gain_pct_values = []
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
@@ -532,6 +552,8 @@ def evaluate_refinement_health(
         raw_coarse_valid = (torch.abs(coarse_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
         raw_refined_valid = (torch.abs(refined_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
         masked_delta = (torch.abs(refined - coarse) * mask).sum(dim=(1, 2, 3)) / hole_denom
+        gain_abs = coarse_hole - refined_hole
+        gain_pct = gain_abs / coarse_hole.clamp_min(1e-8) * 100.0
 
         stats["masked_l1_coarse"].extend(coarse_hole.detach().cpu().tolist())
         stats["masked_l1_refined"].extend(refined_hole.detach().cpu().tolist())
@@ -541,6 +563,8 @@ def evaluate_refinement_health(
         stats["raw_valid_l1_refined"].extend(raw_refined_valid.detach().cpu().tolist())
         stats["masked_delta_mean"].extend(masked_delta.detach().cpu().tolist())
         stats["refined_better_flags"].extend((refined_hole < coarse_hole).detach().cpu().float().tolist())
+        gain_abs_values.extend(gain_abs.detach().cpu().tolist())
+        gain_pct_values.extend(gain_pct.detach().cpu().tolist())
 
         gate_stats = compute_selective_gate_targets(model, image, margin=gate_selective_margin)
         if gate_stats is not None:
@@ -579,6 +603,9 @@ def evaluate_refinement_health(
 
     better_rate = result["refined_better_flags"]
     result["refined_better_rate"] = better_rate
+    result["refined_worse_rate"] = float(sum(1.0 for v in gain_abs_values if v < 0) / len(gain_abs_values)) if gain_abs_values else None
+    add_distribution_metrics(result, gain_abs_values, "gain_abs")
+    add_distribution_metrics(result, gain_pct_values, "gain_pct")
 
     warnings = []
     if result["refinement_gain_pct"] is not None and result["refinement_gain_pct"] < -2.0:
@@ -679,7 +706,16 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     writer.add_scalar("val/raw_valid_l1_refined", health["raw_valid_l1_refined"], step)
     writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
     writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
+    writer.add_scalar("val/refined_worse_rate", health["refined_worse_rate"], step)
     writer.add_scalar("val/masked_delta_mean", health["masked_delta_mean"], step)
+    if health.get("gain_abs_p50") is not None:
+        writer.add_scalar("val/gain_abs_p25", health["gain_abs_p25"], step)
+        writer.add_scalar("val/gain_abs_p50", health["gain_abs_p50"], step)
+        writer.add_scalar("val/gain_abs_p75", health["gain_abs_p75"], step)
+    if health.get("gain_pct_p50") is not None:
+        writer.add_scalar("val/gain_pct_p25", health["gain_pct_p25"], step)
+        writer.add_scalar("val/gain_pct_p50", health["gain_pct_p50"], step)
+        writer.add_scalar("val/gain_pct_p75", health["gain_pct_p75"], step)
     if health.get("gate_target_rate") is not None:
         writer.add_scalar("val/gate_target_rate", health["gate_target_rate"], step)
     if health.get("gate_pred_mean") is not None:
@@ -741,9 +777,12 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"refined={health['masked_l1_refined']:.4f}, "
         f"gain={health['refinement_gain_pct']:.2f}%, "
         f"better_rate={health['refined_better_rate']:.2f}, "
+        f"worse_rate={health['refined_worse_rate']:.2f}, "
         f"valid coarse={health['valid_l1_coarse']:.4f}, "
         f"valid refined={health['valid_l1_refined']:.4f}, "
-        f"raw valid refined={health['raw_valid_l1_refined']:.4f}{gate_suffix}{selector_suffix}{oracle_suffix}{warning_suffix}"
+        f"raw valid refined={health['raw_valid_l1_refined']:.4f}, "
+        f"gain_p50={health['gain_pct_p50']:.2f}% "
+        f"(p25={health['gain_pct_p25']:.2f}%, p75={health['gain_pct_p75']:.2f}%){gate_suffix}{selector_suffix}{oracle_suffix}{warning_suffix}"
     )
 
 

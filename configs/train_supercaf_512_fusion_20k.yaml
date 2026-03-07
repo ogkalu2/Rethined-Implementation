@@ -1,0 +1,82 @@
+# V6 SuperCAF patch-based 512px extended fusion pilot
+
+model:
+  coarse_model:
+    variant: "s4"
+  generator:
+    kernel_size: 8
+    nheads: 2
+    stem_out_stride: 1
+    stem_out_channels: 3
+    merge_mode: "all"
+    image_size: 512
+    embed_dim: 1024
+    use_qpos: null
+    use_kpos: null
+    dropout: 0.0
+    feature_i: 3
+    concat_features: true
+    final_conv: true
+    feature_dim: 896
+    attention_type: "MultiHeadAttention"
+    compute_v: false
+    use_argmax: false
+    refinement_backend: "patch_attention"
+    refinement_gate_init: 1.0
+    patch_match_mode: "hf"
+    attn_topk: 8
+    attn_add_residual: false
+    token_use_mask_ratio: true
+    soft_key_mask_scale: 8.0
+    use_head_selector: false
+    use_spatial_fusion: true
+    fusion_hidden_dim: 256
+
+data:
+  root_dir: "."
+  manifest_path: "dataset/manifests/supercaf_manifest.csv"
+  val_dir: null
+  image_size: 512
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
+  mask_min_coverage: 0.30
+  mask_max_coverage: 0.50
+
+training:
+  total_steps: 20000
+  grad_accum_steps: 32
+  lr: 0.0001
+  warmup_steps: 500
+  min_lr: 0.000001
+  grad_clip: 1.0
+  mixed_precision: true
+  seed: 42
+  train_mode: "refined_loss_only"
+  freeze_coarse: false
+
+loss:
+  l1_hole_weight: 6.0
+  l1_valid_weight: 1.0
+  perceptual_weight: 0.0
+  style_weight: 0.0
+  gate_selective_weight: 0.0
+  gate_selective_margin: 0.0
+  sample_improvement_weight: 0.0
+  sample_improvement_margin: 0.0
+  selector_choice_weight: 0.0
+  selector_choice_margin: 0.0
+  head_oracle_weight: 1.0
+  head_oracle_margin: 0.004
+
+logging:
+  log_dir: "logs/train_supercaf_512_fusion_20k_v6"
+  log_interval: 100
+  vis_interval: 5000
+  eval_interval: 2500
+  eval_batches: 8
+  save_interval: 5000
+  save_checkpoints: true
+  save_final_checkpoint: true
+  checkpoint_steps: [5000, 10000, 15000, 20000]
+  keep_last_checkpoints: 4
