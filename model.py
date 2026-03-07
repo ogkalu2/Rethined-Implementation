@@ -39,7 +39,19 @@ class NativeGaussianBlur2d(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, embed_dim, d_v, n_head, split, dropout, d_qk, compute_v, use_argmax=False):
+    def __init__(
+        self,
+        embed_dim,
+        d_v,
+        n_head,
+        split,
+        dropout,
+        d_qk,
+        compute_v,
+        use_argmax=False,
+        add_residual=True,
+        topk_patches=None,
+    ):
         super().__init__()
         self.d_v = d_v
         self.n_head = n_head
@@ -51,6 +63,8 @@ class MultiHeadAttention(nn.Module):
         self.attention = None
         self.d_k = d_qk
         self.use_argmax = use_argmax
+        self.add_residual = add_residual
+        self.topk_patches = topk_patches
 
     def forward(self, q, k, v, qpos, kpos, qk_mask=None, k_mask=None):
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
@@ -73,6 +87,11 @@ class MultiHeadAttention(nn.Module):
             # Broadcast from (B, 1, N, 1) to attention logits (B, n_head, N, N).
             attn = attn + k_mask.squeeze(-1).unsqueeze(-2)
 
+        if self.topk_patches is not None and self.topk_patches < attn.size(-1):
+            topk_vals, topk_idx = torch.topk(attn, k=self.topk_patches, dim=-1)
+            sparse_attn = torch.full_like(attn, -1e4)
+            attn = sparse_attn.scatter(-1, topk_idx, topk_vals)
+
         # Force FP32 for softmax to prevent FP16 overflow from large mask values
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
 
@@ -84,7 +103,8 @@ class MultiHeadAttention(nn.Module):
         output = torch.matmul(attn, v)
         output = output.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
         output = self.dropout(self.fc(output))
-        output = output + residual
+        if self.add_residual:
+            output = output + residual
 
         return output, attn
 
@@ -118,6 +138,10 @@ class PatchInpainting(nn.Module):
         refinement_gate_init: float = 1.0,
         refinement_backend: str = "residual_cnn",
         refinement_hidden_dim: int = 128,
+        patch_match_mode: str = "hf",
+        attn_topk: int = 8,
+        attn_add_residual: bool = False,
+        token_use_mask_ratio: bool = True,
         model,
     ):
         self.cross_attention = cross_attention
@@ -137,16 +161,29 @@ class PatchInpainting(nn.Module):
         self.use_residual_refinement = residual_refinement
         self.refinement_backend = refinement_backend
         self.refinement_hidden_dim = refinement_hidden_dim
+        self.patch_match_mode = patch_match_mode
+        self.attn_topk = attn_topk
+        self.attn_add_residual = attn_add_residual
+        self.token_use_mask_ratio = token_use_mask_ratio
         super().__init__()
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.pooling_layer = nn.MaxPool2d(kernel_size, stride=kernel_size)
         self.patch_value_dim = stem_out_channels * kernel_size * kernel_size
+        self.patch_token_dim = self.patch_value_dim + self.feature_dim if self.concat_features else self.patch_value_dim
+        if self.token_use_mask_ratio:
+            self.patch_token_dim += 1
         self.multihead_attention = MultiHeadAttention(
-            embed_dim=self.patch_value_dim + self.feature_dim if self.concat_features else self.patch_value_dim,
+            embed_dim=self.patch_token_dim,
             d_v=self.patch_value_dim,
             n_head=self.nheads,
-            split=True, dropout=dropout, d_qk=embed_dim, compute_v=compute_v, use_argmax=self.use_argmax
+            split=True,
+            dropout=dropout,
+            d_qk=embed_dim,
+            compute_v=compute_v,
+            use_argmax=self.use_argmax,
+            add_residual=self.attn_add_residual,
+            topk_patches=self.attn_topk,
         )
         self.stem_out_channels = stem_out_channels
         self.stem_out_stride = stem_out_stride
@@ -160,9 +197,10 @@ class PatchInpainting(nn.Module):
         self.encoder_decoder = model
         self.image_size = image_size
         self.positionalencoding = torch.nn.Parameter(torch.zeros(
-            1, self.kernel_size ** 2 * stem_out_channels + self.feature_dim,
+            1, self.patch_token_dim,
             int((image_size / stem_out_stride / self.kernel_size) ** 2)
         )) if use_kpos or use_qpos else None
+        self.patch_token_norm = nn.LayerNorm(self.patch_token_dim)
         self.patch_delta_mixer = torch.nn.Sequential(
             nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
             nn.GELU(),
@@ -296,6 +334,9 @@ class PatchInpainting(nn.Module):
 
         # V2: Use native unfold instead of CoreML conv2d hack
         image_as_patches_full, sizes = self.unfold_native(coarse_composite, self.kernel_size)
+        image_blurred = self.final_gaussian_blur(coarse_composite)
+        image_as_patches_blurred, _ = self.unfold_native(image_blurred, self.kernel_size)
+        image_as_patches_hf = image_as_patches_full - image_as_patches_blurred
 
         pos = self.positionalencoding.repeat(
             image_as_patches_full.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
@@ -306,20 +347,27 @@ class PatchInpainting(nn.Module):
         mask_same_res_as_features_pooled = mask_as_patches.amax(dim=1, keepdim=True)
         mask_same_res_as_features_pooled = mask_same_res_as_features_pooled.flatten(
             start_dim=2).unsqueeze(-1)
+        mask_ratio = mask_as_patches.mean(dim=1, keepdim=True)
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
+        match_patches = image_as_patches_hf if self.patch_match_mode == "hf" else image_as_patches_full
         if self.concat_features:
             features_to_concat = features[self.feature_i]
             features_to_concat = F.interpolate(features_to_concat, size=image_as_patches_full.shape[-2:], mode='bilinear', align_corners=False)
-            input_attn = torch.cat([image_as_patches_full, features_to_concat], dim=1)
-            input_attn = input_attn.flatten(start_dim=2).transpose(1, 2)
+            token_map = torch.cat([match_patches, features_to_concat], dim=1)
         else:
-            input_attn = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
+            token_map = match_patches
+
+        if self.token_use_mask_ratio:
+            token_map = torch.cat([token_map, mask_ratio], dim=1)
+
+        input_attn = token_map.flatten(start_dim=2).transpose(1, 2)
+        input_attn = self.patch_token_norm(input_attn)
 
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
 
-        qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) + 2e4 * ((1 - mask_same_res_as_features_pooled) * self.qk_mask) if self.attention_masking else None
+        qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
         k_mask = -1e4 * mask_same_res_as_features_pooled if self.attention_masking else None
         out, atten_weights = self.multihead_attention(input_attn, input_attn,
             full_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
