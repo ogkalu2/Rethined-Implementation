@@ -143,7 +143,6 @@ class PatchInpainting(nn.Module):
         attn_add_residual: bool = False,
         token_use_mask_ratio: bool = True,
         soft_key_mask_scale: float = 0.0,
-        value_use_hf: bool = False,
         model,
     ):
         self.cross_attention = cross_attention
@@ -168,7 +167,6 @@ class PatchInpainting(nn.Module):
         self.attn_add_residual = attn_add_residual
         self.token_use_mask_ratio = token_use_mask_ratio
         self.soft_key_mask_scale = soft_key_mask_scale
-        self.value_use_hf = value_use_hf
         super().__init__()
         if self.refinement_backend not in ("patch_attention", "patch", None):
             raise ValueError(
@@ -365,11 +363,6 @@ class PatchInpainting(nn.Module):
         input_attn = self.patch_token_norm(input_attn)
 
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
-        hf_patches_flat = image_as_patches_hf.flatten(start_dim=2).transpose(1, 2)
-        blurred_patches_flat = image_as_patches_blurred.flatten(start_dim=2).transpose(1, 2)
-
-        # Select V: HF patches (paper-aligned) or full patches (legacy)
-        v_patches = hf_patches_flat if self.value_use_hf else full_patches_flat
 
         qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
         if self.attention_masking:
@@ -381,22 +374,16 @@ class PatchInpainting(nn.Module):
         else:
             k_mask = None
         out, atten_weights = self.multihead_attention(input_attn, input_attn,
-            v_patches, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
+            full_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.use_residual_refinement:
-            # Gated residual: out ≈ base + small_gate * delta (safe at init)
-            base_patches = hf_patches_flat if self.value_use_hf else full_patches_flat
-            delta = out - base_patches
-            delta = self.mix_patch_tokens(delta, sizes)
-            gate_logits = self.compute_patch_gate(base_patches, delta, sizes)
+            delta_full = out - full_patches_flat
+            delta_full = self.mix_patch_tokens(delta_full, sizes)
+            gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
             refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
-            refined = base_patches + refinement_gate * pixel_mask_flat * delta
-            if self.value_use_hf:
-                out = blurred_patches_flat + refined
-            else:
-                out = refined
+            out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
         else:
             out = out * patch_mask + full_patches_flat * (1 - patch_mask)
 

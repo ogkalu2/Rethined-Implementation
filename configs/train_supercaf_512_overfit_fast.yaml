@@ -28,7 +28,6 @@ model:
     attn_add_residual: false
     token_use_mask_ratio: true
     soft_key_mask_scale: 8.0
-    value_use_hf: false
 
 data:
   root_dir: "."
@@ -42,9 +41,9 @@ data:
   mask_max_coverage: 0.50
 
 training:
-  total_steps: 5000
-  grad_accum_steps: 1
-  lr: 0.001
+  total_steps: 1000
+  grad_accum_steps: 32
+  lr: 0.0001
   warmup_steps: 100
   min_lr: 0.000001
   grad_clip: 1.0
@@ -63,8 +62,8 @@ logging:
   log_dir: "logs/train_supercaf_512_overfit_fast_v6"
   log_interval: 100
   vis_interval: 500
-  eval_interval: 500
-  eval_batches: 8
+  eval_interval: 250
+  eval_batches: 2
   save_interval: 10000
   save_checkpoints: false
   save_final_checkpoint: false
