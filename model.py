@@ -142,6 +142,7 @@ class PatchInpainting(nn.Module):
         attn_topk: int = 8,
         attn_add_residual: bool = False,
         token_use_mask_ratio: bool = True,
+        soft_key_mask_scale: float = 0.0,
         model,
     ):
         self.cross_attention = cross_attention
@@ -165,6 +166,7 @@ class PatchInpainting(nn.Module):
         self.attn_topk = attn_topk
         self.attn_add_residual = attn_add_residual
         self.token_use_mask_ratio = token_use_mask_ratio
+        self.soft_key_mask_scale = soft_key_mask_scale
         super().__init__()
         if self.refinement_backend not in ("patch_attention", "patch", None):
             raise ValueError(
@@ -363,7 +365,14 @@ class PatchInpainting(nn.Module):
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
 
         qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
-        k_mask = -1e4 * mask_same_res_as_features_pooled if self.attention_masking else None
+        if self.attention_masking:
+            if self.soft_key_mask_scale > 0:
+                key_mask_ratio = mask_ratio.flatten(start_dim=2).unsqueeze(-1)
+                k_mask = -self.soft_key_mask_scale * key_mask_ratio
+            else:
+                k_mask = -1e4 * mask_same_res_as_features_pooled
+        else:
+            k_mask = None
         out, atten_weights = self.multihead_attention(input_attn, input_attn,
             full_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
         )
