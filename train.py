@@ -288,6 +288,66 @@ def compute_head_oracle_loss(model, target, margin: float):
     return oracle_loss, metrics
 
 
+def compute_oracle_patch_distill_loss(model, target, margin: float):
+    """Teach the fused patch output to match the best available retrieved patch hypothesis."""
+    generator = getattr(model, "generator", None)
+    candidate_bank = getattr(generator, "last_candidate_bank", None)
+    output_patches = getattr(generator, "last_output_patches_flat", None)
+    pixel_mask = getattr(generator, "last_pixel_mask_flat", None)
+    if generator is None or candidate_bank is None or output_patches is None or pixel_mask is None:
+        zero = target.new_zeros(())
+        empty_metrics = {
+            "oracle_patch_noncoarse_rate": None,
+            "oracle_patch_distill_gap": None,
+            "oracle_patch_alignment": None,
+        }
+        return zero, empty_metrics
+
+    with torch.no_grad():
+        gt_patches, _ = generator.unfold_native(target, generator.kernel_size)
+        gt_patches = gt_patches.flatten(start_dim=2).transpose(1, 2)
+
+        pixel_mask_detached = pixel_mask.detach()
+        valid_patches = pixel_mask_detached.sum(dim=-1) > 0
+        if not valid_patches.any():
+            zero = target.new_zeros(())
+            empty_metrics = {
+                "oracle_patch_noncoarse_rate": None,
+                "oracle_patch_distill_gap": None,
+                "oracle_patch_alignment": None,
+            }
+            return zero, empty_metrics
+
+        mask_count = pixel_mask_detached.sum(dim=-1).clamp_min(1.0)
+        candidate_err = (
+            torch.abs(candidate_bank.detach() - gt_patches.unsqueeze(2)) * pixel_mask_detached.unsqueeze(2)
+        ).sum(dim=-1) / mask_count.unsqueeze(-1)
+        coarse_err = candidate_err[:, :, 0]
+        best_err, best_idx = candidate_err.min(dim=-1)
+        best_noncoarse_err, best_noncoarse_idx = candidate_err[:, :, 1:].min(dim=-1)
+        use_noncoarse = (best_noncoarse_err + margin) < coarse_err
+        best_idx = torch.where(use_noncoarse, best_noncoarse_idx + 1, torch.zeros_like(best_idx))
+        oracle_target = torch.gather(
+            candidate_bank.detach(),
+            2,
+            best_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, candidate_bank.size(-1)),
+        ).squeeze(2)
+        oracle_advantage = coarse_err - best_noncoarse_err
+
+    distill_l1 = (torch.abs(output_patches - oracle_target) * pixel_mask).sum(dim=-1) / pixel_mask.sum(dim=-1).clamp_min(1.0)
+    oracle_patch_loss = distill_l1[valid_patches].mean()
+
+    output_alignment = (
+        (torch.abs(output_patches.detach() - oracle_target) * pixel_mask).sum(dim=-1) / pixel_mask.sum(dim=-1).clamp_min(1.0)
+    )
+    metrics = {
+        "oracle_patch_noncoarse_rate": use_noncoarse[valid_patches].float().mean().item(),
+        "oracle_patch_distill_gap": oracle_advantage[valid_patches].mean().item(),
+        "oracle_patch_alignment": output_alignment[valid_patches].mean().item(),
+    }
+    return oracle_patch_loss, metrics
+
+
 def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mode: str):
     """Compute loss according to the current staged-training mode."""
     l1_coarse = criterion.masked_l1(coarse, target, mask)
@@ -300,6 +360,8 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
     sample_improvement = zero
     selector_choice = zero
     head_oracle = zero
+    coarse_anchor = zero
+    oracle_patch = zero
     gate_metrics = {
         "gate_target_rate": None,
         "gate_pred_mean": None,
@@ -321,6 +383,11 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
         "head_oracle_success_rate": None,
         "head_oracle_gap": None,
         "head_oracle_margin_violations": None,
+    }
+    oracle_patch_metrics = {
+        "oracle_patch_noncoarse_rate": None,
+        "oracle_patch_distill_gap": None,
+        "oracle_patch_alignment": None,
     }
 
     if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.perceptual_weight > 0:
@@ -354,6 +421,14 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             target,
             criterion.head_oracle_margin,
         )
+    if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.coarse_anchor_weight > 0:
+        coarse_anchor = l1_coarse
+    if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.oracle_patch_weight > 0:
+        oracle_patch, oracle_patch_metrics = compute_oracle_patch_distill_loss(
+            model,
+            target,
+            criterion.oracle_patch_margin,
+        )
 
     if train_mode == "joint":
         total = (
@@ -365,6 +440,8 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.sample_improvement_weight * sample_improvement
             + criterion.selector_choice_weight * selector_choice
             + criterion.head_oracle_weight * head_oracle
+            + criterion.coarse_anchor_weight * coarse_anchor
+            + criterion.oracle_patch_weight * oracle_patch
         )
     elif train_mode == "refined_loss_only":
         total = (
@@ -375,6 +452,8 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.sample_improvement_weight * sample_improvement
             + criterion.selector_choice_weight * selector_choice
             + criterion.head_oracle_weight * head_oracle
+            + criterion.coarse_anchor_weight * coarse_anchor
+            + criterion.oracle_patch_weight * oracle_patch
         )
     elif train_mode == "coarse_only":
         total = l1_coarse
@@ -387,6 +466,8 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.sample_improvement_weight * sample_improvement
             + criterion.selector_choice_weight * selector_choice
             + criterion.head_oracle_weight * head_oracle
+            + criterion.coarse_anchor_weight * coarse_anchor
+            + criterion.oracle_patch_weight * oracle_patch
         )
     else:
         raise ValueError(f"Unknown train_mode: {train_mode}")
@@ -400,9 +481,17 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
         "sample_improvement": sample_improvement.item(),
         "selector_choice": selector_choice.item(),
         "head_oracle": head_oracle.item(),
+        "coarse_anchor": coarse_anchor.item(),
+        "oracle_patch": oracle_patch.item(),
         "total": total.item(),
     }
-    aux_metrics = {**gate_metrics, **improvement_metrics, **selector_metrics, **head_oracle_metrics}
+    aux_metrics = {
+        **gate_metrics,
+        **improvement_metrics,
+        **selector_metrics,
+        **head_oracle_metrics,
+        **oracle_patch_metrics,
+    }
     return total, loss_dict, aux_metrics
 
 
@@ -953,6 +1042,8 @@ def train(cfg, args):
             writer.add_scalar("loss/sample_improvement", loss_dict["sample_improvement"], step)
             writer.add_scalar("loss/selector_choice", loss_dict["selector_choice"], step)
             writer.add_scalar("loss/head_oracle", loss_dict["head_oracle"], step)
+            writer.add_scalar("loss/coarse_anchor", loss_dict["coarse_anchor"], step)
+            writer.add_scalar("loss/oracle_patch", loss_dict["oracle_patch"], step)
             if gate_metrics.get("gate_target_rate") is not None:
                 writer.add_scalar("train/gate_target_rate", gate_metrics["gate_target_rate"], step)
                 writer.add_scalar("train/gate_pred_mean", gate_metrics["gate_pred_mean"], step)
@@ -971,6 +1062,10 @@ def train(cfg, args):
                 writer.add_scalar("train/head_oracle_success_rate", gate_metrics["head_oracle_success_rate"], step)
                 writer.add_scalar("train/head_oracle_gap", gate_metrics["head_oracle_gap"], step)
                 writer.add_scalar("train/head_oracle_margin_violations", gate_metrics["head_oracle_margin_violations"], step)
+            if gate_metrics.get("oracle_patch_noncoarse_rate") is not None:
+                writer.add_scalar("train/oracle_patch_noncoarse_rate", gate_metrics["oracle_patch_noncoarse_rate"], step)
+                writer.add_scalar("train/oracle_patch_distill_gap", gate_metrics["oracle_patch_distill_gap"], step)
+                writer.add_scalar("train/oracle_patch_alignment", gate_metrics["oracle_patch_alignment"], step)
             if hasattr(model.generator, "refinement_gate"):
                 writer.add_scalar("model/refinement_gate", torch.sigmoid(model.generator.refinement_gate).item(), step)
             opt_step = (step + 1) // grad_accum

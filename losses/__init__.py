@@ -29,6 +29,9 @@ class InpaintingLoss(nn.Module):
         selector_choice_margin: float = 0.0,
         head_oracle_weight: float = 0.0,
         head_oracle_margin: float = 0.0,
+        coarse_anchor_weight: float = 0.0,
+        oracle_patch_weight: float = 0.0,
+        oracle_patch_margin: float = 0.0,
     ):
         super().__init__()
         self.l1_hole_weight = l1_hole_weight
@@ -43,6 +46,9 @@ class InpaintingLoss(nn.Module):
         self.selector_choice_margin = selector_choice_margin
         self.head_oracle_weight = head_oracle_weight
         self.head_oracle_margin = head_oracle_margin
+        self.coarse_anchor_weight = coarse_anchor_weight
+        self.oracle_patch_weight = oracle_patch_weight
+        self.oracle_patch_margin = oracle_patch_margin
 
         self.perceptual_loss = PerceptualLoss()
         self.style_loss = StyleLoss()

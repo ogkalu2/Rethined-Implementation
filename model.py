@@ -292,6 +292,7 @@ class PatchInpainting(nn.Module):
         self.last_selector_probs = None
         self.last_candidate_bank = None
         self.last_fusion_weights = None
+        self.last_output_patches_flat = None
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -565,6 +566,7 @@ class PatchInpainting(nn.Module):
                 self.last_selector_probs = None
                 self.last_candidate_bank = None
                 self.last_fusion_weights = None
+            self.last_output_patches_flat = out
             self.last_pixel_mask_flat = pixel_mask_flat
         else:
             out = out * patch_mask + full_patches_flat * (1 - patch_mask)
@@ -575,6 +577,7 @@ class PatchInpainting(nn.Module):
             self.last_selector_probs = None
             self.last_candidate_bank = None
             self.last_fusion_weights = None
+            self.last_output_patches_flat = out
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
