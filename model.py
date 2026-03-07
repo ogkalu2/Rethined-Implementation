@@ -621,14 +621,17 @@ class PatchInpainting(nn.Module):
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
         self.last_base_patches_flat = full_patches_flat
 
-        qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
         if self.attention_masking:
+            # Valid patches self-attend (preserve content); masked patches cannot
+            # (must borrow from valid neighbours). Matches the original paper code.
+            qk_mask = self.qk_mask * (2.0 * (1.0 - mask_same_res_as_features_pooled) - 1.0)
             if self.soft_key_mask_scale > 0:
                 key_mask_ratio = mask_ratio.flatten(start_dim=2).unsqueeze(-1)
                 k_mask = -self.soft_key_mask_scale * key_mask_ratio
             else:
                 k_mask = -1e4 * mask_same_res_as_features_pooled
         else:
+            qk_mask = None
             k_mask = None
         if self.use_head_selector or self.use_spatial_fusion or self.use_region_router:
             out, atten_weights, head_outputs = self.multihead_attention(
