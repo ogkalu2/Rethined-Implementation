@@ -1,4 +1,4 @@
-# V6 SuperCAF fast overfit config at 256px for patch-based refinement checks
+# V6 SuperCAF patch-based pilot config at 512px
 
 model:
   coarse_model:
@@ -9,7 +9,7 @@ model:
     stem_out_stride: 1
     stem_out_channels: 3
     merge_mode: "all"
-    image_size: 256
+    image_size: 512
     embed_dim: 2048
     use_qpos: null
     use_kpos: null
@@ -32,7 +32,7 @@ data:
   root_dir: "."
   manifest_path: "dataset/manifests/supercaf_manifest.csv"
   val_dir: null
-  image_size: 256
+  image_size: 512
   batch_size: 4
   eval_batch_size: 4
   num_workers: 4
@@ -40,10 +40,10 @@ data:
   mask_max_coverage: 0.50
 
 training:
-  total_steps: 1000
+  total_steps: 10000
   grad_accum_steps: 32
   lr: 0.0001
-  warmup_steps: 100
+  warmup_steps: 500
   min_lr: 0.000001
   grad_clip: 1.0
   mixed_precision: true
@@ -58,13 +58,13 @@ loss:
   style_weight: 0.0
 
 logging:
-  log_dir: "logs/train_supercaf_256_overfit_fast_patch_v6"
+  log_dir: "logs/train_supercaf_512_patch_pilot_v6"
   log_interval: 100
-  vis_interval: 500
-  eval_interval: 250
-  eval_batches: 2
-  save_interval: 10000
-  save_checkpoints: false
-  save_final_checkpoint: false
-  checkpoint_steps: []
-  keep_last_checkpoints: 10
+  vis_interval: 1000
+  eval_interval: 500
+  eval_batches: 8
+  save_interval: 2000
+  save_checkpoints: true
+  save_final_checkpoint: true
+  checkpoint_steps: [2000, 5000, 10000]
+  keep_last_checkpoints: 5
