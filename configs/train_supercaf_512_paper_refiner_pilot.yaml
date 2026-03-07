@@ -1,4 +1,4 @@
-# SuperCAF 512px pilot with the paper-facing LR refiner path.
+# SuperCAF joint-HR pilot: 512px crops with a paper-facing 256px LR refiner.
 # This keeps the short pilot length used in prior experiments; the paper's full
 # schedule is still 600k steps.
 
@@ -11,7 +11,7 @@ model:
     stem_out_stride: 1
     stem_out_channels: 3
     merge_mode: "all"
-    image_size: 512
+    image_size: 256
     embed_dim: 2048
     use_qpos: null
     use_kpos: null
@@ -56,6 +56,7 @@ training:
   mixed_precision: true
   seed: 42
   train_mode: "joint"
+  joint_hr_pipeline: true
   freeze_coarse: false
 
 loss:
@@ -74,9 +75,12 @@ loss:
   coarse_anchor_weight: 0.0
   oracle_patch_weight: 0.0
   oracle_patch_margin: 0.0
+  hr_refined_weight: 1.0
+  hr_perceptual_weight: 0.0
+  hr_style_weight: 0.0
 
 logging:
-  log_dir: "logs/train_supercaf_512_paper_refiner_pilot"
+  log_dir: "logs/train_supercaf_512_to_256_paper_refiner_pilot"
   log_interval: 100
   vis_interval: 2500
   eval_interval: 1000
