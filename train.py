@@ -80,7 +80,7 @@ def set_parameter_trainability(model, train_mode: str, freeze_coarse: bool = Fal
     coarse_param_ids = {id(param) for param in model.coarse_model.parameters()}
     for param in model.parameters():
         is_coarse = id(param) in coarse_param_ids
-        if train_mode == "joint":
+        if train_mode in ("joint", "refined_loss_only"):
             param.requires_grad = not (freeze_coarse and is_coarse)
         elif train_mode == "coarse_only":
             param.requires_grad = is_coarse
@@ -102,15 +102,21 @@ def compute_train_loss(criterion, coarse, refined, target, mask, train_mode: str
     perceptual = zero
     style = zero
 
-    if train_mode in ("joint", "refine_only") and criterion.perceptual_weight > 0:
+    if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.perceptual_weight > 0:
         perceptual = criterion.perceptual_loss(refined, target)
-    if train_mode in ("joint", "refine_only") and criterion.style_weight > 0:
+    if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.style_weight > 0:
         style = criterion.style_loss(refined, target)
 
     if train_mode == "joint":
         total = (
             l1_coarse
             + l1_refined
+            + criterion.perceptual_weight * perceptual
+            + criterion.style_weight * style
+        )
+    elif train_mode == "refined_loss_only":
+        total = (
+            l1_refined
             + criterion.perceptual_weight * perceptual
             + criterion.style_weight * style
         )

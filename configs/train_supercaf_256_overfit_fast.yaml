@@ -42,7 +42,7 @@ training:
   grad_clip: 1.0
   mixed_precision: true
   seed: 42
-  train_mode: "joint"
+  train_mode: "refined_loss_only"
   freeze_coarse: false
 
 loss:
