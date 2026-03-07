@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# uv
+.python-version
+uv.lock
+
+# Test files
+test_*.py
+demo_*.py
