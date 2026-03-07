@@ -116,6 +116,8 @@ class PatchInpainting(nn.Module):
         use_argmax: bool = False,
         residual_refinement: bool = True,
         refinement_gate_init: float = 1.0,
+        refinement_backend: str = "residual_cnn",
+        refinement_hidden_dim: int = 128,
         model,
     ):
         self.cross_attention = cross_attention
@@ -133,6 +135,8 @@ class PatchInpainting(nn.Module):
         self.mask_inpainting = mask_inpainting
         self.use_argmax = use_argmax
         self.use_residual_refinement = residual_refinement
+        self.refinement_backend = refinement_backend
+        self.refinement_hidden_dim = refinement_hidden_dim
         super().__init__()
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -170,6 +174,17 @@ class PatchInpainting(nn.Module):
             nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
         ) if self.final_conv else None
         self.refinement_gate = nn.Parameter(torch.tensor(refinement_gate_init, dtype=torch.float32))
+        self.refine_feature_proj = nn.Conv2d(self.feature_dim, 64, kernel_size=1, stride=1) if self.concat_features else None
+        refine_in_channels = stem_out_channels + stem_out_channels + 1 + (64 if self.concat_features else 0)
+        self.residual_refine_head = nn.Sequential(
+            nn.Conv2d(refine_in_channels, refinement_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+            nn.GELU(),
+            nn.Conv2d(refinement_hidden_dim, refinement_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+            nn.GELU(),
+            nn.Conv2d(refinement_hidden_dim, refinement_hidden_dim // 2, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+            nn.GELU(),
+            nn.Conv2d(refinement_hidden_dim // 2, stem_out_channels, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+        )
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -258,15 +273,29 @@ class PatchInpainting(nn.Module):
         return gate_logits.view(B, -1, n_h * n_w).transpose(1, 2)
 
     def forward(self, image, mask):
-        image_coarse_inpainting, features = self.encoder_decoder(image)
+        masked_input = image
+        image_coarse_inpainting, features = self.encoder_decoder(masked_input)
         if self.mask_inpainting:
-            image = image_coarse_inpainting * mask + image * (1 - mask)
+            coarse_composite = image_coarse_inpainting * mask + masked_input * (1 - mask)
         else:
-            image = image_coarse_inpainting
+            coarse_composite = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
 
+        if self.refinement_backend == "residual_cnn":
+            refine_inputs = [masked_input, coarse_composite, mask]
+            if self.concat_features:
+                features_to_concat = features[self.feature_i]
+                features_to_concat = F.interpolate(features_to_concat, size=coarse_composite.shape[-2:], mode='bilinear', align_corners=False)
+                features_to_concat = self.refine_feature_proj(features_to_concat)
+                refine_inputs.append(features_to_concat)
+
+            delta = self.residual_refine_head(torch.cat(refine_inputs, dim=1))
+            refinement_gate = torch.sigmoid(self.refinement_gate)
+            out = coarse_composite + refinement_gate * mask * delta
+            return out, None, image_to_return
+
         # V2: Use native unfold instead of CoreML conv2d hack
-        image_as_patches_full, sizes = self.unfold_native(image, self.kernel_size)
+        image_as_patches_full, sizes = self.unfold_native(coarse_composite, self.kernel_size)
 
         pos = self.positionalencoding.repeat(
             image_as_patches_full.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
