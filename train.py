@@ -610,7 +610,6 @@ def evaluate_refinement_health(
         "head_oracle_success_rate": [],
         "head_oracle_gap": [],
         "head_oracle_margin_violations": [],
-        "region_pred_noncoarse_rate": [],
     }
     gain_abs_values = []
     gain_pct_values = []
@@ -679,12 +678,6 @@ def evaluate_refinement_health(
             stats["head_oracle_success_rate"].append(head_oracle_metrics["head_oracle_success_rate"])
             stats["head_oracle_gap"].append(head_oracle_metrics["head_oracle_gap"])
             stats["head_oracle_margin_violations"].append(head_oracle_metrics["head_oracle_margin_violations"])
-        region_weights = getattr(model.generator, "last_region_weights", None)
-        region_pixel_mask = getattr(model.generator, "last_pixel_mask_flat", None)
-        if region_weights is not None and region_pixel_mask is not None:
-            valid_patches = region_pixel_mask.sum(dim=-1) > 0
-            route_idx = region_weights.argmax(dim=-1)
-            stats["region_pred_noncoarse_rate"].append((route_idx[valid_patches] > 0).float().mean().item())
 
     result = {}
     for key, values in stats.items():
@@ -834,8 +827,6 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         writer.add_scalar("val/head_oracle_gap", health["head_oracle_gap"], step)
     if health.get("head_oracle_margin_violations") is not None:
         writer.add_scalar("val/head_oracle_margin_violations", health["head_oracle_margin_violations"], step)
-    if health.get("region_pred_noncoarse_rate") is not None:
-        writer.add_scalar("val/region_pred_noncoarse_rate", health["region_pred_noncoarse_rate"], step)
     write_status(
         log_dir,
         step,
@@ -868,9 +859,6 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
             f", oracle_ok={health['head_oracle_success_rate']:.2f}"
             f", oracle_gap={health['head_oracle_gap']:.4f}"
         )
-    region_suffix = ""
-    if health.get("region_pred_noncoarse_rate") is not None:
-        region_suffix = f", region_on={health['region_pred_noncoarse_rate']:.2f}"
     warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
     print(
         f"\nValidation step {step}: "
@@ -883,7 +871,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"valid refined={health['valid_l1_refined']:.4f}, "
         f"raw valid refined={health['raw_valid_l1_refined']:.4f}, "
         f"gain_p50={health['gain_pct_p50']:.2f}% "
-        f"(p25={health['gain_pct_p25']:.2f}%, p75={health['gain_pct_p75']:.2f}%){gate_suffix}{selector_suffix}{oracle_suffix}{region_suffix}{warning_suffix}"
+        f"(p25={health['gain_pct_p25']:.2f}%, p75={health['gain_pct_p75']:.2f}%){gate_suffix}{selector_suffix}{oracle_suffix}{warning_suffix}"
     )
 
 
