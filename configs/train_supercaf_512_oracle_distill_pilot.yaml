@@ -2,10 +2,10 @@
 #
 # Key changes from train_supercaf_512_hybrid_retrieval_synthesis_pilot.yaml:
 # 1. oracle_patch_weight: 1.0  → directly trains fused output to match best candidate
-# 2. grad_accum_steps: 16     → 2x more optimizer steps (312 vs 156)
-# 3. total_steps: 5000        → fast pilot (~42 min on RTX 5080)
+# 2. grad_accum_steps: 8      → 4x more optimizer steps (1250 vs 156)
+# 3. total_steps: 10000       → enough steps to converge with lower accumulation
 # 4. fusion_bias_to_coarse: 0.0 → neutral init, let oracle distillation drive selection
-# 5. warmup_steps: 100        → proportional warmup for optimizer steps
+# 5. warmup_steps: 500        → proportional warmup for more optimizer steps
 
 model:
   coarse_model:
@@ -49,17 +49,17 @@ data:
   manifest_path: "dataset/manifests/supercaf_manifest.csv"
   val_dir: null
   image_size: 512
-  batch_size: 8
-  eval_batch_size: 8
+  batch_size: 4
+  eval_batch_size: 4
   num_workers: 4
   mask_min_coverage: 0.30
   mask_max_coverage: 0.50
 
 training:
-  total_steps: 5000
+  total_steps: 10000
   grad_accum_steps: 8
-  lr: 0.0002
-  warmup_steps: 100
+  lr: 0.0001
+  warmup_steps: 500
   min_lr: 0.000001
   grad_clip: 1.0
   mixed_precision: true
@@ -87,11 +87,11 @@ loss:
 logging:
   log_dir: "logs/train_supercaf_512_oracle_distill_pilot_v6"
   log_interval: 100
-  vis_interval: 1000
-  eval_interval: 500
-  eval_batches: 4
+  vis_interval: 2500
+  eval_interval: 1000
+  eval_batches: 8
   save_interval: 5000
   save_checkpoints: true
   save_final_checkpoint: true
-  checkpoint_steps: [5000]
+  checkpoint_steps: [5000, 10000]
   keep_last_checkpoints: 3
