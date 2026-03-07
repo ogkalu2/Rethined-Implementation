@@ -1,0 +1,71 @@
+# V6 SuperCAF patch-based quick pilot config at 512px with higher matcher capacity
+
+model:
+  coarse_model:
+    variant: "s4"
+  generator:
+    kernel_size: 8
+    nheads: 4
+    stem_out_stride: 1
+    stem_out_channels: 3
+    merge_mode: "all"
+    image_size: 512
+    embed_dim: 512
+    use_qpos: null
+    use_kpos: null
+    dropout: 0.0
+    feature_i: 3
+    concat_features: true
+    final_conv: true
+    feature_dim: 896
+    attention_type: "MultiHeadAttention"
+    compute_v: false
+    use_argmax: false
+    refinement_backend: "patch_attention"
+    refinement_gate_init: 1.0
+    patch_match_mode: "hf"
+    attn_topk: 8
+    attn_add_residual: false
+    token_use_mask_ratio: true
+    soft_key_mask_scale: 0.0
+
+data:
+  root_dir: "."
+  manifest_path: "dataset/manifests/supercaf_manifest.csv"
+  val_dir: null
+  image_size: 512
+  batch_size: 8
+  eval_batch_size: 8
+  num_workers: 4
+  mask_min_coverage: 0.30
+  mask_max_coverage: 0.50
+
+training:
+  total_steps: 5000
+  grad_accum_steps: 16
+  lr: 0.0001
+  warmup_steps: 250
+  min_lr: 0.000001
+  grad_clip: 1.0
+  mixed_precision: true
+  seed: 42
+  train_mode: "refined_loss_only"
+  freeze_coarse: false
+
+loss:
+  l1_hole_weight: 6.0
+  l1_valid_weight: 1.0
+  perceptual_weight: 0.0
+  style_weight: 0.0
+
+logging:
+  log_dir: "logs/train_supercaf_512_patch_pilot_fast_multihead_v6"
+  log_interval: 100
+  vis_interval: 2000
+  eval_interval: 1000
+  eval_batches: 4
+  save_interval: 5000
+  save_checkpoints: true
+  save_final_checkpoint: true
+  checkpoint_steps: [5000]
+  keep_last_checkpoints: 3
