@@ -347,22 +347,27 @@ class PatchInpainting(nn.Module):
         input_attn = self.patch_token_norm(input_attn)
 
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
+        blurred_patches_flat = image_as_patches_blurred.flatten(start_dim=2).transpose(1, 2)
+        hf_patches_flat = image_as_patches_hf.flatten(start_dim=2).transpose(1, 2)
 
         qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
         k_mask = -1e4 * mask_same_res_as_features_pooled if self.attention_masking else None
-        out, atten_weights = self.multihead_attention(input_attn, input_attn,
-            full_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
+        out_hf, atten_weights = self.multihead_attention(input_attn, input_attn,
+            hf_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.use_residual_refinement:
-            delta_full = out - full_patches_flat
-            delta_full = self.mix_patch_tokens(delta_full, sizes)
-            gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
+            delta_hf = out_hf - hf_patches_flat
+            delta_hf = self.mix_patch_tokens(delta_hf, sizes)
+            gate_logits = self.compute_patch_gate(hf_patches_flat, delta_hf, sizes)
             refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
-            out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
+            refined_hf = hf_patches_flat + refinement_gate * pixel_mask_flat * delta_hf
         else:
-            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
+            refined_hf = out_hf * patch_mask + hf_patches_flat * (1 - patch_mask)
+
+        # Reconstruct the final patch content as LF + refined HF, matching the paper's formulation.
+        out = blurred_patches_flat + refined_hf
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
