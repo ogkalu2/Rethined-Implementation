@@ -34,7 +34,7 @@ model:
     attn_topk: 8
     attn_add_residual: false
     token_use_mask_ratio: true
-    soft_key_mask_scale: 0.0
+    soft_key_mask_scale: 8.0
     use_head_selector: false
     use_spatial_fusion: true
     use_region_router: false
