@@ -154,6 +154,8 @@ class PatchInpainting(nn.Module):
         attn_temperature: float = 1.0,
         token_use_mask_ratio: bool = True,
         soft_key_mask_scale: float = 0.0,
+        attention_mask_mode: str = "strict",
+        apply_k_mask: bool = True,
         use_head_selector: bool = False,
         selector_hidden_dim: int = 256,
         selector_temperature: float = 1.0,
@@ -186,6 +188,8 @@ class PatchInpainting(nn.Module):
         self.attn_temperature = attn_temperature
         self.token_use_mask_ratio = token_use_mask_ratio
         self.soft_key_mask_scale = soft_key_mask_scale
+        self.attention_mask_mode = attention_mask_mode
+        self.apply_k_mask = apply_k_mask
         self.use_head_selector = use_head_selector
         self.selector_hidden_dim = selector_hidden_dim
         self.selector_temperature = selector_temperature
@@ -203,6 +207,11 @@ class PatchInpainting(nn.Module):
             raise ValueError(
                 f"Unsupported patch_match_mode={self.patch_match_mode!r}. "
                 "Expected one of: 'hf', 'full', 'hybrid'."
+            )
+        if self.attention_mask_mode not in ("strict", "paper"):
+            raise ValueError(
+                f"Unsupported attention_mask_mode={self.attention_mask_mode!r}. "
+                "Expected one of: 'strict', 'paper'."
             )
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -490,14 +499,23 @@ class PatchInpainting(nn.Module):
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
         self.last_base_patches_flat = full_patches_flat
 
-        qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
         if self.attention_masking:
-            if self.soft_key_mask_scale > 0:
-                key_mask_ratio = mask_ratio.flatten(start_dim=2).unsqueeze(-1)
-                k_mask = -self.soft_key_mask_scale * key_mask_ratio
+            if self.attention_mask_mode == "paper":
+                # Preserve known patches by biasing them toward self-attention while
+                # suppressing self-attention on masked patches.
+                qk_mask = self.qk_mask * (2.0 * (1.0 - mask_same_res_as_features_pooled) - 1.0)
             else:
-                k_mask = -1e4 * mask_same_res_as_features_pooled
+                qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1)
+            if self.apply_k_mask:
+                if self.soft_key_mask_scale > 0:
+                    key_mask_ratio = mask_ratio.flatten(start_dim=2).unsqueeze(-1)
+                    k_mask = -self.soft_key_mask_scale * key_mask_ratio
+                else:
+                    k_mask = -1e4 * mask_same_res_as_features_pooled
+            else:
+                k_mask = None
         else:
+            qk_mask = None
             k_mask = None
         if self.use_head_selector or self.use_spatial_fusion:
             out, atten_weights, head_outputs = self.multihead_attention(

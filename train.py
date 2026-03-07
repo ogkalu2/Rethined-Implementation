@@ -30,6 +30,8 @@ from model import InpaintingModel
 from losses import InpaintingLoss
 from data.dataset import get_dataloader
 
+REFINEMENT_TIE_EPS = 1e-6
+
 
 def build_model_config(cfg):
     """Build the model config dict from YAML config."""
@@ -586,6 +588,7 @@ def evaluate_refinement_health(
     gate_selective_margin=0.0,
     selector_choice_margin=0.0,
     head_oracle_margin=0.0,
+    oracle_patch_margin=0.0,
 ):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
@@ -598,6 +601,8 @@ def evaluate_refinement_health(
         "raw_valid_l1_coarse": [],
         "raw_valid_l1_refined": [],
         "refined_better_flags": [],
+        "refined_tie_flags": [],
+        "refined_worse_flags": [],
         "masked_delta_mean": [],
         "gate_target_rate": [],
         "gate_pred_mean": [],
@@ -610,6 +615,9 @@ def evaluate_refinement_health(
         "head_oracle_success_rate": [],
         "head_oracle_gap": [],
         "head_oracle_margin_violations": [],
+        "oracle_patch_noncoarse_rate": [],
+        "oracle_patch_distill_gap": [],
+        "oracle_patch_alignment": [],
     }
     gain_abs_values = []
     gain_pct_values = []
@@ -643,6 +651,9 @@ def evaluate_refinement_health(
         masked_delta = (torch.abs(refined - coarse) * mask).sum(dim=(1, 2, 3)) / hole_denom
         gain_abs = coarse_hole - refined_hole
         gain_pct = gain_abs / coarse_hole.clamp_min(1e-8) * 100.0
+        better_flags = (gain_abs > REFINEMENT_TIE_EPS).float()
+        tie_flags = (torch.abs(gain_abs) <= REFINEMENT_TIE_EPS).float()
+        worse_flags = (gain_abs < -REFINEMENT_TIE_EPS).float()
 
         stats["masked_l1_coarse"].extend(coarse_hole.detach().cpu().tolist())
         stats["masked_l1_refined"].extend(refined_hole.detach().cpu().tolist())
@@ -651,7 +662,9 @@ def evaluate_refinement_health(
         stats["raw_valid_l1_coarse"].extend(raw_coarse_valid.detach().cpu().tolist())
         stats["raw_valid_l1_refined"].extend(raw_refined_valid.detach().cpu().tolist())
         stats["masked_delta_mean"].extend(masked_delta.detach().cpu().tolist())
-        stats["refined_better_flags"].extend((refined_hole < coarse_hole).detach().cpu().float().tolist())
+        stats["refined_better_flags"].extend(better_flags.detach().cpu().tolist())
+        stats["refined_tie_flags"].extend(tie_flags.detach().cpu().tolist())
+        stats["refined_worse_flags"].extend(worse_flags.detach().cpu().tolist())
         gain_abs_values.extend(gain_abs.detach().cpu().tolist())
         gain_pct_values.extend(gain_pct.detach().cpu().tolist())
 
@@ -678,6 +691,11 @@ def evaluate_refinement_health(
             stats["head_oracle_success_rate"].append(head_oracle_metrics["head_oracle_success_rate"])
             stats["head_oracle_gap"].append(head_oracle_metrics["head_oracle_gap"])
             stats["head_oracle_margin_violations"].append(head_oracle_metrics["head_oracle_margin_violations"])
+        _, oracle_patch_metrics = compute_oracle_patch_distill_loss(model, image, margin=oracle_patch_margin)
+        if oracle_patch_metrics["oracle_patch_noncoarse_rate"] is not None:
+            stats["oracle_patch_noncoarse_rate"].append(oracle_patch_metrics["oracle_patch_noncoarse_rate"])
+            stats["oracle_patch_distill_gap"].append(oracle_patch_metrics["oracle_patch_distill_gap"])
+            stats["oracle_patch_alignment"].append(oracle_patch_metrics["oracle_patch_alignment"])
 
     result = {}
     for key, values in stats.items():
@@ -692,7 +710,8 @@ def evaluate_refinement_health(
 
     better_rate = result["refined_better_flags"]
     result["refined_better_rate"] = better_rate
-    result["refined_worse_rate"] = float(sum(1.0 for v in gain_abs_values if v < 0) / len(gain_abs_values)) if gain_abs_values else None
+    result["refined_tie_rate"] = result["refined_tie_flags"]
+    result["refined_worse_rate"] = result["refined_worse_flags"]
     add_distribution_metrics(result, gain_abs_values, "gain_abs")
     add_distribution_metrics(result, gain_pct_values, "gain_pct")
 
@@ -772,6 +791,7 @@ def run_eval_only(cfg, args):
         gate_selective_margin=criterion.gate_selective_margin,
         selector_choice_margin=criterion.selector_choice_margin,
         head_oracle_margin=criterion.head_oracle_margin,
+        oracle_patch_margin=criterion.oracle_patch_margin,
     )
 
     print("\nFull validation results:")
@@ -795,6 +815,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     writer.add_scalar("val/raw_valid_l1_refined", health["raw_valid_l1_refined"], step)
     writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
     writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
+    writer.add_scalar("val/refined_tie_rate", health["refined_tie_rate"], step)
     writer.add_scalar("val/refined_worse_rate", health["refined_worse_rate"], step)
     writer.add_scalar("val/masked_delta_mean", health["masked_delta_mean"], step)
     if health.get("gain_abs_p50") is not None:
@@ -827,6 +848,12 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         writer.add_scalar("val/head_oracle_gap", health["head_oracle_gap"], step)
     if health.get("head_oracle_margin_violations") is not None:
         writer.add_scalar("val/head_oracle_margin_violations", health["head_oracle_margin_violations"], step)
+    if health.get("oracle_patch_noncoarse_rate") is not None:
+        writer.add_scalar("val/oracle_patch_noncoarse_rate", health["oracle_patch_noncoarse_rate"], step)
+    if health.get("oracle_patch_distill_gap") is not None:
+        writer.add_scalar("val/oracle_patch_distill_gap", health["oracle_patch_distill_gap"], step)
+    if health.get("oracle_patch_alignment") is not None:
+        writer.add_scalar("val/oracle_patch_alignment", health["oracle_patch_alignment"], step)
     write_status(
         log_dir,
         step,
@@ -859,6 +886,12 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
             f", oracle_ok={health['head_oracle_success_rate']:.2f}"
             f", oracle_gap={health['head_oracle_gap']:.4f}"
         )
+    oracle_patch_suffix = ""
+    if health.get("oracle_patch_noncoarse_rate") is not None:
+        oracle_patch_suffix = (
+            f", oracle_pick={health['oracle_patch_noncoarse_rate']:.2f}"
+            f", oracle_align={health['oracle_patch_alignment']:.4f}"
+        )
     warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
     print(
         f"\nValidation step {step}: "
@@ -866,12 +899,13 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"refined={health['masked_l1_refined']:.4f}, "
         f"gain={health['refinement_gain_pct']:.2f}%, "
         f"better_rate={health['refined_better_rate']:.2f}, "
+        f"tie_rate={health['refined_tie_rate']:.2f}, "
         f"worse_rate={health['refined_worse_rate']:.2f}, "
         f"valid coarse={health['valid_l1_coarse']:.4f}, "
         f"valid refined={health['valid_l1_refined']:.4f}, "
         f"raw valid refined={health['raw_valid_l1_refined']:.4f}, "
         f"gain_p50={health['gain_pct_p50']:.2f}% "
-        f"(p25={health['gain_pct_p25']:.2f}%, p75={health['gain_pct_p75']:.2f}%){gate_suffix}{selector_suffix}{oracle_suffix}{warning_suffix}"
+        f"(p25={health['gain_pct_p25']:.2f}%, p75={health['gain_pct_p75']:.2f}%){gate_suffix}{selector_suffix}{oracle_suffix}{oracle_patch_suffix}{warning_suffix}"
     )
 
 
@@ -1090,6 +1124,7 @@ def train(cfg, args):
                 gate_selective_margin=criterion.gate_selective_margin,
                 selector_choice_margin=criterion.selector_choice_margin,
                 head_oracle_margin=criterion.head_oracle_margin,
+                oracle_patch_margin=criterion.oracle_patch_margin,
             )
             log_validation(
                 writer,
@@ -1150,6 +1185,7 @@ def train(cfg, args):
             gate_selective_margin=criterion.gate_selective_margin,
             selector_choice_margin=criterion.selector_choice_margin,
             head_oracle_margin=criterion.head_oracle_margin,
+            oracle_patch_margin=criterion.oracle_patch_margin,
         )
         log_validation(
             writer,
