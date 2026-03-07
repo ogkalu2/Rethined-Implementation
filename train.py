@@ -506,7 +506,7 @@ def evaluate_refinement_health(
     }
 
     for batch_idx, batch in enumerate(dataloader):
-        if batch_idx >= max_batches:
+        if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
             break
 
         image = batch["image"].to(device, non_blocking=True)
@@ -596,6 +596,77 @@ def evaluate_refinement_health(
     model.train()
     set_parameter_trainability(model, train_mode, freeze_coarse=freeze_coarse)
     return result
+
+
+def run_eval_only(cfg, args):
+    """Run validation only on a checkpoint without training."""
+    if not args.resume:
+        raise ValueError("--eval-only requires --resume CHECKPOINT")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name()}")
+
+    torch.manual_seed(cfg["training"]["seed"])
+
+    model_config = build_model_config(cfg)
+    model = InpaintingModel(model_config).to(device)
+    train_mode = cfg["training"].get("train_mode", "joint")
+    freeze_coarse = cfg["training"].get("freeze_coarse", False)
+    set_parameter_trainability(model, train_mode, freeze_coarse=freeze_coarse)
+
+    ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    print(f"Loaded checkpoint: {args.resume}")
+
+    criterion = InpaintingLoss(**cfg["loss"]).to(device)
+
+    val_dir = cfg["data"].get("val_dir")
+    manifest_path = cfg["data"].get("manifest_path")
+    eval_loader = get_dataloader(
+        root_dir=cfg["data"]["root_dir"],
+        image_size=cfg["data"]["image_size"],
+        split="val",
+        batch_size=cfg["data"].get("eval_batch_size", cfg["data"]["batch_size"]),
+        num_workers=max(1, min(2, cfg["data"]["num_workers"])),
+        max_images=None,
+        mask_min_coverage=cfg["data"]["mask_min_coverage"],
+        mask_max_coverage=cfg["data"]["mask_max_coverage"],
+        val_dir=val_dir,
+        manifest_path=manifest_path,
+    )
+    print(f"Validation images: {len(eval_loader.dataset)}")
+
+    if args.eval_batches is not None:
+        max_batches = args.eval_batches if args.eval_batches > 0 else None
+    else:
+        max_batches = cfg.get("logging", {}).get("eval_batches", 8)
+        if max_batches is not None and max_batches <= 0:
+            max_batches = None
+
+    health = evaluate_refinement_health(
+        model,
+        eval_loader,
+        device,
+        cfg["training"]["mixed_precision"],
+        max_batches=max_batches,
+        train_mode=train_mode,
+        freeze_coarse=freeze_coarse,
+        gate_selective_margin=criterion.gate_selective_margin,
+        selector_choice_margin=criterion.selector_choice_margin,
+        head_oracle_margin=criterion.head_oracle_margin,
+    )
+
+    print("\nFull validation results:")
+    print(json.dumps(health, indent=2))
+
+    log_dir = Path(cfg["logging"]["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    eval_path = log_dir / "eval_only_full_val.json"
+    with open(eval_path, "w", encoding="utf-8") as f:
+        json.dump(health, f, indent=2)
+    print(f"Saved eval summary: {eval_path}")
 
 
 def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, health):
@@ -970,12 +1041,17 @@ def main():
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
     parser.add_argument("--overfit", type=int, default=None, help="Overfit on N images (sanity check)")
     parser.add_argument("--steps", type=int, default=None, help="Override total training steps")
+    parser.add_argument("--eval-only", action="store_true", help="Run validation only on a checkpoint")
+    parser.add_argument("--eval-batches", type=int, default=None, help="Override eval batches; use 0 for full validation set")
     args = parser.parse_args()
 
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    train(cfg, args)
+    if args.eval_only:
+        run_eval_only(cfg, args)
+    else:
+        train(cfg, args)
 
 
 if __name__ == "__main__":
