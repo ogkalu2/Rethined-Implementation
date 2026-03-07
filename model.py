@@ -171,11 +171,20 @@ class PatchInpainting(nn.Module):
                 f"Unsupported refinement_backend={self.refinement_backend!r}. "
                 "Only the patch-based backend is supported."
             )
+        if self.patch_match_mode not in ("hf", "full", "hybrid"):
+            raise ValueError(
+                f"Unsupported patch_match_mode={self.patch_match_mode!r}. "
+                "Expected one of: 'hf', 'full', 'hybrid'."
+            )
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.pooling_layer = nn.MaxPool2d(kernel_size, stride=kernel_size)
         self.patch_value_dim = stem_out_channels * kernel_size * kernel_size
-        self.patch_token_dim = self.patch_value_dim + self.feature_dim if self.concat_features else self.patch_value_dim
+        if self.patch_match_mode == "hybrid":
+            self.patch_match_dim = self.patch_value_dim * 2
+        else:
+            self.patch_match_dim = self.patch_value_dim
+        self.patch_token_dim = self.patch_match_dim + self.feature_dim if self.concat_features else self.patch_match_dim
         if self.token_use_mask_ratio:
             self.patch_token_dim += 1
         self.multihead_attention = MultiHeadAttention(
@@ -332,7 +341,12 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
-        match_patches = image_as_patches_hf if self.patch_match_mode == "hf" else image_as_patches_full
+        if self.patch_match_mode == "hf":
+            match_patches = image_as_patches_hf
+        elif self.patch_match_mode == "full":
+            match_patches = image_as_patches_full
+        else:
+            match_patches = torch.cat([image_as_patches_hf, image_as_patches_full], dim=1)
         if self.concat_features:
             features_to_concat = features[self.feature_i]
             features_to_concat = F.interpolate(features_to_concat, size=image_as_patches_full.shape[-2:], mode='bilinear', align_corners=False)
@@ -347,27 +361,22 @@ class PatchInpainting(nn.Module):
         input_attn = self.patch_token_norm(input_attn)
 
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
-        blurred_patches_flat = image_as_patches_blurred.flatten(start_dim=2).transpose(1, 2)
-        hf_patches_flat = image_as_patches_hf.flatten(start_dim=2).transpose(1, 2)
 
         qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
         k_mask = -1e4 * mask_same_res_as_features_pooled if self.attention_masking else None
-        out_hf, atten_weights = self.multihead_attention(input_attn, input_attn,
-            hf_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
+        out, atten_weights = self.multihead_attention(input_attn, input_attn,
+            full_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.use_residual_refinement:
-            delta_hf = out_hf - hf_patches_flat
-            delta_hf = self.mix_patch_tokens(delta_hf, sizes)
-            gate_logits = self.compute_patch_gate(hf_patches_flat, delta_hf, sizes)
+            delta_full = out - full_patches_flat
+            delta_full = self.mix_patch_tokens(delta_full, sizes)
+            gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
             refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
-            refined_hf = hf_patches_flat + refinement_gate * pixel_mask_flat * delta_hf
+            out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
         else:
-            refined_hf = out_hf * patch_mask + hf_patches_flat * (1 - patch_mask)
-
-        # Reconstruct the final patch content as LF + refined HF, matching the paper's formulation.
-        out = blurred_patches_flat + refined_hf
+            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)

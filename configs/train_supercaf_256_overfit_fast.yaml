@@ -23,7 +23,7 @@ model:
     use_argmax: false
     refinement_backend: "patch_attention"
     refinement_gate_init: 1.0
-    patch_match_mode: "hf"
+    patch_match_mode: "hybrid"
     attn_topk: 8
     attn_add_residual: false
     token_use_mask_ratio: true
