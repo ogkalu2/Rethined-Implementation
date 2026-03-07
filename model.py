@@ -164,6 +164,11 @@ class PatchInpainting(nn.Module):
             nn.GELU(),
             nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
         ) if self.final_conv else None
+        self.patch_gate_mixer = torch.nn.Sequential(
+            nn.Conv2d(self.patch_value_dim * 2, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+            nn.GELU(),
+            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
+        ) if self.final_conv else None
         self.refinement_gate = nn.Parameter(torch.tensor(refinement_gate_init, dtype=torch.float32))
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
@@ -238,6 +243,20 @@ class PatchInpainting(nn.Module):
         patches_2d = self.patch_delta_mixer(patches_2d)
         return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
 
+    def compute_patch_gate(self, base_patches: torch.Tensor, delta_patches: torch.Tensor, output_size) -> torch.Tensor:
+        """Predict a per-token gate for residual updates."""
+        if self.patch_gate_mixer is None:
+            return delta_patches.new_ones(delta_patches.shape)
+
+        n_h = output_size[0] // self.kernel_size
+        n_w = output_size[1] // self.kernel_size
+        B = delta_patches.shape[0]
+
+        base_2d = base_patches.transpose(1, 2).view(B, -1, n_h, n_w)
+        delta_2d = delta_patches.transpose(1, 2).view(B, -1, n_h, n_w)
+        gate_logits = self.patch_gate_mixer(torch.cat([base_2d, delta_2d], dim=1))
+        return gate_logits.view(B, -1, n_h * n_w).transpose(1, 2)
+
     def forward(self, image, mask):
         image_coarse_inpainting, features = self.encoder_decoder(image)
         if self.mask_inpainting:
@@ -246,15 +265,11 @@ class PatchInpainting(nn.Module):
             image = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
 
-        image_blurred = self.final_gaussian_blur(image)
         # V2: Use native unfold instead of CoreML conv2d hack
-        image_as_patches_blurred, _ = self.unfold_native(image_blurred, self.kernel_size)
         image_as_patches_full, sizes = self.unfold_native(image, self.kernel_size)
 
-        image_as_patches = image_as_patches_full - image_as_patches_blurred
-
         pos = self.positionalencoding.repeat(
-            image_as_patches.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
+            image_as_patches_full.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
 
         # V2: Use native unfold for mask
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
@@ -267,30 +282,28 @@ class PatchInpainting(nn.Module):
 
         if self.concat_features:
             features_to_concat = features[self.feature_i]
-            features_to_concat = F.interpolate(features_to_concat, size=image_as_patches.shape[-2:], mode='bilinear', align_corners=False)
-            input_attn = torch.cat([image_as_patches, features_to_concat], dim=1)
+            features_to_concat = F.interpolate(features_to_concat, size=image_as_patches_full.shape[-2:], mode='bilinear', align_corners=False)
+            input_attn = torch.cat([image_as_patches_full, features_to_concat], dim=1)
             input_attn = input_attn.flatten(start_dim=2).transpose(1, 2)
         else:
-            input_attn = image_as_patches.flatten(start_dim=2).transpose(1, 2)
+            input_attn = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
 
-        image_as_patches = image_as_patches.flatten(start_dim=2).transpose(1, 2)
-        blurred_flat = image_as_patches_blurred.flatten(start_dim=2).transpose(1, 2)
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
 
-        qk_mask = -1e4 * self.qk_mask.repeat(image_as_patches.size(0), 1, 1, 1) + 2e4 * ((1 - mask_same_res_as_features_pooled) * self.qk_mask) if self.attention_masking else None
+        qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) + 2e4 * ((1 - mask_same_res_as_features_pooled) * self.qk_mask) if self.attention_masking else None
         k_mask = -1e4 * mask_same_res_as_features_pooled if self.attention_masking else None
         out, atten_weights = self.multihead_attention(input_attn, input_attn,
-            image_as_patches, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
+            full_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.use_residual_refinement:
-            delta_hf = out - image_as_patches
-            delta_hf = self.mix_patch_tokens(delta_hf, sizes)
-            refinement_gate = torch.sigmoid(self.refinement_gate)
-            out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_hf
+            delta_full = out - full_patches_flat
+            delta_full = self.mix_patch_tokens(delta_full, sizes)
+            gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
+            refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
+            out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
         else:
-            out = out + blurred_flat
             out = out * patch_mask + full_patches_flat * (1 - patch_mask)
 
         # V2: Use native fold
