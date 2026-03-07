@@ -161,6 +161,11 @@ class PatchInpainting(nn.Module):
         selector_bias_to_coarse: float = 2.0,
         use_spatial_fusion: bool = False,
         fusion_hidden_dim: int = 256,
+        use_region_router: bool = False,
+        region_router_hidden_dim: int = 256,
+        region_router_temperature: float = 1.0,
+        region_router_hard: bool = True,
+        region_router_bias_to_coarse: float = 0.5,
         model,
     ):
         self.cross_attention = cross_attention
@@ -193,6 +198,11 @@ class PatchInpainting(nn.Module):
         self.selector_bias_to_coarse = selector_bias_to_coarse
         self.use_spatial_fusion = use_spatial_fusion
         self.fusion_hidden_dim = fusion_hidden_dim
+        self.use_region_router = use_region_router
+        self.region_router_hidden_dim = region_router_hidden_dim
+        self.region_router_temperature = region_router_temperature
+        self.region_router_hard = region_router_hard
+        self.region_router_bias_to_coarse = region_router_bias_to_coarse
         super().__init__()
         if self.refinement_backend not in ("patch_attention", "patch", None):
             raise ValueError(
@@ -266,6 +276,29 @@ class PatchInpainting(nn.Module):
                 self.patch_selector[-1].bias[0] = self.selector_bias_to_coarse
         else:
             self.patch_selector = None
+        if self.use_region_router:
+            region_in_channels = self.patch_value_dim * (self.nheads + 1) + 1 + self.feature_dim
+            self.region_router_backbone = torch.nn.Sequential(
+                nn.Conv2d(region_in_channels, self.region_router_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+                nn.Conv2d(self.region_router_hidden_dim, self.region_router_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+            )
+            self.region_router_head = nn.Linear(self.region_router_hidden_dim, self.nheads + 1)
+            self.region_local_refiner = torch.nn.Sequential(
+                nn.Conv2d(self.patch_value_dim + self.feature_dim + 1, self.fusion_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+                nn.Conv2d(self.fusion_hidden_dim, self.fusion_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+                nn.Conv2d(self.fusion_hidden_dim, self.patch_value_dim, kernel_size=1, stride=1),
+            )
+            with torch.no_grad():
+                self.region_router_head.bias.zero_()
+                self.region_router_head.bias[0] = self.region_router_bias_to_coarse
+        else:
+            self.region_router_backbone = None
+            self.region_router_head = None
+            self.region_local_refiner = None
         if self.use_spatial_fusion:
             fusion_in_channels = self.patch_value_dim * (self.nheads + 1) + 1 + self.feature_dim
             self.patch_fusion_backbone = torch.nn.Sequential(
@@ -293,6 +326,7 @@ class PatchInpainting(nn.Module):
         self.last_candidate_bank = None
         self.last_fusion_weights = None
         self.last_output_patches_flat = None
+        self.last_region_weights = None
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -439,6 +473,82 @@ class PatchInpainting(nn.Module):
         fused_candidates = fused_candidates + pixel_mask_flat * fusion_delta
         return fused_candidates, fusion_weights_flat.squeeze(-1)
 
+    def compute_patch_components(self, patch_mask_2d: torch.Tensor):
+        """Compute connected components on the masked patch grid."""
+        mask_np = (patch_mask_2d.detach().squeeze(1).cpu().numpy() > 0.5)
+        labels = []
+        counts = []
+        for sample_mask in mask_np:
+            h, w = sample_mask.shape
+            label = -np.ones((h, w), dtype=np.int64)
+            comp_count = 0
+            for i in range(h):
+                for j in range(w):
+                    if not sample_mask[i, j] or label[i, j] >= 0:
+                        continue
+                    stack = [(i, j)]
+                    label[i, j] = comp_count
+                    while stack:
+                        y, x = stack.pop()
+                        for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                            if 0 <= ny < h and 0 <= nx < w and sample_mask[ny, nx] and label[ny, nx] < 0:
+                                label[ny, nx] = comp_count
+                                stack.append((ny, nx))
+                    comp_count += 1
+            labels.append(torch.from_numpy(label))
+            counts.append(comp_count)
+        labels = torch.stack(labels, dim=0).to(patch_mask_2d.device)
+        return labels, counts
+
+    def route_patch_regions(
+        self,
+        candidate_bank: torch.Tensor,
+        mask_ratio: torch.Tensor,
+        features_to_concat: torch.Tensor,
+        pixel_mask_flat: torch.Tensor,
+        patch_mask_2d: torch.Tensor,
+        output_size,
+    ):
+        """Route one shared hypothesis mixture per connected masked region."""
+        if self.region_router_backbone is None or self.region_router_head is None or self.region_local_refiner is None:
+            raise RuntimeError("Region routing requested but modules are not initialized.")
+
+        n_h = output_size[0] // self.kernel_size
+        n_w = output_size[1] // self.kernel_size
+        B, N, K, D = candidate_bank.shape
+        candidate_tokens = candidate_bank.permute(0, 2, 3, 1).contiguous().view(B, K * D, n_h, n_w)
+        router_input = torch.cat([candidate_tokens, features_to_concat, mask_ratio], dim=1)
+        region_feat = self.region_router_backbone(router_input)
+        region_feat_flat = region_feat.permute(0, 2, 3, 1).contiguous().view(B, N, -1)
+
+        labels, comp_counts = self.compute_patch_components(patch_mask_2d)
+        labels_flat = labels.view(B, N)
+        region_weights = candidate_bank.new_zeros(B, N, K)
+        region_weights[:, :, 0] = 1.0
+
+        for batch_idx in range(B):
+            label_flat = labels_flat[batch_idx]
+            feat_flat = region_feat_flat[batch_idx]
+            for comp_idx in range(comp_counts[batch_idx]):
+                comp_mask = label_flat == comp_idx
+                if not comp_mask.any():
+                    continue
+                comp_embed = feat_flat[comp_mask].mean(dim=0, keepdim=True)
+                logits = self.region_router_head(comp_embed)
+                probs = F.softmax(logits / max(self.region_router_temperature, 1e-6), dim=-1)
+                if self.region_router_hard:
+                    idx = torch.argmax(probs, dim=-1, keepdim=True)
+                    probs_hard = torch.zeros_like(probs).scatter_(-1, idx, 1.0)
+                    probs = probs_hard - probs.detach() + probs
+                region_weights[batch_idx, comp_mask] = probs.expand(comp_mask.sum(), -1)
+
+        routed = (region_weights.unsqueeze(-1) * candidate_bank).sum(dim=2)
+        routed_2d = routed.transpose(1, 2).view(B, D, n_h, n_w)
+        local_input = torch.cat([routed_2d, features_to_concat, mask_ratio], dim=1)
+        local_delta = self.region_local_refiner(local_input).view(B, D, n_h * n_w).transpose(1, 2)
+        routed = routed + pixel_mask_flat * local_delta
+        return routed, region_weights
+
     def forward(self, image, mask):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
@@ -499,7 +609,7 @@ class PatchInpainting(nn.Module):
                 k_mask = -1e4 * mask_same_res_as_features_pooled
         else:
             k_mask = None
-        if self.use_head_selector or self.use_spatial_fusion:
+        if self.use_head_selector or self.use_spatial_fusion or self.use_region_router:
             out, atten_weights, head_outputs = self.multihead_attention(
                 input_attn,
                 input_attn,
@@ -523,7 +633,28 @@ class PatchInpainting(nn.Module):
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.use_residual_refinement:
-            if self.use_spatial_fusion:
+            patch_mask_2d = mask_same_res_as_features_pooled.view(mask_same_res_as_features_pooled.size(0), 1, image_as_patches_full.shape[-2], image_as_patches_full.shape[-1])
+            if self.use_region_router:
+                delta_full = head_outputs - full_patches_flat.unsqueeze(2)
+                delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
+                candidate_bank = full_patches_flat.unsqueeze(2) + pixel_mask_flat.unsqueeze(2) * delta_full
+                candidate_bank = torch.cat([full_patches_flat.unsqueeze(2), candidate_bank], dim=2)
+                out, region_weights = self.route_patch_regions(
+                    candidate_bank,
+                    mask_ratio,
+                    features_to_concat,
+                    pixel_mask_flat,
+                    patch_mask_2d,
+                    sizes,
+                )
+                self.last_refinement_gate_map = None
+                self.last_candidate_patches_flat = None
+                self.last_selector_logits = None
+                self.last_selector_probs = None
+                self.last_candidate_bank = candidate_bank
+                self.last_fusion_weights = None
+                self.last_region_weights = region_weights
+            elif self.use_spatial_fusion:
                 delta_full = head_outputs - full_patches_flat.unsqueeze(2)
                 delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
                 candidate_bank = full_patches_flat.unsqueeze(2) + pixel_mask_flat.unsqueeze(2) * delta_full
@@ -541,6 +672,7 @@ class PatchInpainting(nn.Module):
                 self.last_selector_probs = None
                 self.last_candidate_bank = candidate_bank
                 self.last_fusion_weights = fusion_weights
+                self.last_region_weights = None
             elif self.use_head_selector:
                 delta_full = head_outputs - full_patches_flat.unsqueeze(2)
                 delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
@@ -553,6 +685,7 @@ class PatchInpainting(nn.Module):
                 self.last_selector_probs = selector_probs
                 self.last_candidate_bank = candidate_bank
                 self.last_fusion_weights = None
+                self.last_region_weights = None
             else:
                 delta_full = out - full_patches_flat
                 delta_full = self.mix_patch_tokens(delta_full, sizes)
@@ -566,6 +699,7 @@ class PatchInpainting(nn.Module):
                 self.last_selector_probs = None
                 self.last_candidate_bank = None
                 self.last_fusion_weights = None
+                self.last_region_weights = None
             self.last_output_patches_flat = out
             self.last_pixel_mask_flat = pixel_mask_flat
         else:
@@ -578,6 +712,7 @@ class PatchInpainting(nn.Module):
             self.last_candidate_bank = None
             self.last_fusion_weights = None
             self.last_output_patches_flat = out
+            self.last_region_weights = None
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
