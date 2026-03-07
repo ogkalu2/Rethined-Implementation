@@ -100,8 +100,11 @@ class MultiHeadAttention(nn.Module):
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
 
         if self.use_argmax:
-            idx = torch.argmax(attn, dim=1, keepdims=True)
-            attn = torch.zeros_like(attn).scatter_(1, idx, 1.)
+            # Pick source patches, not attention heads. Use straight-through hard attention
+            # so training still gets soft-attention gradients.
+            idx = torch.argmax(attn, dim=-1, keepdim=True)
+            attn_hard = torch.zeros_like(attn).scatter_(-1, idx, 1.0)
+            attn = attn_hard - attn.detach() + attn
 
         attn = self.dropout(attn)
         output = torch.matmul(attn, v)
