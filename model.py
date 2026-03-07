@@ -68,7 +68,20 @@ class MultiHeadAttention(nn.Module):
         self.topk_patches = topk_patches
         self.softmax_temperature = softmax_temperature
 
-    def forward(self, q, k, v, qpos, kpos, qk_mask=None, k_mask=None, return_head_outputs=False):
+    def forward(
+        self,
+        q,
+        k,
+        v,
+        qpos,
+        kpos,
+        qk_mask=None,
+        k_mask=None,
+        post_softmax_mask=None,
+        renorm_post_mask=False,
+        direct_patch_mixing=False,
+        return_head_outputs=False,
+    ):
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
         sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
 
@@ -76,9 +89,15 @@ class MultiHeadAttention(nn.Module):
 
         q = self.w_qs(q).view(sz_b, len_q, n_head, d_k)
         k = self.w_ks(k).view(sz_b, len_k, n_head, d_k)
-        v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
+        if direct_patch_mixing:
+            if n_head != 1:
+                raise ValueError("direct_patch_mixing only supports n_head=1.")
+            v_mixed = v.unsqueeze(1)
+        else:
+            v = self.w_vs(v).view(sz_b, len_v, n_head, d_v)
+            v_mixed = v.transpose(1, 2)
 
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        q, k = q.transpose(1, 2), k.transpose(1, 2)
 
         attn = torch.matmul(q / self.d_k**0.5, k.transpose(2, 3))
 
@@ -98,6 +117,10 @@ class MultiHeadAttention(nn.Module):
         attn = attn / max(self.softmax_temperature, 1e-6)
         # Force FP32 for softmax to prevent FP16 overflow from large mask values
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
+        if post_softmax_mask is not None:
+            attn = attn * post_softmax_mask
+            if renorm_post_mask:
+                attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
 
         if self.use_argmax:
             # Pick source patches, not attention heads. Use straight-through hard attention
@@ -107,10 +130,13 @@ class MultiHeadAttention(nn.Module):
             attn = attn_hard - attn.detach() + attn
 
         attn = self.dropout(attn)
-        head_output = torch.matmul(attn, v)
+        head_output = torch.matmul(attn, v_mixed)
         output = head_output.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
-        output = self.dropout(self.fc(output))
-        if self.add_residual:
+        if direct_patch_mixing:
+            output = output
+        else:
+            output = self.dropout(self.fc(output))
+        if self.add_residual and not direct_patch_mixing:
             output = output + residual
 
         if return_head_outputs:
@@ -145,6 +171,7 @@ class PatchInpainting(nn.Module):
         mask_inpainting: bool = True,
         use_argmax: bool = False,
         residual_refinement: bool = True,
+        refiner_formulation: str = "v6",
         refinement_gate_init: float = 1.0,
         refinement_backend: str = "patch_attention",
         refinement_hidden_dim: int = 128,
@@ -156,6 +183,7 @@ class PatchInpainting(nn.Module):
         soft_key_mask_scale: float = 0.0,
         attention_mask_mode: str = "strict",
         apply_k_mask: bool = True,
+        paper_mask_renormalize: bool = False,
         use_head_selector: bool = False,
         selector_hidden_dim: int = 256,
         selector_temperature: float = 1.0,
@@ -180,6 +208,7 @@ class PatchInpainting(nn.Module):
         self.mask_inpainting = mask_inpainting
         self.use_argmax = use_argmax
         self.use_residual_refinement = residual_refinement
+        self.refiner_formulation = refiner_formulation
         self.refinement_backend = refinement_backend
         self.refinement_hidden_dim = refinement_hidden_dim
         self.patch_match_mode = patch_match_mode
@@ -190,6 +219,7 @@ class PatchInpainting(nn.Module):
         self.soft_key_mask_scale = soft_key_mask_scale
         self.attention_mask_mode = attention_mask_mode
         self.apply_k_mask = apply_k_mask
+        self.paper_mask_renormalize = paper_mask_renormalize
         self.use_head_selector = use_head_selector
         self.selector_hidden_dim = selector_hidden_dim
         self.selector_temperature = selector_temperature
@@ -203,6 +233,11 @@ class PatchInpainting(nn.Module):
                 f"Unsupported refinement_backend={self.refinement_backend!r}. "
                 "Only the patch-based backend is supported."
             )
+        if self.refiner_formulation not in ("v6", "paper"):
+            raise ValueError(
+                f"Unsupported refiner_formulation={self.refiner_formulation!r}. "
+                "Expected one of: 'v6', 'paper'."
+            )
         if self.patch_match_mode not in ("hf", "full", "hybrid"):
             raise ValueError(
                 f"Unsupported patch_match_mode={self.patch_match_mode!r}. "
@@ -213,6 +248,8 @@ class PatchInpainting(nn.Module):
                 f"Unsupported attention_mask_mode={self.attention_mask_mode!r}. "
                 "Expected one of: 'strict', 'paper'."
             )
+        if self.refiner_formulation == "paper" and (self.use_head_selector or self.use_spatial_fusion):
+            raise ValueError("Paper refiner formulation does not support selector or spatial fusion modules.")
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.pooling_layer = nn.MaxPool2d(kernel_size, stride=kernel_size)
@@ -262,6 +299,10 @@ class PatchInpainting(nn.Module):
             nn.Conv2d(self.patch_value_dim * 2, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
             nn.GELU(),
             nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
+        ) if self.final_conv else None
+        self.paper_coherence_layer = torch.nn.Sequential(
+            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+            nn.Sigmoid(),
         ) if self.final_conv else None
         if self.use_head_selector:
             selector_in_channels = self.patch_value_dim * (self.nheads + 1) + 1
@@ -448,6 +489,30 @@ class PatchInpainting(nn.Module):
         fused_candidates = fused_candidates + pixel_mask_flat * fusion_delta
         return fused_candidates, fusion_weights_flat.squeeze(-1)
 
+    def build_paper_attention_mask(self, pooled_patch_mask: torch.Tensor) -> torch.Tensor:
+        """Paper-style multiplicative mask applied after softmax."""
+        patch_mask_flat = pooled_patch_mask.squeeze(1).squeeze(-1)
+        B, N = patch_mask_flat.shape
+        eye = torch.eye(N, device=patch_mask_flat.device, dtype=patch_mask_flat.dtype).unsqueeze(0)
+        valid_queries = (1.0 - patch_mask_flat).unsqueeze(-1)
+        valid_keys = (1.0 - patch_mask_flat).unsqueeze(1)
+        masked_queries = patch_mask_flat.unsqueeze(-1)
+        preserve_clean = eye * valid_queries
+        masked_to_valid = masked_queries * valid_keys
+        return (preserve_clean + masked_to_valid).unsqueeze(1)
+
+    def apply_paper_coherence(self, patches: torch.Tensor, output_size) -> torch.Tensor:
+        """Apply the lightweight patch-grid coherence layer described in the paper."""
+        if self.paper_coherence_layer is None:
+            return patches
+
+        n_h = output_size[0] // self.kernel_size
+        n_w = output_size[1] // self.kernel_size
+        B = patches.shape[0]
+        patches_2d = patches.transpose(1, 2).view(B, -1, n_h, n_w)
+        patches_2d = self.paper_coherence_layer(patches_2d)
+        return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
+
     def forward(self, image, mask):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
@@ -476,7 +541,9 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
-        if self.patch_match_mode == "hf":
+        if self.refiner_formulation == "paper":
+            match_patches = image_as_patches_full
+        elif self.patch_match_mode == "hf":
             match_patches = image_as_patches_hf
         elif self.patch_match_mode == "full":
             match_patches = image_as_patches_full
@@ -494,26 +561,35 @@ class PatchInpainting(nn.Module):
             token_map = torch.cat([token_map, mask_ratio], dim=1)
 
         input_attn = token_map.flatten(start_dim=2).transpose(1, 2)
-        input_attn = self.patch_token_norm(input_attn)
+        if self.refiner_formulation != "paper":
+            input_attn = self.patch_token_norm(input_attn)
 
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
         self.last_base_patches_flat = full_patches_flat
 
+        post_softmax_mask = None
+        renorm_post_mask = False
         if self.attention_masking:
-            if self.attention_mask_mode == "paper":
-                # Preserve known patches by biasing them toward self-attention while
-                # suppressing self-attention on masked patches.
-                qk_mask = self.qk_mask * (2.0 * (1.0 - mask_same_res_as_features_pooled) - 1.0)
-            else:
-                qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1)
-            if self.apply_k_mask:
-                if self.soft_key_mask_scale > 0:
-                    key_mask_ratio = mask_ratio.flatten(start_dim=2).unsqueeze(-1)
-                    k_mask = -self.soft_key_mask_scale * key_mask_ratio
-                else:
-                    k_mask = -1e4 * mask_same_res_as_features_pooled
-            else:
+            if self.refiner_formulation == "paper":
+                qk_mask = None
                 k_mask = None
+                post_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled)
+                renorm_post_mask = self.paper_mask_renormalize
+            else:
+                if self.attention_mask_mode == "paper":
+                    # Preserve known patches by biasing them toward self-attention while
+                    # suppressing self-attention on masked patches.
+                    qk_mask = self.qk_mask * (2.0 * (1.0 - mask_same_res_as_features_pooled) - 1.0)
+                else:
+                    qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1)
+                if self.apply_k_mask:
+                    if self.soft_key_mask_scale > 0:
+                        key_mask_ratio = mask_ratio.flatten(start_dim=2).unsqueeze(-1)
+                        k_mask = -self.soft_key_mask_scale * key_mask_ratio
+                    else:
+                        k_mask = -1e4 * mask_same_res_as_features_pooled
+                else:
+                    k_mask = None
         else:
             qk_mask = None
             k_mask = None
@@ -526,6 +602,9 @@ class PatchInpainting(nn.Module):
                 kpos=pos,
                 qk_mask=qk_mask,
                 k_mask=k_mask,
+                post_softmax_mask=post_softmax_mask,
+                renorm_post_mask=renorm_post_mask,
+                direct_patch_mixing=(self.refiner_formulation == "paper"),
                 return_head_outputs=True,
             )
         else:
@@ -537,10 +616,25 @@ class PatchInpainting(nn.Module):
                 kpos=pos,
                 qk_mask=qk_mask,
                 k_mask=k_mask,
+                post_softmax_mask=post_softmax_mask,
+                renorm_post_mask=renorm_post_mask,
+                direct_patch_mixing=(self.refiner_formulation == "paper"),
             )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        if self.use_residual_refinement:
+        if self.refiner_formulation == "paper":
+            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
+            out = self.apply_paper_coherence(out, sizes)
+            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
+            self.last_refinement_gate_map = None
+            self.last_candidate_patches_flat = None
+            self.last_selector_logits = None
+            self.last_selector_probs = None
+            self.last_candidate_bank = None
+            self.last_fusion_weights = None
+            self.last_output_patches_flat = out
+            self.last_pixel_mask_flat = pixel_mask_flat
+        elif self.use_residual_refinement:
             if self.use_spatial_fusion:
                 delta_full = head_outputs - full_patches_flat.unsqueeze(2)
                 delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
@@ -668,33 +762,40 @@ class AttentionUpscaling(nn.Module):
         super().__init__()
         self.patch_inpainting = patch_inpainting_module
 
-    def forward(self, x_hr, x_lr_inpainted, attn_map, x_lr_blurred=None):
+    def forward(self, x_hr, x_lr_inpainted, attn_map):
         hr_h, hr_w = x_hr.shape[-2:]
         lr_h, lr_w = x_lr_inpainted.shape[-2:]
 
-        # V3-C: Bilinear instead of bicubic (2-4x faster, negligible quality loss)
-        x_hr_base = F.interpolate(x_lr_inpainted, size=(hr_h, hr_w), mode='bilinear', align_corners=False)
+        scale_h = hr_h // lr_h
+        scale_w = hr_w // lr_w
+        if hr_h % lr_h != 0 or hr_w % lr_w != 0 or scale_h != scale_w:
+            raise ValueError(
+                "AttentionUpscaling requires an integer isotropic HR/LR scale factor "
+                f"(got LR {lr_h}x{lr_w}, HR {hr_h}x{hr_w})"
+            )
+        if attn_map.dim() != 4 or attn_map.size(1) != 1:
+            raise ValueError(
+                "AttentionUpscaling expects a single-head attention map with shape "
+                f"(B, 1, N, N); got {tuple(attn_map.shape)}"
+            )
 
-        hr_patch_size = self.patch_inpainting.kernel_size * (hr_h // lr_h)
+        # Section 3.4: bicubic upsample the LR inpainted image, then add HR HF details.
+        x_hr_base = F.interpolate(x_lr_inpainted, size=(hr_h, hr_w), mode='bicubic', align_corners=False)
+
+        hr_patch_size = self.patch_inpainting.kernel_size * scale_h
 
         hr_patches, _ = self.patch_inpainting.unfold_native(x_hr, hr_patch_size)
 
-        # V3-D: Blur at LR domain then upsample (instead of blurring at HR)
-        if x_lr_blurred is not None:
-            hr_blurred = F.interpolate(x_lr_blurred, size=(hr_h, hr_w), mode='bilinear', align_corners=False)
-        else:
-            # Fallback: blur at HR (for base resolution where LR blur isn't provided)
-            hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
+        # Section 3.4 mixes only HR high frequencies extracted from the HR masked image.
+        hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
         hr_patches_blurred, _ = self.patch_inpainting.unfold_native(hr_blurred, hr_patch_size)
 
-        # High-frequency = original - blurred
         hr_hf_patches = hr_patches - hr_patches_blurred
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
 
-        # Attention-weighted sum of HR high-frequency patches
         reconstructed_hr_hf_patches = torch.matmul(attn_map.squeeze(1), hr_hf_patches)
 
-        # Fold back to image
+        # Reassemble non-overlapping HR patches without an HR coherence layer.
         reconstructed_hr_hf_image = self.patch_inpainting.fold_native(
             reconstructed_hr_hf_patches, (hr_h, hr_w), kernel_size=hr_patch_size, use_final_conv=False)
 

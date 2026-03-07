@@ -32,6 +32,9 @@ class InpaintingLoss(nn.Module):
         coarse_anchor_weight: float = 0.0,
         oracle_patch_weight: float = 0.0,
         oracle_patch_margin: float = 0.0,
+        hr_refined_weight: float = 0.0,
+        hr_perceptual_weight: float = 0.0,
+        hr_style_weight: float = 0.0,
     ):
         super().__init__()
         self.l1_hole_weight = l1_hole_weight
@@ -49,6 +52,9 @@ class InpaintingLoss(nn.Module):
         self.coarse_anchor_weight = coarse_anchor_weight
         self.oracle_patch_weight = oracle_patch_weight
         self.oracle_patch_margin = oracle_patch_margin
+        self.hr_refined_weight = hr_refined_weight
+        self.hr_perceptual_weight = hr_perceptual_weight
+        self.hr_style_weight = hr_style_weight
 
         self.perceptual_loss = PerceptualLoss()
         self.style_loss = StyleLoss()

@@ -26,7 +26,7 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
-from model import InpaintingModel
+from model import AttentionUpscaling, InpaintingModel
 from losses import InpaintingLoss
 from data.dataset import get_dataloader
 
@@ -75,6 +75,72 @@ def save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, path):
 def composite_with_known(pred, target, mask):
     """Preserve known pixels exactly and only use predictions inside the hole."""
     return pred * mask + target * (1 - mask)
+
+
+def prepare_multiscale_batch(batch, device, model_image_size: int):
+    """Prepare fixed-resolution model inputs from a possibly larger HR crop."""
+    image_hr = batch["image"].to(device, non_blocking=True)
+    mask_hr = batch["mask"].to(device, non_blocking=True)
+    masked_image_hr = image_hr * (1 - mask_hr)
+
+    if image_hr.shape[-2:] == (model_image_size, model_image_size):
+        image = image_hr
+        mask = mask_hr
+    else:
+        image = F.interpolate(image_hr, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
+        mask = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
+        mask = (mask > 0.5).to(image.dtype)
+
+    masked_image = image * (1 - mask)
+    return {
+        "image": image,
+        "mask": mask,
+        "masked_image": masked_image,
+        "image_hr": image_hr,
+        "mask_hr": mask_hr,
+        "masked_image_hr": masked_image_hr,
+        "has_hr_supervision": image_hr.shape[-2:] != image.shape[-2:],
+    }
+
+
+def validate_joint_hr_pipeline(cfg, model):
+    """Validate the config needed to train the LR+HR pipeline jointly."""
+    joint_hr_pipeline = cfg["training"].get("joint_hr_pipeline", False)
+    model_image_size = model.generator.image_size
+    data_image_size = cfg["data"]["image_size"]
+
+    if joint_hr_pipeline:
+        if data_image_size <= model_image_size:
+            raise ValueError(
+                "training.joint_hr_pipeline=true requires data.image_size > "
+                f"model.generator.image_size ({data_image_size} <= {model_image_size})"
+            )
+        if data_image_size % model_image_size != 0:
+            raise ValueError(
+                "training.joint_hr_pipeline requires data.image_size to be an integer "
+                f"multiple of model.generator.image_size ({data_image_size} vs {model_image_size})"
+            )
+        if model.generator.nheads != 1:
+            raise ValueError(
+                "training.joint_hr_pipeline currently requires nheads=1 because "
+                "AttentionUpscaling expects a single learned attention map."
+            )
+
+    return joint_hr_pipeline, model_image_size
+
+
+def compute_hr_refined(attn_upscaler, batch_views, refined_lr, attn_map):
+    """Run the attention upscaler and preserve known HR pixels exactly."""
+    hr_refined_raw = attn_upscaler(batch_views["masked_image_hr"], refined_lr, attn_map)
+    hr_refined = composite_with_known(hr_refined_raw, batch_views["image_hr"], batch_views["mask_hr"])
+    hr_base = F.interpolate(
+        refined_lr,
+        size=batch_views["image_hr"].shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    )
+    hr_base = composite_with_known(hr_base, batch_views["image_hr"], batch_views["mask_hr"])
+    return hr_refined, hr_base
 
 
 def set_parameter_trainability(model, train_mode: str, freeze_coarse: bool = False):
@@ -350,7 +416,18 @@ def compute_oracle_patch_distill_loss(model, target, margin: float):
     return oracle_patch_loss, metrics
 
 
-def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mode: str):
+def compute_train_loss(
+    criterion,
+    model,
+    coarse,
+    refined,
+    target,
+    mask,
+    train_mode: str,
+    hr_refined=None,
+    hr_target=None,
+    hr_mask=None,
+):
     """Compute loss according to the current staged-training mode."""
     l1_coarse = criterion.masked_l1(coarse, target, mask)
     l1_refined = criterion.masked_l1(refined, target, mask)
@@ -364,6 +441,9 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
     head_oracle = zero
     coarse_anchor = zero
     oracle_patch = zero
+    hr_l1_refined = zero
+    hr_perceptual = zero
+    hr_style = zero
     gate_metrics = {
         "gate_target_rate": None,
         "gate_pred_mean": None,
@@ -431,6 +511,18 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             target,
             criterion.oracle_patch_margin,
         )
+    if (
+        train_mode in ("joint", "refine_only", "refined_loss_only")
+        and hr_refined is not None
+        and hr_target is not None
+        and hr_mask is not None
+    ):
+        if criterion.hr_refined_weight > 0:
+            hr_l1_refined = criterion.masked_l1(hr_refined, hr_target, hr_mask)
+        if criterion.hr_perceptual_weight > 0:
+            hr_perceptual = criterion.perceptual_loss(hr_refined, hr_target)
+        if criterion.hr_style_weight > 0:
+            hr_style = criterion.style_loss(hr_refined, hr_target)
 
     if train_mode == "joint":
         total = (
@@ -444,6 +536,9 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.head_oracle_weight * head_oracle
             + criterion.coarse_anchor_weight * coarse_anchor
             + criterion.oracle_patch_weight * oracle_patch
+            + criterion.hr_refined_weight * hr_l1_refined
+            + criterion.hr_perceptual_weight * hr_perceptual
+            + criterion.hr_style_weight * hr_style
         )
     elif train_mode == "refined_loss_only":
         total = (
@@ -456,6 +551,9 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.head_oracle_weight * head_oracle
             + criterion.coarse_anchor_weight * coarse_anchor
             + criterion.oracle_patch_weight * oracle_patch
+            + criterion.hr_refined_weight * hr_l1_refined
+            + criterion.hr_perceptual_weight * hr_perceptual
+            + criterion.hr_style_weight * hr_style
         )
     elif train_mode == "coarse_only":
         total = l1_coarse
@@ -470,6 +568,9 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.head_oracle_weight * head_oracle
             + criterion.coarse_anchor_weight * coarse_anchor
             + criterion.oracle_patch_weight * oracle_patch
+            + criterion.hr_refined_weight * hr_l1_refined
+            + criterion.hr_perceptual_weight * hr_perceptual
+            + criterion.hr_style_weight * hr_style
         )
     else:
         raise ValueError(f"Unknown train_mode: {train_mode}")
@@ -485,6 +586,9 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
         "head_oracle": head_oracle.item(),
         "coarse_anchor": coarse_anchor.item(),
         "oracle_patch": oracle_patch.item(),
+        "hr_l1_refined": hr_l1_refined.item(),
+        "hr_perceptual": hr_perceptual.item(),
+        "hr_style": hr_style.item(),
         "total": total.item(),
     }
     aux_metrics = {
@@ -589,9 +693,14 @@ def evaluate_refinement_health(
     selector_choice_margin=0.0,
     head_oracle_margin=0.0,
     oracle_patch_margin=0.0,
+    model_image_size=None,
+    joint_hr_pipeline=False,
 ):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
+    if model_image_size is None:
+        model_image_size = model.generator.image_size
+    attn_upscaler = AttentionUpscaling(model.generator) if joint_hr_pipeline else None
 
     stats = {
         "masked_l1_coarse": [],
@@ -618,20 +727,28 @@ def evaluate_refinement_health(
         "oracle_patch_noncoarse_rate": [],
         "oracle_patch_distill_gap": [],
         "oracle_patch_alignment": [],
+        "hr_masked_l1_base": [],
+        "hr_masked_l1_refined": [],
+        "hr_refined_better_flags": [],
+        "hr_refined_tie_flags": [],
+        "hr_refined_worse_flags": [],
     }
     gain_abs_values = []
     gain_pct_values = []
+    hr_gain_abs_values = []
+    hr_gain_pct_values = []
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
             break
 
-        image = batch["image"].to(device, non_blocking=True)
-        mask = batch["mask"].to(device, non_blocking=True)
-        masked_image = batch["masked_image"].to(device, non_blocking=True)
+        batch_views = prepare_multiscale_batch(batch, device, model_image_size)
+        image = batch_views["image"]
+        mask = batch_views["mask"]
+        masked_image = batch_views["masked_image"]
 
         with torch.amp.autocast("cuda", enabled=use_amp):
-            refined_raw, _, coarse_raw = model(masked_image, mask)
+            refined_raw, attn_map, coarse_raw = model(masked_image, mask)
 
         refined_raw = refined_raw.clamp(0, 1)
         coarse_raw = coarse_raw.clamp(0, 1)
@@ -667,6 +784,29 @@ def evaluate_refinement_health(
         stats["refined_worse_flags"].extend(worse_flags.detach().cpu().tolist())
         gain_abs_values.extend(gain_abs.detach().cpu().tolist())
         gain_pct_values.extend(gain_pct.detach().cpu().tolist())
+
+        if joint_hr_pipeline and batch_views["has_hr_supervision"]:
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                hr_refined, hr_base = compute_hr_refined(attn_upscaler, batch_views, refined, attn_map)
+
+            image_hr = batch_views["image_hr"]
+            mask_hr = batch_views["mask_hr"]
+            hole_denom_hr = (mask_hr.sum(dim=(1, 2, 3)) * image_hr.shape[1]).clamp_min(1e-8)
+            hr_base_hole = (torch.abs(hr_base - image_hr) * mask_hr).sum(dim=(1, 2, 3)) / hole_denom_hr
+            hr_refined_hole = (torch.abs(hr_refined - image_hr) * mask_hr).sum(dim=(1, 2, 3)) / hole_denom_hr
+            hr_gain_abs = hr_base_hole - hr_refined_hole
+            hr_gain_pct = hr_gain_abs / hr_base_hole.clamp_min(1e-8) * 100.0
+            hr_better_flags = (hr_gain_abs > REFINEMENT_TIE_EPS).float()
+            hr_tie_flags = (torch.abs(hr_gain_abs) <= REFINEMENT_TIE_EPS).float()
+            hr_worse_flags = (hr_gain_abs < -REFINEMENT_TIE_EPS).float()
+
+            stats["hr_masked_l1_base"].extend(hr_base_hole.detach().cpu().tolist())
+            stats["hr_masked_l1_refined"].extend(hr_refined_hole.detach().cpu().tolist())
+            stats["hr_refined_better_flags"].extend(hr_better_flags.detach().cpu().tolist())
+            stats["hr_refined_tie_flags"].extend(hr_tie_flags.detach().cpu().tolist())
+            stats["hr_refined_worse_flags"].extend(hr_worse_flags.detach().cpu().tolist())
+            hr_gain_abs_values.extend(hr_gain_abs.detach().cpu().tolist())
+            hr_gain_pct_values.extend(hr_gain_pct.detach().cpu().tolist())
 
         gate_stats = compute_selective_gate_targets(model, image, margin=gate_selective_margin)
         if gate_stats is not None:
@@ -715,11 +855,25 @@ def evaluate_refinement_health(
     add_distribution_metrics(result, gain_abs_values, "gain_abs")
     add_distribution_metrics(result, gain_pct_values, "gain_pct")
 
+    hr_base_masked = result["hr_masked_l1_base"]
+    hr_refined_masked = result["hr_masked_l1_refined"]
+    if hr_base_masked is not None and hr_refined_masked is not None and hr_base_masked > 0:
+        result["hr_refinement_gain_pct"] = float((hr_base_masked - hr_refined_masked) / hr_base_masked * 100.0)
+    else:
+        result["hr_refinement_gain_pct"] = None
+    result["hr_refined_better_rate"] = result["hr_refined_better_flags"]
+    result["hr_refined_tie_rate"] = result["hr_refined_tie_flags"]
+    result["hr_refined_worse_rate"] = result["hr_refined_worse_flags"]
+    add_distribution_metrics(result, hr_gain_abs_values, "hr_gain_abs")
+    add_distribution_metrics(result, hr_gain_pct_values, "hr_gain_pct")
+
     warnings = []
     if result["refinement_gain_pct"] is not None and result["refinement_gain_pct"] < -2.0:
         warnings.append("refinement_worse_than_coarse")
     if better_rate is not None and better_rate < 0.45:
         warnings.append("refinement_rarely_beats_coarse")
+    if result["hr_refinement_gain_pct"] is not None and result["hr_refinement_gain_pct"] < -2.0:
+        warnings.append("hr_refinement_worse_than_bilinear_base")
     if (
         result["raw_valid_l1_coarse"] is not None and
         result["raw_valid_l1_refined"] is not None and
@@ -749,6 +903,7 @@ def run_eval_only(cfg, args):
     model = InpaintingModel(model_config).to(device)
     train_mode = cfg["training"].get("train_mode", "joint")
     freeze_coarse = cfg["training"].get("freeze_coarse", False)
+    joint_hr_pipeline, model_image_size = validate_joint_hr_pipeline(cfg, model)
     set_parameter_trainability(model, train_mode, freeze_coarse=freeze_coarse)
 
     ckpt = torch.load(args.resume, map_location=device, weights_only=False)
@@ -792,6 +947,8 @@ def run_eval_only(cfg, args):
         selector_choice_margin=criterion.selector_choice_margin,
         head_oracle_margin=criterion.head_oracle_margin,
         oracle_patch_margin=criterion.oracle_patch_margin,
+        model_image_size=model_image_size,
+        joint_hr_pipeline=joint_hr_pipeline,
     )
 
     print("\nFull validation results:")
@@ -854,6 +1011,22 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         writer.add_scalar("val/oracle_patch_distill_gap", health["oracle_patch_distill_gap"], step)
     if health.get("oracle_patch_alignment") is not None:
         writer.add_scalar("val/oracle_patch_alignment", health["oracle_patch_alignment"], step)
+    if health.get("hr_masked_l1_base") is not None:
+        writer.add_scalar("val/hr_masked_l1_base", health["hr_masked_l1_base"], step)
+    if health.get("hr_masked_l1_refined") is not None:
+        writer.add_scalar("val/hr_masked_l1_refined", health["hr_masked_l1_refined"], step)
+    if health.get("hr_refinement_gain_pct") is not None:
+        writer.add_scalar("val/hr_refinement_gain_pct", health["hr_refinement_gain_pct"], step)
+    if health.get("hr_refined_better_rate") is not None:
+        writer.add_scalar("val/hr_refined_better_rate", health["hr_refined_better_rate"], step)
+    if health.get("hr_refined_tie_rate") is not None:
+        writer.add_scalar("val/hr_refined_tie_rate", health["hr_refined_tie_rate"], step)
+    if health.get("hr_refined_worse_rate") is not None:
+        writer.add_scalar("val/hr_refined_worse_rate", health["hr_refined_worse_rate"], step)
+    if health.get("hr_gain_pct_p50") is not None:
+        writer.add_scalar("val/hr_gain_pct_p25", health["hr_gain_pct_p25"], step)
+        writer.add_scalar("val/hr_gain_pct_p50", health["hr_gain_pct_p50"], step)
+        writer.add_scalar("val/hr_gain_pct_p75", health["hr_gain_pct_p75"], step)
     write_status(
         log_dir,
         step,
@@ -892,6 +1065,12 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
             f", oracle_pick={health['oracle_patch_noncoarse_rate']:.2f}"
             f", oracle_align={health['oracle_patch_alignment']:.4f}"
         )
+    hr_suffix = ""
+    if health.get("hr_refinement_gain_pct") is not None:
+        hr_suffix = (
+            f", hr_gain={health['hr_refinement_gain_pct']:.2f}%"
+            f", hr_better={health['hr_refined_better_rate']:.2f}"
+        )
     warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
     print(
         f"\nValidation step {step}: "
@@ -905,7 +1084,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"valid refined={health['valid_l1_refined']:.4f}, "
         f"raw valid refined={health['raw_valid_l1_refined']:.4f}, "
         f"gain_p50={health['gain_pct_p50']:.2f}% "
-        f"(p25={health['gain_pct_p25']:.2f}%, p75={health['gain_pct_p75']:.2f}%){gate_suffix}{selector_suffix}{oracle_suffix}{oracle_patch_suffix}{warning_suffix}"
+        f"(p25={health['gain_pct_p25']:.2f}%, p75={health['gain_pct_p75']:.2f}%){gate_suffix}{selector_suffix}{oracle_suffix}{oracle_patch_suffix}{hr_suffix}{warning_suffix}"
     )
 
 
@@ -923,10 +1102,14 @@ def train(cfg, args):
     model = InpaintingModel(model_config).to(device)
     train_mode = cfg["training"].get("train_mode", "joint")
     freeze_coarse = cfg["training"].get("freeze_coarse", False)
+    joint_hr_pipeline, model_image_size = validate_joint_hr_pipeline(cfg, model)
+    attn_upscaler = AttentionUpscaling(model.generator) if joint_hr_pipeline else None
     set_parameter_trainability(model, train_mode, freeze_coarse=freeze_coarse)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
     print(f"Train mode: {train_mode}")
+    if joint_hr_pipeline:
+        print(f"Joint HR pipeline: {model_image_size}px -> {cfg['data']['image_size']}px")
     if train_mode == "refine_only" or freeze_coarse:
         frozen_params = sum(p.numel() for p in model.coarse_model.parameters())
         print(f"Frozen coarse parameters: {frozen_params:,}")
@@ -1025,15 +1208,19 @@ def train(cfg, args):
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
-        image = batch["image"].to(device, non_blocking=True)
-        mask = batch["mask"].to(device, non_blocking=True)
-        masked_image = batch["masked_image"].to(device, non_blocking=True)
+        batch_views = prepare_multiscale_batch(batch, device, model_image_size)
+        image = batch_views["image"]
+        mask = batch_views["mask"]
+        masked_image = batch_views["masked_image"]
 
         # Forward
         with torch.amp.autocast("cuda", enabled=use_amp):
             refined_raw, attn, coarse_raw = model(masked_image, mask)
             coarse = composite_with_known(coarse_raw, image, mask)
             refined = composite_with_known(refined_raw, image, mask)
+            hr_refined = None
+            if joint_hr_pipeline and batch_views["has_hr_supervision"]:
+                hr_refined, _ = compute_hr_refined(attn_upscaler, batch_views, refined, attn)
             loss, loss_dict, gate_metrics = compute_train_loss(
                 criterion,
                 model,
@@ -1042,6 +1229,9 @@ def train(cfg, args):
                 image,
                 mask,
                 train_mode=train_mode,
+                hr_refined=hr_refined,
+                hr_target=batch_views["image_hr"] if hr_refined is not None else None,
+                hr_mask=batch_views["mask_hr"] if hr_refined is not None else None,
             )
             loss = loss / grad_accum
 
@@ -1078,6 +1268,9 @@ def train(cfg, args):
             writer.add_scalar("loss/head_oracle", loss_dict["head_oracle"], step)
             writer.add_scalar("loss/coarse_anchor", loss_dict["coarse_anchor"], step)
             writer.add_scalar("loss/oracle_patch", loss_dict["oracle_patch"], step)
+            writer.add_scalar("loss/hr_l1_refined", loss_dict["hr_l1_refined"], step)
+            writer.add_scalar("loss/hr_perceptual", loss_dict["hr_perceptual"], step)
+            writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
             if gate_metrics.get("gate_target_rate") is not None:
                 writer.add_scalar("train/gate_target_rate", gate_metrics["gate_target_rate"], step)
                 writer.add_scalar("train/gate_pred_mean", gate_metrics["gate_pred_mean"], step)
@@ -1125,6 +1318,8 @@ def train(cfg, args):
                 selector_choice_margin=criterion.selector_choice_margin,
                 head_oracle_margin=criterion.head_oracle_margin,
                 oracle_patch_margin=criterion.oracle_patch_margin,
+                model_image_size=model_image_size,
+                joint_hr_pipeline=joint_hr_pipeline,
             )
             log_validation(
                 writer,
@@ -1140,7 +1335,7 @@ def train(cfg, args):
 
         # Visualization
         if step % log_cfg["vis_interval"] == 0:
-            save_vis(writer, batch, coarse, refined, step, log_dir=log_cfg["log_dir"])
+            save_vis(writer, batch_views, coarse, refined, step, log_dir=log_cfg["log_dir"])
 
         # Checkpoint at specific steps
         checkpoint_steps = log_cfg.get("checkpoint_steps", None)
@@ -1186,6 +1381,8 @@ def train(cfg, args):
             selector_choice_margin=criterion.selector_choice_margin,
             head_oracle_margin=criterion.head_oracle_margin,
             oracle_patch_margin=criterion.oracle_patch_margin,
+            model_image_size=model_image_size,
+            joint_hr_pipeline=joint_hr_pipeline,
         )
         log_validation(
             writer,
