@@ -115,7 +115,7 @@ class PatchInpainting(nn.Module):
         mask_inpainting: bool = True,
         use_argmax: bool = False,
         residual_refinement: bool = True,
-        refinement_gate_init: float = 0.0,
+        refinement_gate_init: float = 1.0,
         model,
     ):
         self.cross_attention = cross_attention
@@ -262,6 +262,8 @@ class PatchInpainting(nn.Module):
         mask_same_res_as_features_pooled = mask_as_patches.amax(dim=1, keepdim=True)
         mask_same_res_as_features_pooled = mask_same_res_as_features_pooled.flatten(
             start_dim=2).unsqueeze(-1)
+        pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
+        pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
         if self.concat_features:
             features_to_concat = features[self.feature_i]
@@ -285,14 +287,11 @@ class PatchInpainting(nn.Module):
         if self.use_residual_refinement:
             delta_hf = out - image_as_patches
             delta_hf = self.mix_patch_tokens(delta_hf, sizes)
-            delta_hf = torch.tanh(delta_hf)
             refinement_gate = torch.sigmoid(self.refinement_gate)
-            refined_hf = image_as_patches + patch_mask * refinement_gate * delta_hf
-            out = refined_hf + blurred_flat
+            out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_hf
         else:
             out = out + blurred_flat
-
-        out = out * patch_mask + full_patches_flat * (1 - patch_mask)
+            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
