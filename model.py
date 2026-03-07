@@ -51,6 +51,7 @@ class MultiHeadAttention(nn.Module):
         use_argmax=False,
         add_residual=True,
         topk_patches=None,
+        softmax_temperature=1.0,
     ):
         super().__init__()
         self.d_v = d_v
@@ -65,6 +66,7 @@ class MultiHeadAttention(nn.Module):
         self.use_argmax = use_argmax
         self.add_residual = add_residual
         self.topk_patches = topk_patches
+        self.softmax_temperature = softmax_temperature
 
     def forward(self, q, k, v, qpos, kpos, qk_mask=None, k_mask=None):
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
@@ -92,6 +94,8 @@ class MultiHeadAttention(nn.Module):
             sparse_attn = torch.full_like(attn, -1e4)
             attn = sparse_attn.scatter(-1, topk_idx, topk_vals)
 
+        # Sharpen or soften the patch mixture without changing the top-k set.
+        attn = attn / max(self.softmax_temperature, 1e-6)
         # Force FP32 for softmax to prevent FP16 overflow from large mask values
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
 
@@ -141,6 +145,7 @@ class PatchInpainting(nn.Module):
         patch_match_mode: str = "hf",
         attn_topk: int = 8,
         attn_add_residual: bool = False,
+        attn_temperature: float = 1.0,
         token_use_mask_ratio: bool = True,
         soft_key_mask_scale: float = 0.0,
         model,
@@ -165,6 +170,7 @@ class PatchInpainting(nn.Module):
         self.patch_match_mode = patch_match_mode
         self.attn_topk = attn_topk
         self.attn_add_residual = attn_add_residual
+        self.attn_temperature = attn_temperature
         self.token_use_mask_ratio = token_use_mask_ratio
         self.soft_key_mask_scale = soft_key_mask_scale
         super().__init__()
@@ -200,6 +206,7 @@ class PatchInpainting(nn.Module):
             use_argmax=self.use_argmax,
             add_residual=self.attn_add_residual,
             topk_patches=self.attn_topk,
+            softmax_temperature=self.attn_temperature,
         )
         self.stem_out_channels = stem_out_channels
         self.stem_out_stride = stem_out_stride
