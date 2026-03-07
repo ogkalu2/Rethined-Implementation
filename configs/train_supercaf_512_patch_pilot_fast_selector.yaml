@@ -31,8 +31,8 @@ model:
     use_head_selector: true
     selector_hidden_dim: 256
     selector_temperature: 1.0
-    selector_hard: true
-    selector_bias_to_coarse: 2.0
+    selector_hard: false
+    selector_bias_to_coarse: 0.5
 
 data:
   root_dir: "."
@@ -66,8 +66,10 @@ loss:
   gate_selective_margin: 0.0
   sample_improvement_weight: 0.0
   sample_improvement_margin: 0.0
-  selector_choice_weight: 0.5
+  selector_choice_weight: 0.25
   selector_choice_margin: 0.004
+  head_oracle_weight: 1.0
+  head_oracle_margin: 0.004
 
 logging:
   log_dir: "logs/train_supercaf_512_patch_pilot_fast_selector_v6"
