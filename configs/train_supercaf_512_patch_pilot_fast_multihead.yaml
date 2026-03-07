@@ -22,7 +22,7 @@ model:
     compute_v: false
     use_argmax: false
     refinement_backend: "patch_attention"
-    refinement_gate_init: 1.0
+    refinement_gate_init: 2.0
     patch_match_mode: "hf"
     attn_topk: 8
     attn_add_residual: false
