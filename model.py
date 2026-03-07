@@ -159,6 +159,8 @@ class PatchInpainting(nn.Module):
         selector_temperature: float = 1.0,
         selector_hard: bool = True,
         selector_bias_to_coarse: float = 2.0,
+        use_spatial_fusion: bool = False,
+        fusion_hidden_dim: int = 256,
         model,
     ):
         self.cross_attention = cross_attention
@@ -189,6 +191,8 @@ class PatchInpainting(nn.Module):
         self.selector_temperature = selector_temperature
         self.selector_hard = selector_hard
         self.selector_bias_to_coarse = selector_bias_to_coarse
+        self.use_spatial_fusion = use_spatial_fusion
+        self.fusion_hidden_dim = fusion_hidden_dim
         super().__init__()
         if self.refinement_backend not in ("patch_attention", "patch", None):
             raise ValueError(
@@ -262,6 +266,23 @@ class PatchInpainting(nn.Module):
                 self.patch_selector[-1].bias[0] = self.selector_bias_to_coarse
         else:
             self.patch_selector = None
+        if self.use_spatial_fusion:
+            fusion_in_channels = self.patch_value_dim * (self.nheads + 1) + 1 + self.feature_dim
+            self.patch_fusion_backbone = torch.nn.Sequential(
+                nn.Conv2d(fusion_in_channels, self.fusion_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+                nn.Conv2d(self.fusion_hidden_dim, self.fusion_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+            )
+            self.patch_fusion_logits = nn.Conv2d(self.fusion_hidden_dim, self.nheads + 1, kernel_size=1, stride=1)
+            self.patch_fusion_delta = nn.Conv2d(self.fusion_hidden_dim, self.patch_value_dim, kernel_size=1, stride=1)
+            with torch.no_grad():
+                self.patch_fusion_logits.bias.zero_()
+                self.patch_fusion_logits.bias[0] = 0.5
+        else:
+            self.patch_fusion_backbone = None
+            self.patch_fusion_logits = None
+            self.patch_fusion_delta = None
         self.refinement_gate = nn.Parameter(torch.tensor(refinement_gate_init, dtype=torch.float32))
         self.last_refinement_gate_map = None
         self.last_candidate_patches_flat = None
@@ -270,6 +291,7 @@ class PatchInpainting(nn.Module):
         self.last_selector_logits = None
         self.last_selector_probs = None
         self.last_candidate_bank = None
+        self.last_fusion_weights = None
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -390,6 +412,32 @@ class PatchInpainting(nn.Module):
         selected = (selector_probs_flat * candidate_bank).sum(dim=2)
         return selected, selector_logits_flat, selector_probs_flat.squeeze(-1)
 
+    def fuse_patch_hypotheses(
+        self,
+        candidate_bank: torch.Tensor,
+        mask_ratio: torch.Tensor,
+        features_to_concat: torch.Tensor,
+        pixel_mask_flat: torch.Tensor,
+        output_size,
+    ):
+        """Fuse coarse + head hypotheses with neighborhood context on the patch grid."""
+        if self.patch_fusion_backbone is None:
+            raise RuntimeError("Spatial fusion requested but fusion module is not initialized.")
+
+        n_h = output_size[0] // self.kernel_size
+        n_w = output_size[1] // self.kernel_size
+        B, N, K, D = candidate_bank.shape
+        candidate_tokens = candidate_bank.permute(0, 2, 3, 1).contiguous().view(B, K * D, n_h, n_w)
+        fusion_input = torch.cat([candidate_tokens, features_to_concat, mask_ratio], dim=1)
+        fusion_feat = self.patch_fusion_backbone(fusion_input)
+        fusion_logits = self.patch_fusion_logits(fusion_feat)
+        fusion_weights = F.softmax(fusion_logits, dim=1)
+        fusion_weights_flat = fusion_weights.view(B, K, n_h * n_w).transpose(1, 2).unsqueeze(-1)
+        fused_candidates = (fusion_weights_flat * candidate_bank).sum(dim=2)
+        fusion_delta = self.patch_fusion_delta(fusion_feat).view(B, D, n_h * n_w).transpose(1, 2)
+        fused_candidates = fused_candidates + pixel_mask_flat * fusion_delta
+        return fused_candidates, fusion_weights_flat.squeeze(-1)
+
     def forward(self, image, mask):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
@@ -424,6 +472,7 @@ class PatchInpainting(nn.Module):
             match_patches = image_as_patches_full
         else:
             match_patches = torch.cat([image_as_patches_hf, image_as_patches_full], dim=1)
+        features_to_concat = None
         if self.concat_features:
             features_to_concat = features[self.feature_i]
             features_to_concat = F.interpolate(features_to_concat, size=image_as_patches_full.shape[-2:], mode='bilinear', align_corners=False)
@@ -449,7 +498,7 @@ class PatchInpainting(nn.Module):
                 k_mask = -1e4 * mask_same_res_as_features_pooled
         else:
             k_mask = None
-        if self.use_head_selector:
+        if self.use_head_selector or self.use_spatial_fusion:
             out, atten_weights, head_outputs = self.multihead_attention(
                 input_attn,
                 input_attn,
@@ -473,7 +522,25 @@ class PatchInpainting(nn.Module):
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.use_residual_refinement:
-            if self.use_head_selector:
+            if self.use_spatial_fusion:
+                delta_full = head_outputs - full_patches_flat.unsqueeze(2)
+                delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
+                candidate_bank = full_patches_flat.unsqueeze(2) + pixel_mask_flat.unsqueeze(2) * delta_full
+                candidate_bank = torch.cat([full_patches_flat.unsqueeze(2), candidate_bank], dim=2)
+                out, fusion_weights = self.fuse_patch_hypotheses(
+                    candidate_bank,
+                    mask_ratio,
+                    features_to_concat,
+                    pixel_mask_flat,
+                    sizes,
+                )
+                self.last_refinement_gate_map = None
+                self.last_candidate_patches_flat = None
+                self.last_selector_logits = None
+                self.last_selector_probs = None
+                self.last_candidate_bank = candidate_bank
+                self.last_fusion_weights = fusion_weights
+            elif self.use_head_selector:
                 delta_full = head_outputs - full_patches_flat.unsqueeze(2)
                 delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
                 candidate_bank = full_patches_flat.unsqueeze(2) + pixel_mask_flat.unsqueeze(2) * delta_full
@@ -484,6 +551,7 @@ class PatchInpainting(nn.Module):
                 self.last_selector_logits = selector_logits
                 self.last_selector_probs = selector_probs
                 self.last_candidate_bank = candidate_bank
+                self.last_fusion_weights = None
             else:
                 delta_full = out - full_patches_flat
                 delta_full = self.mix_patch_tokens(delta_full, sizes)
@@ -496,6 +564,7 @@ class PatchInpainting(nn.Module):
                 self.last_selector_logits = None
                 self.last_selector_probs = None
                 self.last_candidate_bank = None
+                self.last_fusion_weights = None
             self.last_pixel_mask_flat = pixel_mask_flat
         else:
             out = out * patch_mask + full_patches_flat * (1 - patch_mask)
@@ -505,6 +574,7 @@ class PatchInpainting(nn.Module):
             self.last_selector_logits = None
             self.last_selector_probs = None
             self.last_candidate_bank = None
+            self.last_fusion_weights = None
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
