@@ -25,6 +25,8 @@ class InpaintingLoss(nn.Module):
         gate_selective_margin: float = 0.0,
         sample_improvement_weight: float = 0.0,
         sample_improvement_margin: float = 0.0,
+        selector_choice_weight: float = 0.0,
+        selector_choice_margin: float = 0.0,
     ):
         super().__init__()
         self.l1_hole_weight = l1_hole_weight
@@ -35,6 +37,8 @@ class InpaintingLoss(nn.Module):
         self.gate_selective_margin = gate_selective_margin
         self.sample_improvement_weight = sample_improvement_weight
         self.sample_improvement_margin = sample_improvement_margin
+        self.selector_choice_weight = selector_choice_weight
+        self.selector_choice_margin = selector_choice_margin
 
         self.perceptual_loss = PerceptualLoss()
         self.style_loss = StyleLoss()

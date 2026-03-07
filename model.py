@@ -68,7 +68,7 @@ class MultiHeadAttention(nn.Module):
         self.topk_patches = topk_patches
         self.softmax_temperature = softmax_temperature
 
-    def forward(self, q, k, v, qpos, kpos, qk_mask=None, k_mask=None):
+    def forward(self, q, k, v, qpos, kpos, qk_mask=None, k_mask=None, return_head_outputs=False):
         d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
         sz_b, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
 
@@ -107,12 +107,15 @@ class MultiHeadAttention(nn.Module):
             attn = attn_hard - attn.detach() + attn
 
         attn = self.dropout(attn)
-        output = torch.matmul(attn, v)
-        output = output.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
+        head_output = torch.matmul(attn, v)
+        output = head_output.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
         output = self.dropout(self.fc(output))
         if self.add_residual:
             output = output + residual
 
+        if return_head_outputs:
+            head_output = head_output.transpose(1, 2).contiguous()
+            return output, attn, head_output
         return output, attn
 
 
@@ -151,6 +154,11 @@ class PatchInpainting(nn.Module):
         attn_temperature: float = 1.0,
         token_use_mask_ratio: bool = True,
         soft_key_mask_scale: float = 0.0,
+        use_head_selector: bool = False,
+        selector_hidden_dim: int = 256,
+        selector_temperature: float = 1.0,
+        selector_hard: bool = True,
+        selector_bias_to_coarse: float = 2.0,
         model,
     ):
         self.cross_attention = cross_attention
@@ -176,6 +184,11 @@ class PatchInpainting(nn.Module):
         self.attn_temperature = attn_temperature
         self.token_use_mask_ratio = token_use_mask_ratio
         self.soft_key_mask_scale = soft_key_mask_scale
+        self.use_head_selector = use_head_selector
+        self.selector_hidden_dim = selector_hidden_dim
+        self.selector_temperature = selector_temperature
+        self.selector_hard = selector_hard
+        self.selector_bias_to_coarse = selector_bias_to_coarse
         super().__init__()
         if self.refinement_backend not in ("patch_attention", "patch", None):
             raise ValueError(
@@ -237,11 +250,26 @@ class PatchInpainting(nn.Module):
             nn.GELU(),
             nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
         ) if self.final_conv else None
+        if self.use_head_selector:
+            selector_in_channels = self.patch_value_dim * (self.nheads + 1) + 1
+            self.patch_selector = torch.nn.Sequential(
+                nn.Conv2d(selector_in_channels, self.selector_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+                nn.Conv2d(self.selector_hidden_dim, self.nheads + 1, kernel_size=1, stride=1),
+            )
+            with torch.no_grad():
+                self.patch_selector[-1].bias.zero_()
+                self.patch_selector[-1].bias[0] = self.selector_bias_to_coarse
+        else:
+            self.patch_selector = None
         self.refinement_gate = nn.Parameter(torch.tensor(refinement_gate_init, dtype=torch.float32))
         self.last_refinement_gate_map = None
         self.last_candidate_patches_flat = None
         self.last_base_patches_flat = None
         self.last_pixel_mask_flat = None
+        self.last_selector_logits = None
+        self.last_selector_probs = None
+        self.last_candidate_bank = None
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -329,6 +357,39 @@ class PatchInpainting(nn.Module):
         gate_logits = self.patch_gate_mixer(torch.cat([base_2d, delta_2d], dim=1))
         return gate_logits.view(B, -1, n_h * n_w).transpose(1, 2)
 
+    def mix_multihead_patch_tokens(self, patches: torch.Tensor, output_size) -> torch.Tensor:
+        """Apply the same token mixer independently to each head hypothesis."""
+        if self.patch_delta_mixer is None:
+            return patches
+
+        B, N, H, D = patches.shape
+        patches_bhn = patches.permute(0, 2, 1, 3).contiguous().view(B * H, N, D)
+        patches_bhn = self.mix_patch_tokens(patches_bhn, output_size)
+        return patches_bhn.view(B, H, N, D).permute(0, 2, 1, 3).contiguous()
+
+    def select_patch_hypotheses(self, candidate_bank: torch.Tensor, mask_ratio: torch.Tensor, output_size):
+        """Choose between coarse and per-head patch hypotheses."""
+        if self.patch_selector is None:
+            raise RuntimeError("Patch selector requested but not initialized.")
+
+        n_h = output_size[0] // self.kernel_size
+        n_w = output_size[1] // self.kernel_size
+        B, N, K, D = candidate_bank.shape
+
+        selector_tokens = candidate_bank.permute(0, 2, 3, 1).contiguous().view(B, K * D, n_h, n_w)
+        selector_input = torch.cat([selector_tokens, mask_ratio], dim=1)
+        selector_logits = self.patch_selector(selector_input)
+        selector_probs = F.softmax(selector_logits / max(self.selector_temperature, 1e-6), dim=1)
+        if self.selector_hard:
+            idx = torch.argmax(selector_probs, dim=1, keepdim=True)
+            selector_hard = torch.zeros_like(selector_probs).scatter_(1, idx, 1.0)
+            selector_probs = selector_hard - selector_probs.detach() + selector_probs
+
+        selector_probs_flat = selector_probs.view(B, K, n_h * n_w).transpose(1, 2).unsqueeze(-1)
+        selector_logits_flat = selector_logits.view(B, K, n_h * n_w).transpose(1, 2)
+        selected = (selector_probs_flat * candidate_bank).sum(dim=2)
+        return selected, selector_logits_flat, selector_probs_flat.squeeze(-1)
+
     def forward(self, image, mask):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
@@ -388,26 +449,62 @@ class PatchInpainting(nn.Module):
                 k_mask = -1e4 * mask_same_res_as_features_pooled
         else:
             k_mask = None
-        out, atten_weights = self.multihead_attention(input_attn, input_attn,
-            full_patches_flat, qpos=pos, kpos=pos, qk_mask=qk_mask, k_mask=k_mask
-        )
+        if self.use_head_selector:
+            out, atten_weights, head_outputs = self.multihead_attention(
+                input_attn,
+                input_attn,
+                full_patches_flat,
+                qpos=pos,
+                kpos=pos,
+                qk_mask=qk_mask,
+                k_mask=k_mask,
+                return_head_outputs=True,
+            )
+        else:
+            out, atten_weights = self.multihead_attention(
+                input_attn,
+                input_attn,
+                full_patches_flat,
+                qpos=pos,
+                kpos=pos,
+                qk_mask=qk_mask,
+                k_mask=k_mask,
+            )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         if self.use_residual_refinement:
-            delta_full = out - full_patches_flat
-            delta_full = self.mix_patch_tokens(delta_full, sizes)
-            candidate_patches = full_patches_flat + pixel_mask_flat * delta_full
-            gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
-            refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
-            out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
-            self.last_refinement_gate_map = refinement_gate
-            self.last_candidate_patches_flat = candidate_patches
+            if self.use_head_selector:
+                delta_full = head_outputs - full_patches_flat.unsqueeze(2)
+                delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
+                candidate_bank = full_patches_flat.unsqueeze(2) + pixel_mask_flat.unsqueeze(2) * delta_full
+                candidate_bank = torch.cat([full_patches_flat.unsqueeze(2), candidate_bank], dim=2)
+                out, selector_logits, selector_probs = self.select_patch_hypotheses(candidate_bank, mask_ratio, sizes)
+                self.last_refinement_gate_map = None
+                self.last_candidate_patches_flat = None
+                self.last_selector_logits = selector_logits
+                self.last_selector_probs = selector_probs
+                self.last_candidate_bank = candidate_bank
+            else:
+                delta_full = out - full_patches_flat
+                delta_full = self.mix_patch_tokens(delta_full, sizes)
+                candidate_patches = full_patches_flat + pixel_mask_flat * delta_full
+                gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
+                refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
+                out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
+                self.last_refinement_gate_map = refinement_gate
+                self.last_candidate_patches_flat = candidate_patches
+                self.last_selector_logits = None
+                self.last_selector_probs = None
+                self.last_candidate_bank = None
             self.last_pixel_mask_flat = pixel_mask_flat
         else:
             out = out * patch_mask + full_patches_flat * (1 - patch_mask)
             self.last_refinement_gate_map = None
             self.last_candidate_patches_flat = None
             self.last_pixel_mask_flat = pixel_mask_flat
+            self.last_selector_logits = None
+            self.last_selector_probs = None
+            self.last_candidate_bank = None
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)

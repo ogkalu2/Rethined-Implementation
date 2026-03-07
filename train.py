@@ -186,6 +186,63 @@ def compute_sample_improvement_loss(coarse, refined, target, mask, margin: float
     return improvement_hinge.mean(), metrics
 
 
+def compute_selector_choice_loss(model, target, margin: float):
+    """Supervise coarse-vs-head hypothesis selection in patch space."""
+    generator = getattr(model, "generator", None)
+    logits = getattr(generator, "last_selector_logits", None)
+    candidate_bank = getattr(generator, "last_candidate_bank", None)
+    pixel_mask = getattr(generator, "last_pixel_mask_flat", None)
+    if generator is None or logits is None or candidate_bank is None or pixel_mask is None:
+        zero = target.new_zeros(())
+        empty_metrics = {
+            "selector_accuracy": None,
+            "selector_pred_noncoarse_rate": None,
+            "selector_target_noncoarse_rate": None,
+            "selector_advantage_mean": None,
+        }
+        return zero, empty_metrics
+
+    with torch.no_grad():
+        gt_patches, _ = generator.unfold_native(target, generator.kernel_size)
+        gt_patches = gt_patches.flatten(start_dim=2).transpose(1, 2)
+
+        pixel_mask_detached = pixel_mask.detach()
+        valid_patches = pixel_mask_detached.sum(dim=-1) > 0
+        if not valid_patches.any():
+            zero = target.new_zeros(())
+            empty_metrics = {
+                "selector_accuracy": None,
+                "selector_pred_noncoarse_rate": None,
+                "selector_target_noncoarse_rate": None,
+                "selector_advantage_mean": None,
+            }
+            return zero, empty_metrics
+
+        mask_count = pixel_mask_detached.sum(dim=-1).clamp_min(1.0)
+        candidate_err = (
+            torch.abs(candidate_bank.detach() - gt_patches.unsqueeze(2)) * pixel_mask_detached.unsqueeze(2)
+        ).sum(dim=-1) / mask_count.unsqueeze(-1)
+        coarse_err = candidate_err[:, :, 0]
+        best_noncoarse_err, best_noncoarse_idx = candidate_err[:, :, 1:].min(dim=-1)
+        choose_noncoarse = (best_noncoarse_err + margin) < coarse_err
+        target_idx = torch.zeros_like(best_noncoarse_idx)
+        target_idx[choose_noncoarse] = best_noncoarse_idx[choose_noncoarse] + 1
+        selector_advantage = coarse_err - best_noncoarse_err
+
+    logits_valid = logits[valid_patches]
+    target_valid = target_idx[valid_patches]
+    selector_loss = F.cross_entropy(logits_valid.float(), target_valid, reduction="mean")
+
+    pred_idx = logits_valid.argmax(dim=-1)
+    metrics = {
+        "selector_accuracy": (pred_idx == target_valid).float().mean().item(),
+        "selector_pred_noncoarse_rate": (pred_idx > 0).float().mean().item(),
+        "selector_target_noncoarse_rate": (target_valid > 0).float().mean().item(),
+        "selector_advantage_mean": selector_advantage[valid_patches].mean().item(),
+    }
+    return selector_loss, metrics
+
+
 def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mode: str):
     """Compute loss according to the current staged-training mode."""
     l1_coarse = criterion.masked_l1(coarse, target, mask)
@@ -196,6 +253,7 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
     style = zero
     gate_selective = zero
     sample_improvement = zero
+    selector_choice = zero
     gate_metrics = {
         "gate_target_rate": None,
         "gate_pred_mean": None,
@@ -206,6 +264,12 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
         "sample_better_rate_batch": None,
         "sample_margin_violations": None,
         "sample_improvement_gap": None,
+    }
+    selector_metrics = {
+        "selector_accuracy": None,
+        "selector_pred_noncoarse_rate": None,
+        "selector_target_noncoarse_rate": None,
+        "selector_advantage_mean": None,
     }
 
     if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.perceptual_weight > 0:
@@ -227,6 +291,12 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             mask,
             criterion.sample_improvement_margin,
         )
+    if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.selector_choice_weight > 0:
+        selector_choice, selector_metrics = compute_selector_choice_loss(
+            model,
+            target,
+            criterion.selector_choice_margin,
+        )
 
     if train_mode == "joint":
         total = (
@@ -236,6 +306,7 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.style_weight * style
             + criterion.gate_selective_weight * gate_selective
             + criterion.sample_improvement_weight * sample_improvement
+            + criterion.selector_choice_weight * selector_choice
         )
     elif train_mode == "refined_loss_only":
         total = (
@@ -244,6 +315,7 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.style_weight * style
             + criterion.gate_selective_weight * gate_selective
             + criterion.sample_improvement_weight * sample_improvement
+            + criterion.selector_choice_weight * selector_choice
         )
     elif train_mode == "coarse_only":
         total = l1_coarse
@@ -254,6 +326,7 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.style_weight * style
             + criterion.gate_selective_weight * gate_selective
             + criterion.sample_improvement_weight * sample_improvement
+            + criterion.selector_choice_weight * selector_choice
         )
     else:
         raise ValueError(f"Unknown train_mode: {train_mode}")
@@ -265,9 +338,10 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
         "style": style.item(),
         "gate_selective": gate_selective.item(),
         "sample_improvement": sample_improvement.item(),
+        "selector_choice": selector_choice.item(),
         "total": total.item(),
     }
-    aux_metrics = {**gate_metrics, **improvement_metrics}
+    aux_metrics = {**gate_metrics, **improvement_metrics, **selector_metrics}
     return total, loss_dict, aux_metrics
 
 
@@ -342,6 +416,7 @@ def evaluate_refinement_health(
     train_mode="joint",
     freeze_coarse=False,
     gate_selective_margin=0.0,
+    selector_choice_margin=0.0,
 ):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
@@ -359,6 +434,10 @@ def evaluate_refinement_health(
         "gate_pred_mean": [],
         "gate_accuracy": [],
         "gate_advantage_mean": [],
+        "selector_accuracy": [],
+        "selector_pred_noncoarse_rate": [],
+        "selector_target_noncoarse_rate": [],
+        "selector_advantage_mean": [],
     }
 
     for batch_idx, batch in enumerate(dataloader):
@@ -409,6 +488,13 @@ def evaluate_refinement_health(
             stats["gate_pred_mean"].append(gate_pred.mean().item())
             stats["gate_accuracy"].append((gate_binary == gate_target).float().mean().item())
             stats["gate_advantage_mean"].append(gate_advantage.mean().item())
+
+        _, selector_metrics = compute_selector_choice_loss(model, image, margin=selector_choice_margin)
+        if selector_metrics["selector_accuracy"] is not None:
+            stats["selector_accuracy"].append(selector_metrics["selector_accuracy"])
+            stats["selector_pred_noncoarse_rate"].append(selector_metrics["selector_pred_noncoarse_rate"])
+            stats["selector_target_noncoarse_rate"].append(selector_metrics["selector_target_noncoarse_rate"])
+            stats["selector_advantage_mean"].append(selector_metrics["selector_advantage_mean"])
 
     result = {}
     for key, values in stats.items():
@@ -461,6 +547,14 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         writer.add_scalar("val/gate_accuracy", health["gate_accuracy"], step)
     if health.get("gate_advantage_mean") is not None:
         writer.add_scalar("val/gate_advantage_mean", health["gate_advantage_mean"], step)
+    if health.get("selector_accuracy") is not None:
+        writer.add_scalar("val/selector_accuracy", health["selector_accuracy"], step)
+    if health.get("selector_pred_noncoarse_rate") is not None:
+        writer.add_scalar("val/selector_pred_noncoarse_rate", health["selector_pred_noncoarse_rate"], step)
+    if health.get("selector_target_noncoarse_rate") is not None:
+        writer.add_scalar("val/selector_target_noncoarse_rate", health["selector_target_noncoarse_rate"], step)
+    if health.get("selector_advantage_mean") is not None:
+        writer.add_scalar("val/selector_advantage_mean", health["selector_advantage_mean"], step)
     write_status(
         log_dir,
         step,
@@ -480,6 +574,13 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
             f", gate_on={health['gate_pred_mean']:.2f}"
             f", gate_target={health['gate_target_rate']:.2f}"
         )
+    selector_suffix = ""
+    if health.get("selector_accuracy") is not None:
+        selector_suffix = (
+            f", sel_acc={health['selector_accuracy']:.2f}"
+            f", sel_on={health['selector_pred_noncoarse_rate']:.2f}"
+            f", sel_target={health['selector_target_noncoarse_rate']:.2f}"
+        )
     warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
     print(
         f"\nValidation step {step}: "
@@ -489,7 +590,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"better_rate={health['refined_better_rate']:.2f}, "
         f"valid coarse={health['valid_l1_coarse']:.4f}, "
         f"valid refined={health['valid_l1_refined']:.4f}, "
-        f"raw valid refined={health['raw_valid_l1_refined']:.4f}{gate_suffix}{warning_suffix}"
+        f"raw valid refined={health['raw_valid_l1_refined']:.4f}{gate_suffix}{selector_suffix}{warning_suffix}"
     )
 
 
@@ -658,6 +759,7 @@ def train(cfg, args):
             writer.add_scalar("loss/style", loss_dict["style"], step)
             writer.add_scalar("loss/gate_selective", loss_dict["gate_selective"], step)
             writer.add_scalar("loss/sample_improvement", loss_dict["sample_improvement"], step)
+            writer.add_scalar("loss/selector_choice", loss_dict["selector_choice"], step)
             if gate_metrics.get("gate_target_rate") is not None:
                 writer.add_scalar("train/gate_target_rate", gate_metrics["gate_target_rate"], step)
                 writer.add_scalar("train/gate_pred_mean", gate_metrics["gate_pred_mean"], step)
@@ -667,6 +769,11 @@ def train(cfg, args):
                 writer.add_scalar("train/sample_better_rate_batch", gate_metrics["sample_better_rate_batch"], step)
                 writer.add_scalar("train/sample_margin_violations", gate_metrics["sample_margin_violations"], step)
                 writer.add_scalar("train/sample_improvement_gap", gate_metrics["sample_improvement_gap"], step)
+            if gate_metrics.get("selector_accuracy") is not None:
+                writer.add_scalar("train/selector_accuracy", gate_metrics["selector_accuracy"], step)
+                writer.add_scalar("train/selector_pred_noncoarse_rate", gate_metrics["selector_pred_noncoarse_rate"], step)
+                writer.add_scalar("train/selector_target_noncoarse_rate", gate_metrics["selector_target_noncoarse_rate"], step)
+                writer.add_scalar("train/selector_advantage_mean", gate_metrics["selector_advantage_mean"], step)
             if hasattr(model.generator, "refinement_gate"):
                 writer.add_scalar("model/refinement_gate", torch.sigmoid(model.generator.refinement_gate).item(), step)
             opt_step = (step + 1) // grad_accum
@@ -689,6 +796,7 @@ def train(cfg, args):
                 train_mode=train_mode,
                 freeze_coarse=freeze_coarse,
                 gate_selective_margin=criterion.gate_selective_margin,
+                selector_choice_margin=criterion.selector_choice_margin,
             )
             log_validation(
                 writer,
@@ -747,6 +855,7 @@ def train(cfg, args):
             train_mode=train_mode,
             freeze_coarse=freeze_coarse,
             gate_selective_margin=criterion.gate_selective_margin,
+            selector_choice_margin=criterion.selector_choice_margin,
         )
         log_validation(
             writer,
