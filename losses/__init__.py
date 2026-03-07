@@ -10,9 +10,8 @@ from losses.perceptual import PerceptualLoss, StyleLoss
 class InpaintingLoss(nn.Module):
     """Combined loss for RETHINED: masked L1 + perceptual.
 
-    Style loss stays configurable, but defaults to off in V6 because its
-    weighting is completely unspecified by the paper and a large value is a
-    weak guess for this refinement architecture.
+    Style loss stays configurable, but defaults to off because its weighting is
+    unspecified by the paper.
     """
 
     def __init__(
@@ -21,17 +20,6 @@ class InpaintingLoss(nn.Module):
         l1_valid_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         style_weight: float = 0.0,
-        gate_selective_weight: float = 0.0,
-        gate_selective_margin: float = 0.0,
-        sample_improvement_weight: float = 0.0,
-        sample_improvement_margin: float = 0.0,
-        selector_choice_weight: float = 0.0,
-        selector_choice_margin: float = 0.0,
-        head_oracle_weight: float = 0.0,
-        head_oracle_margin: float = 0.0,
-        coarse_anchor_weight: float = 0.0,
-        oracle_patch_weight: float = 0.0,
-        oracle_patch_margin: float = 0.0,
         hr_refined_weight: float = 0.0,
         hr_perceptual_weight: float = 0.0,
         hr_style_weight: float = 0.0,
@@ -41,17 +29,6 @@ class InpaintingLoss(nn.Module):
         self.l1_valid_weight = l1_valid_weight
         self.perceptual_weight = perceptual_weight
         self.style_weight = style_weight
-        self.gate_selective_weight = gate_selective_weight
-        self.gate_selective_margin = gate_selective_margin
-        self.sample_improvement_weight = sample_improvement_weight
-        self.sample_improvement_margin = sample_improvement_margin
-        self.selector_choice_weight = selector_choice_weight
-        self.selector_choice_margin = selector_choice_margin
-        self.head_oracle_weight = head_oracle_weight
-        self.head_oracle_margin = head_oracle_margin
-        self.coarse_anchor_weight = coarse_anchor_weight
-        self.oracle_patch_weight = oracle_patch_weight
-        self.oracle_patch_margin = oracle_patch_margin
         self.hr_refined_weight = hr_refined_weight
         self.hr_perceptual_weight = hr_perceptual_weight
         self.hr_style_weight = hr_style_weight

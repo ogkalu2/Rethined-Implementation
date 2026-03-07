@@ -1,4 +1,4 @@
-"""RETHINED V6: refinement fixes on top of the V3 codebase."""
+"""RETHINED paper-path model."""
 
 import torch
 from torch import nn
@@ -170,27 +170,11 @@ class PatchInpainting(nn.Module):
         final_conv: bool = False,
         mask_inpainting: bool = True,
         use_argmax: bool = False,
-        residual_refinement: bool = True,
-        refiner_formulation: str = "v6",
-        refinement_gate_init: float = 1.0,
-        refinement_backend: str = "patch_attention",
-        refinement_hidden_dim: int = 128,
-        patch_match_mode: str = "hf",
         attn_topk: int = 8,
         attn_add_residual: bool = False,
         attn_temperature: float = 1.0,
-        token_use_mask_ratio: bool = True,
-        soft_key_mask_scale: float = 0.0,
-        attention_mask_mode: str = "strict",
-        apply_k_mask: bool = True,
+        token_use_mask_ratio: bool = False,
         paper_mask_renormalize: bool = False,
-        use_head_selector: bool = False,
-        selector_hidden_dim: int = 256,
-        selector_temperature: float = 1.0,
-        selector_hard: bool = True,
-        selector_bias_to_coarse: float = 2.0,
-        use_spatial_fusion: bool = False,
-        fusion_hidden_dim: int = 256,
         model,
     ):
         self.cross_attention = cross_attention
@@ -207,57 +191,17 @@ class PatchInpainting(nn.Module):
         self.final_conv = final_conv
         self.mask_inpainting = mask_inpainting
         self.use_argmax = use_argmax
-        self.use_residual_refinement = residual_refinement
-        self.refiner_formulation = refiner_formulation
-        self.refinement_backend = refinement_backend
-        self.refinement_hidden_dim = refinement_hidden_dim
-        self.patch_match_mode = patch_match_mode
         self.attn_topk = attn_topk
         self.attn_add_residual = attn_add_residual
         self.attn_temperature = attn_temperature
         self.token_use_mask_ratio = token_use_mask_ratio
-        self.soft_key_mask_scale = soft_key_mask_scale
-        self.attention_mask_mode = attention_mask_mode
-        self.apply_k_mask = apply_k_mask
         self.paper_mask_renormalize = paper_mask_renormalize
-        self.use_head_selector = use_head_selector
-        self.selector_hidden_dim = selector_hidden_dim
-        self.selector_temperature = selector_temperature
-        self.selector_hard = selector_hard
-        self.selector_bias_to_coarse = selector_bias_to_coarse
-        self.use_spatial_fusion = use_spatial_fusion
-        self.fusion_hidden_dim = fusion_hidden_dim
         super().__init__()
-        if self.refinement_backend not in ("patch_attention", "patch", None):
-            raise ValueError(
-                f"Unsupported refinement_backend={self.refinement_backend!r}. "
-                "Only the patch-based backend is supported."
-            )
-        if self.refiner_formulation not in ("v6", "paper"):
-            raise ValueError(
-                f"Unsupported refiner_formulation={self.refiner_formulation!r}. "
-                "Expected one of: 'v6', 'paper'."
-            )
-        if self.patch_match_mode not in ("hf", "full", "hybrid"):
-            raise ValueError(
-                f"Unsupported patch_match_mode={self.patch_match_mode!r}. "
-                "Expected one of: 'hf', 'full', 'hybrid'."
-            )
-        if self.attention_mask_mode not in ("strict", "paper"):
-            raise ValueError(
-                f"Unsupported attention_mask_mode={self.attention_mask_mode!r}. "
-                "Expected one of: 'strict', 'paper'."
-            )
-        if self.refiner_formulation == "paper" and (self.use_head_selector or self.use_spatial_fusion):
-            raise ValueError("Paper refiner formulation does not support selector or spatial fusion modules.")
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.pooling_layer = nn.MaxPool2d(kernel_size, stride=kernel_size)
         self.patch_value_dim = stem_out_channels * kernel_size * kernel_size
-        if self.patch_match_mode == "hybrid":
-            self.patch_match_dim = self.patch_value_dim * 2
-        else:
-            self.patch_match_dim = self.patch_value_dim
+        self.patch_match_dim = self.patch_value_dim
         self.patch_token_dim = self.patch_match_dim + self.feature_dim if self.concat_features else self.patch_match_dim
         if self.token_use_mask_ratio:
             self.patch_token_dim += 1
@@ -289,61 +233,13 @@ class PatchInpainting(nn.Module):
             1, self.patch_token_dim,
             int((image_size / stem_out_stride / self.kernel_size) ** 2)
         )) if use_kpos or use_qpos else None
-        self.patch_token_norm = nn.LayerNorm(self.patch_token_dim)
-        self.patch_delta_mixer = torch.nn.Sequential(
-            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-            nn.GELU(),
-            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
-        ) if self.final_conv else None
-        self.patch_gate_mixer = torch.nn.Sequential(
-            nn.Conv2d(self.patch_value_dim * 2, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-            nn.GELU(),
-            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
-        ) if self.final_conv else None
         self.paper_coherence_layer = torch.nn.Sequential(
             nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
             nn.Sigmoid(),
         ) if self.final_conv else None
-        if self.use_head_selector:
-            selector_in_channels = self.patch_value_dim * (self.nheads + 1) + 1
-            self.patch_selector = torch.nn.Sequential(
-                nn.Conv2d(selector_in_channels, self.selector_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-                nn.GELU(),
-                nn.Conv2d(self.selector_hidden_dim, self.nheads + 1, kernel_size=1, stride=1),
-            )
-            with torch.no_grad():
-                self.patch_selector[-1].bias.zero_()
-                self.patch_selector[-1].bias[0] = self.selector_bias_to_coarse
-        else:
-            self.patch_selector = None
-        if self.use_spatial_fusion:
-            fusion_in_channels = self.patch_value_dim * (self.nheads + 1) + 1 + self.feature_dim
-            self.patch_fusion_backbone = torch.nn.Sequential(
-                nn.Conv2d(fusion_in_channels, self.fusion_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-                nn.GELU(),
-                nn.Conv2d(self.fusion_hidden_dim, self.fusion_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-                nn.GELU(),
-            )
-            self.patch_fusion_logits = nn.Conv2d(self.fusion_hidden_dim, self.nheads + 1, kernel_size=1, stride=1)
-            self.patch_fusion_delta = nn.Conv2d(self.fusion_hidden_dim, self.patch_value_dim, kernel_size=1, stride=1)
-            with torch.no_grad():
-                self.patch_fusion_logits.bias.zero_()
-                self.patch_fusion_logits.bias[0] = 0.5
-        else:
-            self.patch_fusion_backbone = None
-            self.patch_fusion_logits = None
-            self.patch_fusion_delta = None
-        self.refinement_gate = nn.Parameter(torch.tensor(refinement_gate_init, dtype=torch.float32))
-        self.last_refinement_gate_map = None
-        self.last_candidate_patches_flat = None
         self.last_base_patches_flat = None
         self.last_pixel_mask_flat = None
-        self.last_selector_logits = None
-        self.last_selector_probs = None
-        self.last_candidate_bank = None
-        self.last_fusion_weights = None
         self.last_output_patches_flat = None
-        self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
 
@@ -403,92 +299,6 @@ class PatchInpainting(nn.Module):
         final_image = patches.view(B, C, n_h * kernel_size, n_w * kernel_size)
         return final_image
 
-    def mix_patch_tokens(self, patches: torch.Tensor, output_size) -> torch.Tensor:
-        """Apply a lightweight learned mixer in patch-token space."""
-        if self.patch_delta_mixer is None:
-            return patches
-
-        n_h = output_size[0] // self.kernel_size
-        n_w = output_size[1] // self.kernel_size
-        B = patches.shape[0]
-
-        patches_2d = patches.transpose(1, 2).view(B, -1, n_h, n_w)
-        patches_2d = self.patch_delta_mixer(patches_2d)
-        return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
-
-    def compute_patch_gate(self, base_patches: torch.Tensor, delta_patches: torch.Tensor, output_size) -> torch.Tensor:
-        """Predict a per-token gate for residual updates."""
-        if self.patch_gate_mixer is None:
-            return delta_patches.new_ones(delta_patches.shape)
-
-        n_h = output_size[0] // self.kernel_size
-        n_w = output_size[1] // self.kernel_size
-        B = delta_patches.shape[0]
-
-        base_2d = base_patches.transpose(1, 2).view(B, -1, n_h, n_w)
-        delta_2d = delta_patches.transpose(1, 2).view(B, -1, n_h, n_w)
-        gate_logits = self.patch_gate_mixer(torch.cat([base_2d, delta_2d], dim=1))
-        return gate_logits.view(B, -1, n_h * n_w).transpose(1, 2)
-
-    def mix_multihead_patch_tokens(self, patches: torch.Tensor, output_size) -> torch.Tensor:
-        """Apply the same token mixer independently to each head hypothesis."""
-        if self.patch_delta_mixer is None:
-            return patches
-
-        B, N, H, D = patches.shape
-        patches_bhn = patches.permute(0, 2, 1, 3).contiguous().view(B * H, N, D)
-        patches_bhn = self.mix_patch_tokens(patches_bhn, output_size)
-        return patches_bhn.view(B, H, N, D).permute(0, 2, 1, 3).contiguous()
-
-    def select_patch_hypotheses(self, candidate_bank: torch.Tensor, mask_ratio: torch.Tensor, output_size):
-        """Choose between coarse and per-head patch hypotheses."""
-        if self.patch_selector is None:
-            raise RuntimeError("Patch selector requested but not initialized.")
-
-        n_h = output_size[0] // self.kernel_size
-        n_w = output_size[1] // self.kernel_size
-        B, N, K, D = candidate_bank.shape
-
-        selector_tokens = candidate_bank.permute(0, 2, 3, 1).contiguous().view(B, K * D, n_h, n_w)
-        selector_input = torch.cat([selector_tokens, mask_ratio], dim=1)
-        selector_logits = self.patch_selector(selector_input)
-        selector_probs = F.softmax(selector_logits / max(self.selector_temperature, 1e-6), dim=1)
-        if self.selector_hard:
-            idx = torch.argmax(selector_probs, dim=1, keepdim=True)
-            selector_hard = torch.zeros_like(selector_probs).scatter_(1, idx, 1.0)
-            selector_probs = selector_hard - selector_probs.detach() + selector_probs
-
-        selector_probs_flat = selector_probs.view(B, K, n_h * n_w).transpose(1, 2).unsqueeze(-1)
-        selector_logits_flat = selector_logits.view(B, K, n_h * n_w).transpose(1, 2)
-        selected = (selector_probs_flat * candidate_bank).sum(dim=2)
-        return selected, selector_logits_flat, selector_probs_flat.squeeze(-1)
-
-    def fuse_patch_hypotheses(
-        self,
-        candidate_bank: torch.Tensor,
-        mask_ratio: torch.Tensor,
-        features_to_concat: torch.Tensor,
-        pixel_mask_flat: torch.Tensor,
-        output_size,
-    ):
-        """Fuse coarse + head hypotheses with neighborhood context on the patch grid."""
-        if self.patch_fusion_backbone is None:
-            raise RuntimeError("Spatial fusion requested but fusion module is not initialized.")
-
-        n_h = output_size[0] // self.kernel_size
-        n_w = output_size[1] // self.kernel_size
-        B, N, K, D = candidate_bank.shape
-        candidate_tokens = candidate_bank.permute(0, 2, 3, 1).contiguous().view(B, K * D, n_h, n_w)
-        fusion_input = torch.cat([candidate_tokens, features_to_concat, mask_ratio], dim=1)
-        fusion_feat = self.patch_fusion_backbone(fusion_input)
-        fusion_logits = self.patch_fusion_logits(fusion_feat)
-        fusion_weights = F.softmax(fusion_logits, dim=1)
-        fusion_weights_flat = fusion_weights.view(B, K, n_h * n_w).transpose(1, 2).unsqueeze(-1)
-        fused_candidates = (fusion_weights_flat * candidate_bank).sum(dim=2)
-        fusion_delta = self.patch_fusion_delta(fusion_feat).view(B, D, n_h * n_w).transpose(1, 2)
-        fused_candidates = fused_candidates + pixel_mask_flat * fusion_delta
-        return fused_candidates, fusion_weights_flat.squeeze(-1)
-
     def build_paper_attention_mask(self, pooled_patch_mask: torch.Tensor) -> torch.Tensor:
         """Paper-style multiplicative mask applied after softmax."""
         patch_mask_flat = pooled_patch_mask.squeeze(1).squeeze(-1)
@@ -522,15 +332,10 @@ class PatchInpainting(nn.Module):
             coarse_composite = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
 
-        # Paper mode uses raw coarse patches for token construction and the masked
-        # LR input for value mixing / preservation. Other modes keep the legacy
-        # composite-path behavior.
+        # The paper path uses raw coarse patches for token construction and the
+        # masked LR input for value mixing / preservation.
         coarse_patches_full, sizes = self.unfold_native(image_coarse_inpainting, self.kernel_size)
-        composite_patches_full, _ = self.unfold_native(coarse_composite, self.kernel_size)
         known_patches_full, _ = self.unfold_native(masked_input, self.kernel_size)
-        composite_blurred = self.final_gaussian_blur(coarse_composite)
-        composite_patches_blurred, _ = self.unfold_native(composite_blurred, self.kernel_size)
-        composite_patches_hf = composite_patches_full - composite_patches_blurred
 
         pos = self.positionalencoding.repeat(
             coarse_patches_full.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
@@ -545,22 +350,9 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
-        if self.refiner_formulation == "paper":
-            match_patches = coarse_patches_full
-            value_patches_full = known_patches_full
-            preserve_patches_full = known_patches_full
-        elif self.patch_match_mode == "hf":
-            match_patches = composite_patches_hf
-            value_patches_full = composite_patches_full
-            preserve_patches_full = composite_patches_full
-        elif self.patch_match_mode == "full":
-            match_patches = composite_patches_full
-            value_patches_full = composite_patches_full
-            preserve_patches_full = composite_patches_full
-        else:
-            match_patches = torch.cat([composite_patches_hf, composite_patches_full], dim=1)
-            value_patches_full = composite_patches_full
-            preserve_patches_full = composite_patches_full
+        match_patches = coarse_patches_full
+        value_patches_full = known_patches_full
+        preserve_patches_full = known_patches_full
         features_to_concat = None
         if self.concat_features:
             features_to_concat = features[self.feature_i]
@@ -573,139 +365,31 @@ class PatchInpainting(nn.Module):
             token_map = torch.cat([token_map, mask_ratio], dim=1)
 
         input_attn = token_map.flatten(start_dim=2).transpose(1, 2)
-        if self.refiner_formulation != "paper":
-            input_attn = self.patch_token_norm(input_attn)
 
         full_patches_flat = value_patches_full.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
-        if self.refiner_formulation == "paper":
-            self.last_base_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
-        else:
-            self.last_base_patches_flat = full_patches_flat
+        self.last_base_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
 
-        post_softmax_mask = None
-        renorm_post_mask = False
-        if self.attention_masking:
-            if self.refiner_formulation == "paper":
-                qk_mask = None
-                k_mask = None
-                post_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled)
-                renorm_post_mask = self.paper_mask_renormalize
-            else:
-                if self.attention_mask_mode == "paper":
-                    # Preserve known patches by biasing them toward self-attention while
-                    # suppressing self-attention on masked patches.
-                    qk_mask = self.qk_mask * (2.0 * (1.0 - mask_same_res_as_features_pooled) - 1.0)
-                else:
-                    qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1)
-                if self.apply_k_mask:
-                    if self.soft_key_mask_scale > 0:
-                        key_mask_ratio = mask_ratio.flatten(start_dim=2).unsqueeze(-1)
-                        k_mask = -self.soft_key_mask_scale * key_mask_ratio
-                    else:
-                        k_mask = -1e4 * mask_same_res_as_features_pooled
-                else:
-                    k_mask = None
-        else:
-            qk_mask = None
-            k_mask = None
-        if self.use_head_selector or self.use_spatial_fusion:
-            out, atten_weights, head_outputs = self.multihead_attention(
-                input_attn,
-                input_attn,
-                full_patches_flat,
-                qpos=pos,
-                kpos=pos,
-                qk_mask=qk_mask,
-                k_mask=k_mask,
-                post_softmax_mask=post_softmax_mask,
-                renorm_post_mask=renorm_post_mask,
-                direct_patch_mixing=(self.refiner_formulation == "paper"),
-                return_head_outputs=True,
-            )
-        else:
-            out, atten_weights = self.multihead_attention(
-                input_attn,
-                input_attn,
-                full_patches_flat,
-                qpos=pos,
-                kpos=pos,
-                qk_mask=qk_mask,
-                k_mask=k_mask,
-                post_softmax_mask=post_softmax_mask,
-                renorm_post_mask=renorm_post_mask,
-                direct_patch_mixing=(self.refiner_formulation == "paper"),
-            )
+        post_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
+        out, atten_weights = self.multihead_attention(
+            input_attn,
+            input_attn,
+            full_patches_flat,
+            qpos=pos,
+            kpos=pos,
+            qk_mask=None,
+            k_mask=None,
+            post_softmax_mask=post_softmax_mask,
+            renorm_post_mask=self.paper_mask_renormalize,
+            direct_patch_mixing=True,
+        )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        if self.refiner_formulation == "paper":
-            out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
-            out = self.apply_paper_coherence(out, sizes)
-            out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
-            self.last_refinement_gate_map = None
-            self.last_candidate_patches_flat = None
-            self.last_selector_logits = None
-            self.last_selector_probs = None
-            self.last_candidate_bank = None
-            self.last_fusion_weights = None
-            self.last_output_patches_flat = out
-            self.last_pixel_mask_flat = pixel_mask_flat
-        elif self.use_residual_refinement:
-            if self.use_spatial_fusion:
-                delta_full = head_outputs - full_patches_flat.unsqueeze(2)
-                delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
-                candidate_bank = full_patches_flat.unsqueeze(2) + pixel_mask_flat.unsqueeze(2) * delta_full
-                candidate_bank = torch.cat([full_patches_flat.unsqueeze(2), candidate_bank], dim=2)
-                out, fusion_weights = self.fuse_patch_hypotheses(
-                    candidate_bank,
-                    mask_ratio,
-                    features_to_concat,
-                    pixel_mask_flat,
-                    sizes,
-                )
-                self.last_refinement_gate_map = None
-                self.last_candidate_patches_flat = None
-                self.last_selector_logits = None
-                self.last_selector_probs = None
-                self.last_candidate_bank = candidate_bank
-                self.last_fusion_weights = fusion_weights
-            elif self.use_head_selector:
-                delta_full = head_outputs - full_patches_flat.unsqueeze(2)
-                delta_full = self.mix_multihead_patch_tokens(delta_full, sizes)
-                candidate_bank = full_patches_flat.unsqueeze(2) + pixel_mask_flat.unsqueeze(2) * delta_full
-                candidate_bank = torch.cat([full_patches_flat.unsqueeze(2), candidate_bank], dim=2)
-                out, selector_logits, selector_probs = self.select_patch_hypotheses(candidate_bank, mask_ratio, sizes)
-                self.last_refinement_gate_map = None
-                self.last_candidate_patches_flat = None
-                self.last_selector_logits = selector_logits
-                self.last_selector_probs = selector_probs
-                self.last_candidate_bank = candidate_bank
-                self.last_fusion_weights = None
-            else:
-                delta_full = out - full_patches_flat
-                delta_full = self.mix_patch_tokens(delta_full, sizes)
-                candidate_patches = full_patches_flat + pixel_mask_flat * delta_full
-                gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
-                refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
-                out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
-                self.last_refinement_gate_map = refinement_gate
-                self.last_candidate_patches_flat = candidate_patches
-                self.last_selector_logits = None
-                self.last_selector_probs = None
-                self.last_candidate_bank = None
-                self.last_fusion_weights = None
-            self.last_output_patches_flat = out
-            self.last_pixel_mask_flat = pixel_mask_flat
-        else:
-            out = out * patch_mask + full_patches_flat * (1 - patch_mask)
-            self.last_refinement_gate_map = None
-            self.last_candidate_patches_flat = None
-            self.last_pixel_mask_flat = pixel_mask_flat
-            self.last_selector_logits = None
-            self.last_selector_probs = None
-            self.last_candidate_bank = None
-            self.last_fusion_weights = None
-            self.last_output_patches_flat = out
+        out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        out = self.apply_paper_coherence(out, sizes)
+        out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        self.last_output_patches_flat = out
+        self.last_pixel_mask_flat = pixel_mask_flat
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
