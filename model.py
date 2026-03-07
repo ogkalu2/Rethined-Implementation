@@ -238,6 +238,10 @@ class PatchInpainting(nn.Module):
             nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=1, stride=1),
         ) if self.final_conv else None
         self.refinement_gate = nn.Parameter(torch.tensor(refinement_gate_init, dtype=torch.float32))
+        self.last_refinement_gate_map = None
+        self.last_candidate_patches_flat = None
+        self.last_base_patches_flat = None
+        self.last_pixel_mask_flat = None
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -373,6 +377,7 @@ class PatchInpainting(nn.Module):
         input_attn = self.patch_token_norm(input_attn)
 
         full_patches_flat = image_as_patches_full.flatten(start_dim=2).transpose(1, 2)
+        self.last_base_patches_flat = full_patches_flat
 
         qk_mask = -1e4 * self.qk_mask.repeat(full_patches_flat.size(0), 1, 1, 1) if self.attention_masking else None
         if self.attention_masking:
@@ -391,11 +396,18 @@ class PatchInpainting(nn.Module):
         if self.use_residual_refinement:
             delta_full = out - full_patches_flat
             delta_full = self.mix_patch_tokens(delta_full, sizes)
+            candidate_patches = full_patches_flat + pixel_mask_flat * delta_full
             gate_logits = self.compute_patch_gate(full_patches_flat, delta_full, sizes)
             refinement_gate = torch.sigmoid(self.refinement_gate) * torch.sigmoid(gate_logits)
             out = full_patches_flat + refinement_gate * pixel_mask_flat * delta_full
+            self.last_refinement_gate_map = refinement_gate
+            self.last_candidate_patches_flat = candidate_patches
+            self.last_pixel_mask_flat = pixel_mask_flat
         else:
             out = out * patch_mask + full_patches_flat * (1 - patch_mask)
+            self.last_refinement_gate_map = None
+            self.last_candidate_patches_flat = None
+            self.last_pixel_mask_flat = pixel_mask_flat
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)

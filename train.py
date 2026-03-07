@@ -93,7 +93,81 @@ def set_parameter_trainability(model, train_mode: str, freeze_coarse: bool = Fal
         model.coarse_model.eval()
 
 
-def compute_train_loss(criterion, coarse, refined, target, mask, train_mode: str):
+def compute_selective_gate_targets(model, target, margin: float = 0.0):
+    """Build patch-level supervision for the learned refinement gate."""
+    generator = getattr(model, "generator", None)
+    if generator is None:
+        return None
+
+    gate = getattr(generator, "last_refinement_gate_map", None)
+    candidate = getattr(generator, "last_candidate_patches_flat", None)
+    base = getattr(generator, "last_base_patches_flat", None)
+    pixel_mask = getattr(generator, "last_pixel_mask_flat", None)
+    if gate is None or candidate is None or base is None or pixel_mask is None:
+        return None
+
+    with torch.no_grad():
+        gt_patches, _ = generator.unfold_native(target, generator.kernel_size)
+        gt_patches = gt_patches.flatten(start_dim=2).transpose(1, 2)
+
+        pixel_mask_detached = pixel_mask.detach()
+        valid_patches = pixel_mask_detached.sum(dim=-1) > 0
+        if not valid_patches.any():
+            return None
+
+        mask_count = pixel_mask_detached.sum(dim=-1).clamp_min(1.0)
+        base_patch_err = (torch.abs(base.detach() - gt_patches) * pixel_mask_detached).sum(dim=-1) / mask_count
+        candidate_patch_err = (torch.abs(candidate.detach() - gt_patches) * pixel_mask_detached).sum(dim=-1) / mask_count
+        gate_target = ((candidate_patch_err + margin) < base_patch_err).float()
+        advantage = base_patch_err - candidate_patch_err
+
+    gate_pred = (gate * pixel_mask).sum(dim=-1) / pixel_mask.sum(dim=-1).clamp_min(1.0)
+    return {
+        "gate_pred": gate_pred.float(),
+        "gate_target": gate_target.float(),
+        "valid_patches": valid_patches,
+        "advantage": advantage.float(),
+    }
+
+
+
+def compute_selective_gate_loss(model, target, weight: float, margin: float):
+    """Teach the gate to open only where the raw candidate beats coarse."""
+    zero = target.new_zeros(())
+    empty_metrics = {
+        "gate_target_rate": None,
+        "gate_pred_mean": None,
+        "gate_accuracy": None,
+        "gate_advantage_mean": None,
+    }
+    if weight <= 0:
+        return zero, empty_metrics
+
+    stats = compute_selective_gate_targets(model, target, margin=margin)
+    if stats is None:
+        return zero, empty_metrics
+
+    valid_patches = stats["valid_patches"]
+    gate_pred = stats["gate_pred"][valid_patches].clamp(1e-4, 1 - 1e-4)
+    gate_target = stats["gate_target"][valid_patches]
+    advantage = stats["advantage"][valid_patches]
+
+    raw_bce = F.binary_cross_entropy(gate_pred, gate_target, reduction="none")
+    advantage_weight = (advantage.abs() / advantage.abs().mean().clamp_min(1e-6)).detach().clamp(0.25, 4.0)
+    gate_loss = (raw_bce * advantage_weight).mean()
+
+    gate_binary = (gate_pred >= 0.5).float()
+    gate_metrics = {
+        "gate_target_rate": gate_target.mean().item(),
+        "gate_pred_mean": gate_pred.mean().item(),
+        "gate_accuracy": (gate_binary == gate_target).float().mean().item(),
+        "gate_advantage_mean": advantage.mean().item(),
+    }
+    return gate_loss, gate_metrics
+
+
+
+def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mode: str):
     """Compute loss according to the current staged-training mode."""
     l1_coarse = criterion.masked_l1(coarse, target, mask)
     l1_refined = criterion.masked_l1(refined, target, mask)
@@ -101,11 +175,25 @@ def compute_train_loss(criterion, coarse, refined, target, mask, train_mode: str
     zero = refined.new_zeros(())
     perceptual = zero
     style = zero
+    gate_selective = zero
+    gate_metrics = {
+        "gate_target_rate": None,
+        "gate_pred_mean": None,
+        "gate_accuracy": None,
+        "gate_advantage_mean": None,
+    }
 
     if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.perceptual_weight > 0:
         perceptual = criterion.perceptual_loss(refined, target)
     if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.style_weight > 0:
         style = criterion.style_loss(refined, target)
+    if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.gate_selective_weight > 0:
+        gate_selective, gate_metrics = compute_selective_gate_loss(
+            model,
+            target,
+            criterion.gate_selective_weight,
+            criterion.gate_selective_margin,
+        )
 
     if train_mode == "joint":
         total = (
@@ -113,12 +201,14 @@ def compute_train_loss(criterion, coarse, refined, target, mask, train_mode: str
             + l1_refined
             + criterion.perceptual_weight * perceptual
             + criterion.style_weight * style
+            + criterion.gate_selective_weight * gate_selective
         )
     elif train_mode == "refined_loss_only":
         total = (
             l1_refined
             + criterion.perceptual_weight * perceptual
             + criterion.style_weight * style
+            + criterion.gate_selective_weight * gate_selective
         )
     elif train_mode == "coarse_only":
         total = l1_coarse
@@ -127,6 +217,7 @@ def compute_train_loss(criterion, coarse, refined, target, mask, train_mode: str
             l1_refined
             + criterion.perceptual_weight * perceptual
             + criterion.style_weight * style
+            + criterion.gate_selective_weight * gate_selective
         )
     else:
         raise ValueError(f"Unknown train_mode: {train_mode}")
@@ -136,9 +227,10 @@ def compute_train_loss(criterion, coarse, refined, target, mask, train_mode: str
         "l1_refined": l1_refined.item(),
         "perceptual": perceptual.item(),
         "style": style.item(),
+        "gate_selective": gate_selective.item(),
         "total": total.item(),
     }
-    return total, loss_dict
+    return total, loss_dict, gate_metrics
 
 
 def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, extra=None):
@@ -203,7 +295,16 @@ def save_vis(writer, batch, coarse, refined, step, log_dir=None):
 
 
 @torch.no_grad()
-def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8, train_mode="joint", freeze_coarse=False):
+def evaluate_refinement_health(
+    model,
+    dataloader,
+    device,
+    use_amp,
+    max_batches=8,
+    train_mode="joint",
+    freeze_coarse=False,
+    gate_selective_margin=0.0,
+):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
 
@@ -216,6 +317,10 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
         "raw_valid_l1_refined": [],
         "refined_better_flags": [],
         "masked_delta_mean": [],
+        "gate_target_rate": [],
+        "gate_pred_mean": [],
+        "gate_accuracy": [],
+        "gate_advantage_mean": [],
     }
 
     for batch_idx, batch in enumerate(dataloader):
@@ -254,6 +359,18 @@ def evaluate_refinement_health(model, dataloader, device, use_amp, max_batches=8
         stats["raw_valid_l1_refined"].extend(raw_refined_valid.detach().cpu().tolist())
         stats["masked_delta_mean"].extend(masked_delta.detach().cpu().tolist())
         stats["refined_better_flags"].extend((refined_hole < coarse_hole).detach().cpu().float().tolist())
+
+        gate_stats = compute_selective_gate_targets(model, image, margin=gate_selective_margin)
+        if gate_stats is not None:
+            valid_patches = gate_stats["valid_patches"]
+            gate_pred = gate_stats["gate_pred"][valid_patches]
+            gate_target = gate_stats["gate_target"][valid_patches]
+            gate_advantage = gate_stats["advantage"][valid_patches]
+            gate_binary = (gate_pred >= 0.5).float()
+            stats["gate_target_rate"].append(gate_target.mean().item())
+            stats["gate_pred_mean"].append(gate_pred.mean().item())
+            stats["gate_accuracy"].append((gate_binary == gate_target).float().mean().item())
+            stats["gate_advantage_mean"].append(gate_advantage.mean().item())
 
     result = {}
     for key, values in stats.items():
@@ -298,6 +415,14 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
     writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
     writer.add_scalar("val/masked_delta_mean", health["masked_delta_mean"], step)
+    if health.get("gate_target_rate") is not None:
+        writer.add_scalar("val/gate_target_rate", health["gate_target_rate"], step)
+    if health.get("gate_pred_mean") is not None:
+        writer.add_scalar("val/gate_pred_mean", health["gate_pred_mean"], step)
+    if health.get("gate_accuracy") is not None:
+        writer.add_scalar("val/gate_accuracy", health["gate_accuracy"], step)
+    if health.get("gate_advantage_mean") is not None:
+        writer.add_scalar("val/gate_advantage_mean", health["gate_advantage_mean"], step)
     write_status(
         log_dir,
         step,
@@ -310,6 +435,13 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     )
     append_validation_history(log_dir, step, health)
 
+    gate_suffix = ""
+    if health.get("gate_accuracy") is not None:
+        gate_suffix = (
+            f", gate_acc={health['gate_accuracy']:.2f}"
+            f", gate_on={health['gate_pred_mean']:.2f}"
+            f", gate_target={health['gate_target_rate']:.2f}"
+        )
     warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
     print(
         f"\nValidation step {step}: "
@@ -319,7 +451,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"better_rate={health['refined_better_rate']:.2f}, "
         f"valid coarse={health['valid_l1_coarse']:.4f}, "
         f"valid refined={health['valid_l1_refined']:.4f}, "
-        f"raw valid refined={health['raw_valid_l1_refined']:.4f}{warning_suffix}"
+        f"raw valid refined={health['raw_valid_l1_refined']:.4f}{gate_suffix}{warning_suffix}"
     )
 
 
@@ -448,7 +580,15 @@ def train(cfg, args):
             refined_raw, attn, coarse_raw = model(masked_image, mask)
             coarse = composite_with_known(coarse_raw, image, mask)
             refined = composite_with_known(refined_raw, image, mask)
-            loss, loss_dict = compute_train_loss(criterion, coarse, refined, image, mask, train_mode=train_mode)
+            loss, loss_dict, gate_metrics = compute_train_loss(
+                criterion,
+                model,
+                coarse,
+                refined,
+                image,
+                mask,
+                train_mode=train_mode,
+            )
             loss = loss / grad_accum
 
         # Backward
@@ -478,6 +618,12 @@ def train(cfg, args):
             writer.add_scalar("loss/l1_refined", loss_dict["l1_refined"], step)
             writer.add_scalar("loss/perceptual", loss_dict["perceptual"], step)
             writer.add_scalar("loss/style", loss_dict["style"], step)
+            writer.add_scalar("loss/gate_selective", loss_dict["gate_selective"], step)
+            if gate_metrics.get("gate_target_rate") is not None:
+                writer.add_scalar("train/gate_target_rate", gate_metrics["gate_target_rate"], step)
+                writer.add_scalar("train/gate_pred_mean", gate_metrics["gate_pred_mean"], step)
+                writer.add_scalar("train/gate_accuracy", gate_metrics["gate_accuracy"], step)
+                writer.add_scalar("train/gate_advantage_mean", gate_metrics["gate_advantage_mean"], step)
             if hasattr(model.generator, "refinement_gate"):
                 writer.add_scalar("model/refinement_gate", torch.sigmoid(model.generator.refinement_gate).item(), step)
             opt_step = (step + 1) // grad_accum
@@ -499,6 +645,7 @@ def train(cfg, args):
                 max_batches=eval_batches,
                 train_mode=train_mode,
                 freeze_coarse=freeze_coarse,
+                gate_selective_margin=criterion.gate_selective_margin,
             )
             log_validation(
                 writer,
@@ -556,6 +703,7 @@ def train(cfg, args):
             max_batches=eval_batches,
             train_mode=train_mode,
             freeze_coarse=freeze_coarse,
+            gate_selective_margin=criterion.gate_selective_margin,
         )
         log_validation(
             writer,

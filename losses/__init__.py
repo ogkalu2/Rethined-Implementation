@@ -21,12 +21,16 @@ class InpaintingLoss(nn.Module):
         l1_valid_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         style_weight: float = 0.0,
+        gate_selective_weight: float = 0.0,
+        gate_selective_margin: float = 0.0,
     ):
         super().__init__()
         self.l1_hole_weight = l1_hole_weight
         self.l1_valid_weight = l1_valid_weight
         self.perceptual_weight = perceptual_weight
         self.style_weight = style_weight
+        self.gate_selective_weight = gate_selective_weight
+        self.gate_selective_margin = gate_selective_margin
 
         self.perceptual_loss = PerceptualLoss()
         self.style_loss = StyleLoss()
