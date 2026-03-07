@@ -166,6 +166,9 @@ class PatchInpainting(nn.Module):
         region_router_temperature: float = 1.0,
         region_router_hard: bool = True,
         region_router_bias_to_coarse: float = 0.5,
+        use_synthesis_branch: bool = False,
+        synthesis_hidden_dim: int = 128,
+        synthesis_feature_channels: int = 64,
         model,
     ):
         self.cross_attention = cross_attention
@@ -203,6 +206,9 @@ class PatchInpainting(nn.Module):
         self.region_router_temperature = region_router_temperature
         self.region_router_hard = region_router_hard
         self.region_router_bias_to_coarse = region_router_bias_to_coarse
+        self.use_synthesis_branch = use_synthesis_branch
+        self.synthesis_hidden_dim = synthesis_hidden_dim
+        self.synthesis_feature_channels = synthesis_feature_channels
         super().__init__()
         if self.refinement_backend not in ("patch_attention", "patch", None):
             raise ValueError(
@@ -299,6 +305,18 @@ class PatchInpainting(nn.Module):
             self.region_router_backbone = None
             self.region_router_head = None
             self.region_local_refiner = None
+        if self.use_synthesis_branch:
+            self.synthesis_feature_proj = nn.Conv2d(self.feature_dim, self.synthesis_feature_channels, kernel_size=1, stride=1)
+            self.synthesis_head = torch.nn.Sequential(
+                nn.Conv2d(3 + 3 + 1 + self.synthesis_feature_channels, self.synthesis_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+                nn.Conv2d(self.synthesis_hidden_dim, self.synthesis_hidden_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
+                nn.GELU(),
+                nn.Conv2d(self.synthesis_hidden_dim, 3, kernel_size=1, stride=1),
+            )
+        else:
+            self.synthesis_feature_proj = None
+            self.synthesis_head = None
         if self.use_spatial_fusion:
             fusion_in_channels = self.patch_value_dim * (self.nheads + 1) + 1 + self.feature_dim
             self.patch_fusion_backbone = torch.nn.Sequential(
@@ -327,6 +345,7 @@ class PatchInpainting(nn.Module):
         self.last_fusion_weights = None
         self.last_output_patches_flat = None
         self.last_region_weights = None
+        self.last_synthesis_delta_mean = None
         self.pixel_shuffle = nn.PixelShuffle(self.kernel_size)
         if merge_mode == 'all':
             self.merge_func = self.merge_all_patches_sum
@@ -716,6 +735,21 @@ class PatchInpainting(nn.Module):
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
+
+        if self.use_synthesis_branch:
+            synthesis_features = F.interpolate(
+                features[self.feature_i],
+                size=out.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+            synthesis_features = self.synthesis_feature_proj(synthesis_features)
+            synthesis_input = torch.cat([coarse_composite, out, mask, synthesis_features], dim=1)
+            synthesis_delta = self.synthesis_head(synthesis_input)
+            out = out + mask * synthesis_delta
+            self.last_synthesis_delta_mean = float((torch.abs(synthesis_delta) * mask).mean().detach().cpu().item())
+        else:
+            self.last_synthesis_delta_mean = None
 
         return out, atten_weights, image_to_return
 
