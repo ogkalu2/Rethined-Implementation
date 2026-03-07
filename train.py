@@ -172,6 +172,19 @@ def compute_selective_gate_loss(model, target, weight: float, margin: float):
     return gate_loss, gate_metrics
 
 
+def compute_sample_improvement_loss(coarse, refined, target, mask, margin: float):
+    """Encourage refined output to beat coarse on each sample, not only on average."""
+    hole_denom = (mask.sum(dim=(1, 2, 3)) * target.shape[1]).clamp_min(1e-8)
+    coarse_hole = (torch.abs(coarse.detach() - target) * mask).sum(dim=(1, 2, 3)) / hole_denom
+    refined_hole = (torch.abs(refined - target) * mask).sum(dim=(1, 2, 3)) / hole_denom
+    improvement_hinge = F.relu(refined_hole - coarse_hole + margin)
+    metrics = {
+        "sample_better_rate_batch": (refined_hole < coarse_hole).float().mean().item(),
+        "sample_margin_violations": (improvement_hinge > 0).float().mean().item(),
+        "sample_improvement_gap": (coarse_hole - refined_hole).mean().item(),
+    }
+    return improvement_hinge.mean(), metrics
+
 
 def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mode: str):
     """Compute loss according to the current staged-training mode."""
@@ -182,11 +195,17 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
     perceptual = zero
     style = zero
     gate_selective = zero
+    sample_improvement = zero
     gate_metrics = {
         "gate_target_rate": None,
         "gate_pred_mean": None,
         "gate_accuracy": None,
         "gate_advantage_mean": None,
+    }
+    improvement_metrics = {
+        "sample_better_rate_batch": None,
+        "sample_margin_violations": None,
+        "sample_improvement_gap": None,
     }
 
     if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.perceptual_weight > 0:
@@ -200,6 +219,14 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             criterion.gate_selective_weight,
             criterion.gate_selective_margin,
         )
+    if train_mode in ("joint", "refine_only", "refined_loss_only") and criterion.sample_improvement_weight > 0:
+        sample_improvement, improvement_metrics = compute_sample_improvement_loss(
+            coarse,
+            refined,
+            target,
+            mask,
+            criterion.sample_improvement_margin,
+        )
 
     if train_mode == "joint":
         total = (
@@ -208,6 +235,7 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.perceptual_weight * perceptual
             + criterion.style_weight * style
             + criterion.gate_selective_weight * gate_selective
+            + criterion.sample_improvement_weight * sample_improvement
         )
     elif train_mode == "refined_loss_only":
         total = (
@@ -215,6 +243,7 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.perceptual_weight * perceptual
             + criterion.style_weight * style
             + criterion.gate_selective_weight * gate_selective
+            + criterion.sample_improvement_weight * sample_improvement
         )
     elif train_mode == "coarse_only":
         total = l1_coarse
@@ -224,6 +253,7 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
             + criterion.perceptual_weight * perceptual
             + criterion.style_weight * style
             + criterion.gate_selective_weight * gate_selective
+            + criterion.sample_improvement_weight * sample_improvement
         )
     else:
         raise ValueError(f"Unknown train_mode: {train_mode}")
@@ -234,9 +264,11 @@ def compute_train_loss(criterion, model, coarse, refined, target, mask, train_mo
         "perceptual": perceptual.item(),
         "style": style.item(),
         "gate_selective": gate_selective.item(),
+        "sample_improvement": sample_improvement.item(),
         "total": total.item(),
     }
-    return total, loss_dict, gate_metrics
+    aux_metrics = {**gate_metrics, **improvement_metrics}
+    return total, loss_dict, aux_metrics
 
 
 def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, extra=None):
@@ -625,11 +657,16 @@ def train(cfg, args):
             writer.add_scalar("loss/perceptual", loss_dict["perceptual"], step)
             writer.add_scalar("loss/style", loss_dict["style"], step)
             writer.add_scalar("loss/gate_selective", loss_dict["gate_selective"], step)
+            writer.add_scalar("loss/sample_improvement", loss_dict["sample_improvement"], step)
             if gate_metrics.get("gate_target_rate") is not None:
                 writer.add_scalar("train/gate_target_rate", gate_metrics["gate_target_rate"], step)
                 writer.add_scalar("train/gate_pred_mean", gate_metrics["gate_pred_mean"], step)
                 writer.add_scalar("train/gate_accuracy", gate_metrics["gate_accuracy"], step)
                 writer.add_scalar("train/gate_advantage_mean", gate_metrics["gate_advantage_mean"], step)
+            if gate_metrics.get("sample_better_rate_batch") is not None:
+                writer.add_scalar("train/sample_better_rate_batch", gate_metrics["sample_better_rate_batch"], step)
+                writer.add_scalar("train/sample_margin_violations", gate_metrics["sample_margin_violations"], step)
+                writer.add_scalar("train/sample_improvement_gap", gate_metrics["sample_improvement_gap"], step)
             if hasattr(model.generator, "refinement_gate"):
                 writer.add_scalar("model/refinement_gate", torch.sigmoid(model.generator.refinement_gate).item(), step)
             opt_step = (step + 1) // grad_accum
