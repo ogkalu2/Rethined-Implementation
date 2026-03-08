@@ -66,9 +66,9 @@ loss:
   refined_weight: 1.0
   l1_hole_weight: 6.0
   l1_valid_weight: 1.0
-  perceptual_weight: 0.0
+  perceptual_weight: 0.1
   style_weight: 0.0
-  hr_refined_weight: 0.0
+  hr_refined_weight: 1.0
   hr_perceptual_weight: 0.0
   hr_style_weight: 0.0
 
@@ -77,7 +77,7 @@ logging:
   log_interval: 25
   vis_interval: 500
   eval_interval: 250
-  eval_batches: 8
+  eval_batches: 0
   save_interval: 1000
   save_checkpoints: true
   save_final_checkpoint: true

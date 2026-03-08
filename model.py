@@ -239,7 +239,7 @@ class PatchInpainting(nn.Module):
             1, self.patch_token_dim,
             int((image_size / stem_out_stride / self.kernel_size) ** 2)
         )) if use_kpos or use_qpos else None
-        self.refinement_gate = nn.Parameter(torch.tensor([0.05]))
+        self.refinement_gate = nn.Parameter(torch.tensor([1.0]))
         self.refinement_runtime_scale = 1.0
         self.paper_coherence_layer = nn.Conv2d(
             self.patch_value_dim, self.patch_value_dim,
@@ -351,9 +351,9 @@ class PatchInpainting(nn.Module):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
         if self.mask_inpainting:
-            coarse_composite = image_coarse_inpainting.detach() * mask + masked_input * (1 - mask)
+            coarse_composite = image_coarse_inpainting * mask + masked_input * (1 - mask)
         else:
-            coarse_composite = image_coarse_inpainting.detach()
+            coarse_composite = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
 
         # Match the reference path: build attention tokens from the coarse
@@ -386,7 +386,7 @@ class PatchInpainting(nn.Module):
         preserve_patches_full = composite_patches_full
         features_to_concat = None
         if self.concat_features:
-            features_to_concat = features[self.feature_i].detach()
+            features_to_concat = features[self.feature_i]
             features_to_concat = F.interpolate(features_to_concat, size=hf_patches.shape[-2:], mode='bilinear', align_corners=False)
             token_map = torch.cat([match_patches, features_to_concat], dim=1)
         else:
