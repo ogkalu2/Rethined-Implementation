@@ -35,10 +35,11 @@ REFINEMENT_TIE_EPS = 1e-6
 
 def build_model_config(cfg):
     """Build the model config dict from YAML config."""
+    coarse_cfg = cfg["model"]["coarse_model"]
     return {
         "coarse_model": {
-            "class": "MobileOneCoarse",
-            "parameters": {"variant": cfg["model"]["coarse_model"]["variant"]},
+            "class": coarse_cfg.get("class", "MobileOneCoarse"),
+            "parameters": {k: v for k, v in coarse_cfg.items() if k != "class"},
         },
         "generator": {
             "generator_class": "PatchInpainting",

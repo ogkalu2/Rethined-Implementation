@@ -6,7 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from mobileone import PARAMS, mobileone, reparameterize_model
+from mobileone import MobileOne, PARAMS, reparameterize_model
 
 
 class NativeGaussianBlur2d(nn.Module):
@@ -416,13 +416,138 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
+class DepthwiseSeparableBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, use_residual: bool = True):
+        super().__init__()
+        self.use_residual = use_residual
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=3,
+            stride=stride,
+            padding=1,
+            groups=in_channels,
+            bias=False,
+        )
+        self.depthwise_bn = nn.BatchNorm2d(in_channels)
+        self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.pointwise_bn = nn.BatchNorm2d(out_channels)
+        self.activation = nn.ReLU(inplace=True)
+        self.proj = None
+        if use_residual and (stride != 1 or in_channels != out_channels):
+            self.proj = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = self.depthwise(x)
+        out = self.depthwise_bn(out)
+        out = self.activation(out)
+        out = self.pointwise(out)
+        out = self.pointwise_bn(out)
+        if self.use_residual:
+            if self.proj is not None:
+                residual = self.proj(residual)
+            out = out + residual
+        return self.activation(out)
+
+
+class PaperEncoderStage(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        self.down = DepthwiseSeparableBlock(in_channels, out_channels, stride=2, use_residual=True)
+        self.refine = DepthwiseSeparableBlock(out_channels, out_channels, stride=1, use_residual=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.down(x)
+        return self.refine(x)
+
+
+class PaperUpBlock(nn.Module):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+        super().__init__()
+        self.block1 = DepthwiseSeparableBlock(
+            in_channels + skip_channels,
+            out_channels,
+            stride=1,
+            use_residual=True,
+        )
+        self.block2 = DepthwiseSeparableBlock(out_channels, out_channels, stride=1, use_residual=True)
+
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = torch.cat([x, skip], dim=1)
+        x = self.block1(x)
+        return self.block2(x)
+
+
+class PaperCoarse(nn.Module):
+    def __init__(self, channels=None, head_channels: int = 32, **kwargs):
+        super().__init__()
+        if kwargs:
+            raise ValueError(f"Unsupported PaperCoarse arguments: {sorted(kwargs)}")
+
+        if channels is None:
+            channels = [64, 128, 256, 384, 512]
+        if len(channels) != 5:
+            raise ValueError(f"PaperCoarse expects 5 channel values, got {channels}")
+
+        c0, c1, c2, c3, c4 = [int(c) for c in channels]
+        self.feature_channels = [c0, c1, c2, c3, c4]
+
+        self.stage0 = PaperEncoderStage(3, c0)
+        self.stage1 = PaperEncoderStage(c0, c1)
+        self.stage2 = PaperEncoderStage(c1, c2)
+        self.stage3 = PaperEncoderStage(c2, c3)
+        self.stage4 = PaperEncoderStage(c3, c4)
+
+        self.up4 = PaperUpBlock(c4, c3, c3)
+        self.up3 = PaperUpBlock(c3, c2, c2)
+        self.up2 = PaperUpBlock(c2, c1, c1)
+        self.up1 = PaperUpBlock(c1, c0, c0)
+        self.head_channels = int(head_channels)
+        self.head_block = DepthwiseSeparableBlock(c0 + 3, self.head_channels, stride=1, use_residual=True)
+        self.out_conv = nn.Conv2d(self.head_channels, 3, kernel_size=1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x: torch.Tensor):
+        features = []
+        x0 = self.stage0(x)
+        features.append(x0)
+        x1 = self.stage1(x0)
+        features.append(x1)
+        x2 = self.stage2(x1)
+        features.append(x2)
+        x3 = self.stage3(x2)
+        features.append(x3)
+        x4 = self.stage4(x3)
+        features.append(x4)
+
+        out = self.up4(x4, x3)
+        out = self.up3(out, x2)
+        out = self.up2(out, x1)
+        out = self.up1(out, x0)
+        out = F.interpolate(out, scale_factor=2, mode='bilinear', align_corners=False)
+        out = torch.cat([out, x], dim=1)
+        out = self.head_block(out)
+        out = self.sigmoid(self.out_conv(out))
+        return out, features
+
+    def reparameterize(self):
+        return self
+
+
 class MobileOneCoarse(nn.Module):
     def __init__(self, variant='s4', **kwargs):
         super().__init__()
         if variant not in PARAMS:
             raise ValueError(f"Unsupported MobileOne variant: {variant}")
 
-        width_multipliers = PARAMS[variant]["width_multipliers"]
+        variant_params = dict(PARAMS[variant])
+        variant_params.update(kwargs)
+        width_multipliers = variant_params["width_multipliers"]
         stage0_channels = min(64, int(64 * width_multipliers[0]))
         stage1_channels = int(64 * width_multipliers[0])
         stage2_channels = int(128 * width_multipliers[1])
@@ -436,7 +561,7 @@ class MobileOneCoarse(nn.Module):
             stage4_channels,
         ]
 
-        self.model = mobileone(variant=variant, **kwargs)
+        self.model = MobileOne(**variant_params)
         self.d4 = nn.ConvTranspose2d(stage4_channels, stage3_channels, kernel_size=4, stride=2, padding=1)
         self.d3 = nn.ConvTranspose2d(stage3_channels + stage3_channels, stage2_channels, kernel_size=4, stride=2, padding=1)
         self.d2 = nn.ConvTranspose2d(stage2_channels + stage2_channels, stage1_channels, kernel_size=4, stride=2, padding=1)
@@ -469,6 +594,12 @@ class MobileOneCoarse(nn.Module):
         out = self.sigmoid(self.d0(out))
 
         return out, features
+
+
+COARSE_MODEL_REGISTRY = {
+    "MobileOneCoarse": MobileOneCoarse,
+    "PaperCoarse": PaperCoarse,
+}
 
 
 class AttentionUpscaling(nn.Module):
@@ -521,7 +652,12 @@ class AttentionUpscaling(nn.Module):
 class InpaintingModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.coarse_model = MobileOneCoarse(**config['coarse_model']['parameters'])
+        coarse_class_name = config['coarse_model'].get('class', 'MobileOneCoarse')
+        coarse_class = COARSE_MODEL_REGISTRY.get(coarse_class_name)
+        if coarse_class is None:
+            raise ValueError(f"Unsupported coarse model class: {coarse_class_name}")
+
+        self.coarse_model = coarse_class(**config['coarse_model']['parameters'])
         generator_params = dict(config['generator']['params'])
 
         if generator_params.get('concat_features', True):
@@ -553,5 +689,8 @@ class InpaintingModel(nn.Module):
         This is a one-way operation — the model can no longer be trained after this.
         Call after loading checkpoint, before inference.
         """
-        self.coarse_model.model = reparameterize_model(self.coarse_model.model)
+        if hasattr(self.coarse_model, 'reparameterize'):
+            self.coarse_model.reparameterize()
+        elif hasattr(self.coarse_model, 'model'):
+            self.coarse_model.model = reparameterize_model(self.coarse_model.model)
         return self

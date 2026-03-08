@@ -1,0 +1,75 @@
+# Paper-style coarse model pilot.
+# Replaces MobileOne with a small 5-level depthwise-separable encoder-decoder.
+
+model:
+  coarse_model:
+    class: "PaperCoarse"
+    channels: [64, 128, 256, 384, 512]
+    head_channels: 32
+  generator:
+    kernel_size: 8
+    nheads: 1
+    stem_out_stride: 1
+    stem_out_channels: 3
+    merge_mode: "all"
+    image_size: 256
+    embed_dim: 576
+    use_qpos: null
+    use_kpos: null
+    dropout: 0.1
+    feature_i: 2
+    feature_dim: null
+    concat_features: true
+    final_conv: true
+    attention_type: "MultiHeadAttention"
+    compute_v: false
+    use_argmax: false
+    attn_topk: null
+    attn_add_residual: false
+    token_use_mask_ratio: false
+    attention_masking: true
+    paper_mask_renormalize: false
+
+data:
+  root_dir: "."
+  manifest_path: "dataset/manifests/supercaf_manifest.csv"
+  val_dir: null
+  image_size: 512
+  batch_size: 4
+  eval_batch_size: 4
+  num_workers: 4
+  mask_min_coverage: 0.30
+  mask_max_coverage: 0.50
+
+training:
+  total_steps: 800
+  grad_accum_steps: 4
+  lr: 0.001
+  warmup_steps: 100
+  min_lr: 0.000001
+  grad_clip: 1.0
+  mixed_precision: true
+  seed: 42
+  joint_hr_pipeline: true
+  freeze_coarse: false
+
+loss:
+  l1_hole_weight: 6.0
+  l1_valid_weight: 1.0
+  perceptual_weight: 0.1
+  style_weight: 0.0
+  hr_refined_weight: 1.0
+  hr_perceptual_weight: 0.0
+  hr_style_weight: 0.0
+
+logging:
+  log_dir: "logs/train_supercaf_512_to_256_papercoarse_ultrafast"
+  log_interval: 25
+  vis_interval: 400
+  eval_interval: 100
+  eval_batches: 8
+  save_interval: 800
+  save_checkpoints: true
+  save_final_checkpoint: true
+  checkpoint_steps: [800]
+  keep_last_checkpoints: 3
