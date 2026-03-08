@@ -17,4 +17,6 @@ uv.lock
 test_*.py
 demo_*.py
 
+# Misc Folders
 datasets/
+logs/
