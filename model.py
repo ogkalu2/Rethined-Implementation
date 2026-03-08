@@ -349,6 +349,12 @@ class PatchInpainting(nn.Module):
         coarse_patches_full, sizes = self.unfold_native(image_coarse_inpainting, self.kernel_size)
         known_patches_full, _ = self.unfold_native(masked_input, self.kernel_size)
 
+        # High-frequency content of the known image for residual attention.
+        # Mirrors Section 3.4 HR pipeline: attention mixes HF as an additive
+        # residual on top of the coarse base instead of replacing patches.
+        hf_input = masked_input - self.final_gaussian_blur(masked_input)
+        hf_patches, _ = self.unfold_native(hf_input, self.kernel_size)
+
         # V2: Use native unfold for mask
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
         # A patch is corrupted if any pixel inside it is corrupted.
@@ -360,7 +366,6 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
         match_patches = coarse_patches_full
-        value_patches_full = known_patches_full
         preserve_patches_full = known_patches_full
         features_to_concat = None
         if self.concat_features:
@@ -380,15 +385,16 @@ class PatchInpainting(nn.Module):
         if self.positionalencoding is not None:
             input_attn = input_attn + self.positionalencoding.transpose(1, 2)
 
-        full_patches_flat = value_patches_full.flatten(start_dim=2).transpose(1, 2)
+        hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
-        self.last_base_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
+        coarse_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
+        self.last_base_patches_flat = coarse_patches_flat
 
         pre_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
         out, atten_weights = self.multihead_attention(
             input_attn,
             input_attn,
-            full_patches_flat,
+            hf_patches_flat,
             qpos=None,
             kpos=None,
             qk_mask=pre_softmax_mask,
@@ -399,7 +405,7 @@ class PatchInpainting(nn.Module):
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        out = (coarse_patches_flat + out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
         out = self.apply_paper_coherence(out, sizes)
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
