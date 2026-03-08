@@ -47,7 +47,7 @@ training:
   grad_accum_steps: 2
   lr: 0.001
   warmup_steps: 500
-  refinement_start_step: 0
+  refinement_start_step: 1000
   refinement_warmup_steps: 1000
   refinement_lr_scale: 0.05
   coarse_freeze_step: null
