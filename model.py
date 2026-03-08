@@ -304,16 +304,24 @@ class PatchInpainting(nn.Module):
         return final_image
 
     def build_paper_attention_mask(self, pooled_patch_mask: torch.Tensor) -> torch.Tensor:
-        """Paper-style multiplicative mask applied after softmax."""
-        patch_mask_flat = pooled_patch_mask.squeeze(1).squeeze(-1)
+        """Pre-softmax additive mask for attention logits.
+
+        Valid queries attend only to themselves (identity copy).
+        Masked queries attend only to valid keys.
+        Applied before softmax so it naturally normalizes over the correct set
+        of keys — no post-softmax renormalization needed.
+        """
+        patch_mask_flat = pooled_patch_mask.squeeze(1).squeeze(-1)  # (B, N)
         B, N = patch_mask_flat.shape
+        is_masked_q = patch_mask_flat.unsqueeze(-1)           # (B, N, 1)
+        is_valid_k = (1.0 - patch_mask_flat).unsqueeze(1)    # (B, 1, N)
         eye = torch.eye(N, device=patch_mask_flat.device, dtype=patch_mask_flat.dtype).unsqueeze(0)
-        valid_queries = (1.0 - patch_mask_flat).unsqueeze(-1)
-        valid_keys = (1.0 - patch_mask_flat).unsqueeze(1)
-        masked_queries = patch_mask_flat.unsqueeze(-1)
-        preserve_clean = eye * valid_queries
-        masked_to_valid = masked_queries * valid_keys
-        return (preserve_clean + masked_to_valid).unsqueeze(1)
+
+        # valid query → self only; masked query → valid keys
+        allowed = (1.0 - is_masked_q) * eye + is_masked_q * is_valid_k  # (B, N, N)
+
+        # 0 where allowed, -1e4 where blocked
+        return ((1.0 - allowed) * -1e4).unsqueeze(1)  # (B, 1, N, N)
 
     def apply_paper_coherence(self, patches: torch.Tensor, output_size) -> torch.Tensor:
         """Apply the lightweight patch-grid coherence layer described in the paper."""
@@ -338,12 +346,7 @@ class PatchInpainting(nn.Module):
 
         # The paper path uses raw coarse patches for token construction and the
         # masked LR input for value mixing / preservation.
-        # Detach coarse outputs for attention Q/K tokens to prevent the refined
-        # loss from sending conflicting gradients into the coarse model.  The
-        # coarse model is trained only by l1_coarse; the attention parameters
-        # (W_q, W_k, PE, coherence) are trained only by l1_refined.
-        coarse_detached = image_coarse_inpainting.detach()
-        coarse_patches_full, sizes = self.unfold_native(coarse_detached, self.kernel_size)
+        coarse_patches_full, sizes = self.unfold_native(image_coarse_inpainting, self.kernel_size)
         known_patches_full, _ = self.unfold_native(masked_input, self.kernel_size)
 
         # V2: Use native unfold for mask
@@ -361,7 +364,7 @@ class PatchInpainting(nn.Module):
         preserve_patches_full = known_patches_full
         features_to_concat = None
         if self.concat_features:
-            features_to_concat = features[self.feature_i].detach()
+            features_to_concat = features[self.feature_i]
             features_to_concat = F.interpolate(features_to_concat, size=coarse_patches_full.shape[-2:], mode='bilinear', align_corners=False)
             token_map = torch.cat([match_patches, features_to_concat], dim=1)
         else:
@@ -381,17 +384,17 @@ class PatchInpainting(nn.Module):
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
         self.last_base_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
 
-        post_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
+        pre_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
         out, atten_weights = self.multihead_attention(
             input_attn,
             input_attn,
             full_patches_flat,
             qpos=None,
             kpos=None,
-            qk_mask=None,
+            qk_mask=pre_softmax_mask,
             k_mask=None,
-            post_softmax_mask=post_softmax_mask,
-            renorm_post_mask=self.paper_mask_renormalize,
+            post_softmax_mask=None,
+            renorm_post_mask=False,
             direct_patch_mixing=True,
         )
 
