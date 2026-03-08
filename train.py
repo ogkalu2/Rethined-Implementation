@@ -230,8 +230,8 @@ def compute_train_loss(
             hr_style = criterion.style_loss(hr_for_perceptual, hr_target)
 
     total = (
-        l1_coarse
-        + l1_refined
+        criterion.coarse_weight * l1_coarse
+        + criterion.refined_weight * l1_refined
         + criterion.perceptual_weight * perceptual
         + criterion.style_weight * style
         + criterion.hr_refined_weight * hr_l1_refined

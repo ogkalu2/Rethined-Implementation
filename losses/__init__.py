@@ -16,6 +16,8 @@ class InpaintingLoss(nn.Module):
 
     def __init__(
         self,
+        coarse_weight: float = 1.0,
+        refined_weight: float = 1.0,
         l1_hole_weight: float = 6.0,
         l1_valid_weight: float = 1.0,
         perceptual_weight: float = 0.1,
@@ -25,6 +27,8 @@ class InpaintingLoss(nn.Module):
         hr_style_weight: float = 0.0,
     ):
         super().__init__()
+        self.coarse_weight = coarse_weight
+        self.refined_weight = refined_weight
         self.l1_hole_weight = l1_hole_weight
         self.l1_valid_weight = l1_valid_weight
         self.perceptual_weight = perceptual_weight

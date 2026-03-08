@@ -54,9 +54,11 @@ training:
   freeze_coarse: false
 
 loss:
+  coarse_weight: 1.0
+  refined_weight: 0.25
   l1_hole_weight: 6.0
   l1_valid_weight: 1.0
-  perceptual_weight: 0.1
+  perceptual_weight: 0.0
   style_weight: 0.0
   hr_refined_weight: 0.0
   hr_perceptual_weight: 0.0
