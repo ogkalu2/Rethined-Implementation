@@ -383,7 +383,6 @@ class PatchInpainting(nn.Module):
             input_attn = input_attn + self.positionalencoding.transpose(1, 2)
 
         hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
-        blurred_patches_flat = blurred_patches_full.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
         self.last_base_patches_flat = preserve_patches_flat
 
@@ -403,7 +402,7 @@ class PatchInpainting(nn.Module):
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
         refinement_scale = torch.tanh(self.refinement_gate)
-        out = (blurred_patches_flat + refinement_scale * out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        out = (preserve_patches_flat + refinement_scale * out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
         out = self.apply_paper_coherence(out, sizes)
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
