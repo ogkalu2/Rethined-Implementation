@@ -80,8 +80,8 @@ def evaluate_quality(model, dataloader, device, num_images=200):
         with torch.amp.autocast("cuda"):
             refined, attn, coarse = model(masked_image, mask)
 
-        refined = refined.clamp(0, 1)
-        coarse = coarse.clamp(0, 1)
+        refined = refined.clamp(0, 1) * mask + image * (1 - mask)
+        coarse = coarse.clamp(0, 1) * mask + image * (1 - mask)
 
         for i in range(bs):
             if count >= num_images:
@@ -132,7 +132,7 @@ def benchmark_speed(model, device, resolutions=(256, 512), num_runs=50, warmup=1
         # Check if resolution fits in VRAM
         try:
             dummy_img = torch.randn(1, 3, res, res, device=device)
-            dummy_mask = torch.ones(1, 1, res, res, device=device)
+            dummy_mask = torch.zeros(1, 1, res, res, device=device)
             dummy_mask[:, :, res//4:3*res//4, res//4:3*res//4] = 1.0
         except RuntimeError:
             results[str(res)] = {"error": "OOM"}
@@ -187,7 +187,7 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
 
     # Generate LR input + attention map
     dummy_lr = torch.randn(1, 3, lr_res, lr_res, device=device)
-    dummy_mask = torch.ones(1, 1, lr_res, lr_res, device=device)
+    dummy_mask = torch.zeros(1, 1, lr_res, lr_res, device=device)
     dummy_mask[:, :, lr_res//4:3*lr_res//4, lr_res//4:3*lr_res//4] = 1.0
 
     # Run LR inference to get attention map

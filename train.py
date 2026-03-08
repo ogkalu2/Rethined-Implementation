@@ -145,14 +145,14 @@ def compute_hr_refined(attn_upscaler, batch_views, refined_lr, attn_map):
     """Run the attention upscaler and preserve known HR pixels exactly."""
     hr_refined_raw = attn_upscaler(batch_views["masked_image_hr"], refined_lr, attn_map)
     hr_refined = composite_with_known(hr_refined_raw, batch_views["image_hr"], batch_views["mask_hr"])
-    hr_base = F.interpolate(
+    hr_base_raw = F.interpolate(
         refined_lr,
         size=batch_views["image_hr"].shape[-2:],
-        mode="bilinear",
+        mode="bicubic",
         align_corners=False,
     )
-    hr_base = composite_with_known(hr_base, batch_views["image_hr"], batch_views["mask_hr"])
-    return hr_refined, hr_base
+    hr_base = composite_with_known(hr_base_raw, batch_views["image_hr"], batch_views["mask_hr"])
+    return hr_refined_raw, hr_refined, hr_base_raw, hr_base
 
 
 def set_parameter_trainability(model, freeze_coarse: bool = False):
@@ -168,41 +168,51 @@ def set_parameter_trainability(model, freeze_coarse: bool = False):
 
 def compute_train_loss(
     criterion,
-    coarse,
-    refined,
+    coarse_raw,
+    refined_raw,
     target,
     mask,
-    hr_refined=None,
+    refined_composite=None,
+    hr_refined_raw=None,
     hr_target=None,
     hr_mask=None,
+    hr_refined_composite=None,
 ):
-    """Compute the paper-path training loss."""
-    l1_coarse = criterion.masked_l1(coarse, target, mask)
-    l1_refined = criterion.masked_l1(refined, target, mask)
+    """Compute the paper-path training loss.
 
-    zero = refined.new_zeros(())
+    L1 must run on the raw network outputs; otherwise the valid-region term is
+    always zero after compositing known pixels back from the target.
+    """
+    l1_coarse = criterion.masked_l1(coarse_raw, target, mask)
+    l1_refined = criterion.masked_l1(refined_raw, target, mask)
+
+    zero = refined_raw.new_zeros(())
     perceptual = zero
     style = zero
     hr_l1_refined = zero
     hr_perceptual = zero
     hr_style = zero
+    refined_for_perceptual = refined_composite if refined_composite is not None else refined_raw
 
     if criterion.perceptual_weight > 0:
-        perceptual = criterion.perceptual_loss(refined, target)
+        perceptual = criterion.perceptual_loss(refined_for_perceptual, target)
     if criterion.style_weight > 0:
-        style = criterion.style_loss(refined, target)
+        style = criterion.style_loss(refined_for_perceptual, target)
 
     if (
-        hr_refined is not None
+        hr_refined_raw is not None
         and hr_target is not None
         and hr_mask is not None
     ):
+        hr_for_perceptual = (
+            hr_refined_composite if hr_refined_composite is not None else hr_refined_raw
+        )
         if criterion.hr_refined_weight > 0:
-            hr_l1_refined = criterion.masked_l1(hr_refined, hr_target, hr_mask)
+            hr_l1_refined = criterion.masked_l1(hr_refined_raw, hr_target, hr_mask)
         if criterion.hr_perceptual_weight > 0:
-            hr_perceptual = criterion.perceptual_loss(hr_refined, hr_target)
+            hr_perceptual = criterion.perceptual_loss(hr_for_perceptual, hr_target)
         if criterion.hr_style_weight > 0:
-            hr_style = criterion.style_loss(hr_refined, hr_target)
+            hr_style = criterion.style_loss(hr_for_perceptual, hr_target)
 
     total = (
         l1_coarse
@@ -373,10 +383,10 @@ def evaluate_refinement_health(
 
         coarse_hole = (torch.abs(coarse - image) * mask).sum(dim=(1, 2, 3)) / hole_denom
         refined_hole = (torch.abs(refined - image) * mask).sum(dim=(1, 2, 3)) / hole_denom
-        coarse_valid = (torch.abs(coarse - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
-        refined_valid = (torch.abs(refined - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
-        raw_coarse_valid = (torch.abs(coarse_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
-        raw_refined_valid = (torch.abs(refined_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
+        coarse_valid = (torch.abs(coarse_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
+        refined_valid = (torch.abs(refined_raw - image) * valid_mask).sum(dim=(1, 2, 3)) / valid_denom
+        raw_coarse_valid = coarse_valid
+        raw_refined_valid = refined_valid
         masked_delta = (torch.abs(refined - coarse) * mask).sum(dim=(1, 2, 3)) / hole_denom
         gain_abs = coarse_hole - refined_hole
         gain_pct = gain_abs / coarse_hole.clamp_min(1e-8) * 100.0
@@ -399,7 +409,12 @@ def evaluate_refinement_health(
 
         if joint_hr_pipeline and batch_views["has_hr_supervision"]:
             with torch.amp.autocast("cuda", enabled=use_amp):
-                hr_refined, hr_base = compute_hr_refined(attn_upscaler, batch_views, refined, attn_map)
+                _, hr_refined, _, hr_base = compute_hr_refined(
+                    attn_upscaler,
+                    batch_views,
+                    refined,
+                    attn_map,
+                )
 
             image_hr = batch_views["image_hr"]
             mask_hr = batch_views["mask_hr"]
@@ -706,7 +721,7 @@ def train(cfg, args):
         model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scaler.load_state_dict(ckpt["scaler_state_dict"])
-        start_step = ckpt["step"] + 1
+        start_step = ckpt["step"]
         print(f"Resumed from step {start_step}")
 
     # Training loop
@@ -718,67 +733,92 @@ def train(cfg, args):
     pbar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
     running_loss = 0.0
     train_start_time = time.time()
+    loss_dict = {
+        "l1_coarse": 0.0,
+        "l1_refined": 0.0,
+        "perceptual": 0.0,
+        "style": 0.0,
+        "hr_l1_refined": 0.0,
+        "hr_perceptual": 0.0,
+        "hr_style": 0.0,
+        "total": 0.0,
+    }
+    coarse = None
+    refined = None
+    batch_views = None
 
-    for step in pbar:
-        # Get batch (cycle through dataset)
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(train_loader)
-            batch = next(data_iter)
+    for step_idx in pbar:
+        step = step_idx + 1
+        lr = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
+        for pg in optimizer.param_groups:
+            pg["lr"] = lr
 
-        batch_views = prepare_multiscale_batch(
-            batch,
-            device,
-            model_image_size,
-            blur_layer=model.generator.final_gaussian_blur,
-        )
-        image = batch_views["image"]
-        mask = batch_views["mask"]
-        masked_image = batch_views["masked_image"]
+        loss_sums = {k: 0.0 for k in loss_dict}
 
-        # Forward
-        with torch.amp.autocast("cuda", enabled=use_amp):
-            refined_raw, attn, coarse_raw = model(masked_image, mask)
-            coarse = composite_with_known(coarse_raw, image, mask)
-            refined = composite_with_known(refined_raw, image, mask)
-            hr_refined = None
-            if joint_hr_pipeline and batch_views["has_hr_supervision"]:
-                hr_refined, _ = compute_hr_refined(attn_upscaler, batch_views, refined, attn)
-            loss, loss_dict = compute_train_loss(
-                criterion,
-                coarse,
-                refined,
-                image,
-                mask,
-                hr_refined=hr_refined,
-                hr_target=batch_views["image_hr"] if hr_refined is not None else None,
-                hr_mask=batch_views["mask_hr"] if hr_refined is not None else None,
+        for _ in range(grad_accum):
+            # Get batch (cycle through dataset)
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_loader)
+                batch = next(data_iter)
+
+            batch_views = prepare_multiscale_batch(
+                batch,
+                device,
+                model_image_size,
+                blur_layer=model.generator.final_gaussian_blur,
             )
-            loss = loss / grad_accum
+            image = batch_views["image"]
+            mask = batch_views["mask"]
+            masked_image = batch_views["masked_image"]
 
-        # Backward
-        scaler.scale(loss).backward()
+            # Forward
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                refined_raw, attn, coarse_raw = model(masked_image, mask)
+                coarse = composite_with_known(coarse_raw, image, mask)
+                refined = composite_with_known(refined_raw, image, mask)
+                hr_refined_raw = None
+                hr_refined = None
+                if joint_hr_pipeline and batch_views["has_hr_supervision"]:
+                    hr_refined_raw, hr_refined, _, _ = compute_hr_refined(
+                        attn_upscaler,
+                        batch_views,
+                        refined,
+                        attn,
+                    )
+                micro_loss, micro_loss_dict = compute_train_loss(
+                    criterion,
+                    coarse_raw,
+                    refined_raw,
+                    image,
+                    mask,
+                    refined_composite=refined,
+                    hr_refined_raw=hr_refined_raw,
+                    hr_target=batch_views["image_hr"] if hr_refined_raw is not None else None,
+                    hr_mask=batch_views["mask_hr"] if hr_refined_raw is not None else None,
+                    hr_refined_composite=hr_refined,
+                )
+                loss = micro_loss / grad_accum
 
-        # Optimizer step (every grad_accum steps)
-        if (step + 1) % grad_accum == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+            # Backward
+            scaler.scale(loss).backward()
+            for key, value in micro_loss_dict.items():
+                loss_sums[key] += value
 
-            # Update LR
-            opt_step = (step + 1) // grad_accum
-            lr = get_lr(opt_step, warmup_steps, total_steps // grad_accum, max_lr, min_lr)
-            for pg in optimizer.param_groups:
-                pg["lr"] = lr
+        loss_dict = {k: v / grad_accum for k, v in loss_sums.items()}
+
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(trainable_params, grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
 
         running_loss = 0.9 * running_loss + 0.1 * loss_dict["total"]
         pbar.set_postfix(loss=f"{running_loss:.4f}", l1r=f"{loss_dict['l1_refined']:.4f}")
 
         # Logging
-        if step % log_cfg["log_interval"] == 0:
+        if step == 1 or step % log_cfg["log_interval"] == 0:
             writer.add_scalar("loss/total", loss_dict["total"], step)
             writer.add_scalar("loss/l1_coarse", loss_dict["l1_coarse"], step)
             writer.add_scalar("loss/l1_refined", loss_dict["l1_refined"], step)
@@ -787,8 +827,6 @@ def train(cfg, args):
             writer.add_scalar("loss/hr_l1_refined", loss_dict["hr_l1_refined"], step)
             writer.add_scalar("loss/hr_perceptual", loss_dict["hr_perceptual"], step)
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
-            opt_step = (step + 1) // grad_accum
-            lr = get_lr(opt_step, warmup_steps, total_steps // grad_accum, max_lr, min_lr)
             writer.add_scalar("lr", lr, step)
 
             if device == "cuda":
@@ -797,7 +835,7 @@ def train(cfg, args):
             # Write status file for remote monitoring
             write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr, train_start_time)
 
-        if eval_loader is not None and step > 0 and step % eval_interval == 0:
+        if eval_loader is not None and step % eval_interval == 0:
             health = evaluate_refinement_health(
                 model,
                 eval_loader,
@@ -830,16 +868,14 @@ def train(cfg, args):
         should_save = False
         if save_checkpoints and checkpoint_steps and step in checkpoint_steps:
             should_save = True
-        elif save_checkpoints and not checkpoint_steps and step > 0 and step % log_cfg["save_interval"] == 0:
+        elif save_checkpoints and not checkpoint_steps and step % log_cfg["save_interval"] == 0:
             should_save = True
 
         if should_save:
             ckpt_path = ckpt_dir / f"step_{step}.pth"
             if save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, ckpt_path):
                 print(f"\nSaved checkpoint: {ckpt_path}")
-                opt_step_ckpt = (step + 1) // grad_accum
-                lr_ckpt = get_lr(opt_step_ckpt, warmup_steps, total_steps // grad_accum, max_lr, min_lr)
-                write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr_ckpt, train_start_time,
+                write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr, train_start_time,
                              extra={"event": "checkpoint", "checkpoint_path": str(ckpt_path)})
 
             # Clean old checkpoints (keep all if using checkpoint_steps)
@@ -854,7 +890,7 @@ def train(cfg, args):
     save_final_checkpoint = log_cfg.get("save_final_checkpoint", True)
     if save_final_checkpoint:
         save_checkpoint(model, optimizer, scaler, total_steps, loss_dict, cfg, final_path)
-    final_lr = get_lr(max((total_steps + grad_accum - 1) // grad_accum, 1), warmup_steps, total_steps // grad_accum, max_lr, min_lr)
+    final_lr = get_lr(total_steps, warmup_steps, total_steps, max_lr, min_lr)
     if eval_loader is not None:
         final_health = evaluate_refinement_health(
             model,
