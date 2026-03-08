@@ -411,8 +411,9 @@ class PatchInpainting(nn.Module):
         refinement_scale = torch.tanh(self.refinement_gate) * self.refinement_runtime_scale
         
         # Smoothly interpolate between the hallucinated coarse HF and the retrieved valid HF
-        out = preserve_patches_flat + refinement_scale * (out - base_hf_flat) * patch_mask
-        out = self.apply_paper_coherence(out, sizes)
+        delta = refinement_scale * (out - base_hf_flat) * patch_mask
+        delta = self.apply_paper_coherence(delta, sizes)
+        out = preserve_patches_flat + delta
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
         self.last_pixel_mask_flat = pixel_mask_flat
