@@ -338,7 +338,12 @@ class PatchInpainting(nn.Module):
 
         # The paper path uses raw coarse patches for token construction and the
         # masked LR input for value mixing / preservation.
-        coarse_patches_full, sizes = self.unfold_native(image_coarse_inpainting, self.kernel_size)
+        # Detach coarse outputs for attention Q/K tokens to prevent the refined
+        # loss from sending conflicting gradients into the coarse model.  The
+        # coarse model is trained only by l1_coarse; the attention parameters
+        # (W_q, W_k, PE, coherence) are trained only by l1_refined.
+        coarse_detached = image_coarse_inpainting.detach()
+        coarse_patches_full, sizes = self.unfold_native(coarse_detached, self.kernel_size)
         known_patches_full, _ = self.unfold_native(masked_input, self.kernel_size)
 
         # V2: Use native unfold for mask
@@ -356,7 +361,7 @@ class PatchInpainting(nn.Module):
         preserve_patches_full = known_patches_full
         features_to_concat = None
         if self.concat_features:
-            features_to_concat = features[self.feature_i]
+            features_to_concat = features[self.feature_i].detach()
             features_to_concat = F.interpolate(features_to_concat, size=coarse_patches_full.shape[-2:], mode='bilinear', align_corners=False)
             token_map = torch.cat([match_patches, features_to_concat], dim=1)
         else:
