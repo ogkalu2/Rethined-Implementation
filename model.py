@@ -234,6 +234,7 @@ class PatchInpainting(nn.Module):
             int((image_size / stem_out_stride / self.kernel_size) ** 2)
         )) if use_kpos or use_qpos else None
         self.refinement_gate = nn.Parameter(torch.tensor([0.05]))
+        self.refinement_runtime_scale = 1.0
         self.paper_coherence_layer = nn.Conv2d(
             self.patch_value_dim, self.patch_value_dim,
             kernel_size=3, stride=1, padding=1, padding_mode='reflect',
@@ -336,6 +337,9 @@ class PatchInpainting(nn.Module):
         patches_2d = patches_2d + self.paper_coherence_layer(patches_2d)
         return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
 
+    def set_refinement_runtime_scale(self, scale: float) -> None:
+        self.refinement_runtime_scale = float(scale)
+
     def forward(self, image, mask):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
@@ -401,7 +405,7 @@ class PatchInpainting(nn.Module):
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        refinement_scale = torch.tanh(self.refinement_gate)
+        refinement_scale = torch.tanh(self.refinement_gate) * self.refinement_runtime_scale
         out = (preserve_patches_flat + refinement_scale * out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
         out = self.apply_paper_coherence(out, sizes)
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
@@ -655,7 +659,7 @@ class AttentionUpscaling(nn.Module):
         hr_hf_patches = hr_patches - hr_patches_blurred
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
 
-        refinement_scale = torch.tanh(self.patch_inpainting.refinement_gate)
+        refinement_scale = torch.tanh(self.patch_inpainting.refinement_gate) * self.patch_inpainting.refinement_runtime_scale
         reconstructed_hr_hf_patches = refinement_scale * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
 
         # Reassemble non-overlapping HR patches without an HR coherence layer.

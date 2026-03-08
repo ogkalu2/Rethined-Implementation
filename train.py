@@ -63,6 +63,15 @@ def get_lr(step, warmup_steps, total_steps, max_lr, min_lr):
     return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * progress))
 
 
+def get_refinement_scale(step, start_step, ramp_steps):
+    """Coarse-only warmup, then linear ramp-in for refinement branch."""
+    if step < start_step:
+        return 0.0
+    if ramp_steps <= 0:
+        return 1.0
+    return min((step - start_step) / ramp_steps, 1.0)
+
+
 def save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, path):
     """Save training checkpoint."""
     try:
@@ -187,6 +196,7 @@ def compute_train_loss(
     refined_raw,
     target,
     mask,
+    refinement_loss_scale=1.0,
     refined_composite=None,
     hr_refined_raw=None,
     hr_target=None,
@@ -231,9 +241,9 @@ def compute_train_loss(
 
     total = (
         criterion.coarse_weight * l1_coarse
-        + criterion.refined_weight * l1_refined
-        + criterion.perceptual_weight * perceptual
-        + criterion.style_weight * style
+        + refinement_loss_scale * criterion.refined_weight * l1_refined
+        + refinement_loss_scale * criterion.perceptual_weight * perceptual
+        + refinement_loss_scale * criterion.style_weight * style
         + criterion.hr_refined_weight * hr_l1_refined
         + criterion.hr_perceptual_weight * hr_perceptual
         + criterion.hr_style_weight * hr_style
@@ -722,6 +732,8 @@ def train(cfg, args):
     min_lr = cfg["training"]["min_lr"]
     warmup_steps = cfg["training"]["warmup_steps"]
     grad_clip = cfg["training"]["grad_clip"]
+    refinement_start_step = cfg["training"].get("refinement_start_step", 0)
+    refinement_warmup_steps = cfg["training"].get("refinement_warmup_steps", 0)
     # Logging
     log_cfg = cfg["logging"]
     eval_interval = log_cfg.get("eval_interval", 0)
@@ -770,6 +782,8 @@ def train(cfg, args):
     for step_idx in pbar:
         step = step_idx + 1
         lr = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
+        refinement_scale = get_refinement_scale(step, refinement_start_step, refinement_warmup_steps)
+        model.generator.set_refinement_runtime_scale(refinement_scale)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
@@ -813,6 +827,7 @@ def train(cfg, args):
                     refined_raw,
                     image,
                     mask,
+                    refinement_loss_scale=refinement_scale,
                     refined_composite=refined,
                     hr_refined_raw=hr_refined_raw,
                     hr_target=batch_views["image_hr"] if hr_refined_raw is not None else None,
@@ -848,6 +863,7 @@ def train(cfg, args):
             writer.add_scalar("loss/hr_perceptual", loss_dict["hr_perceptual"], step)
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
             writer.add_scalar("lr", lr, step)
+            writer.add_scalar("refinement_scale", refinement_scale, step)
 
             peak_memory_gb = get_peak_memory_allocated_gb(device)
             if peak_memory_gb is not None:
