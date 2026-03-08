@@ -341,9 +341,6 @@ class PatchInpainting(nn.Module):
         coarse_patches_full, sizes = self.unfold_native(image_coarse_inpainting, self.kernel_size)
         known_patches_full, _ = self.unfold_native(masked_input, self.kernel_size)
 
-        pos = self.positionalencoding.repeat(
-            coarse_patches_full.size(0), 1, 1).unsqueeze(2) if self.use_qpos else None
-
         # V2: Use native unfold for mask
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
         # A patch is corrupted if any pixel inside it is corrupted.
@@ -370,6 +367,11 @@ class PatchInpainting(nn.Module):
 
         input_attn = token_map.flatten(start_dim=2).transpose(1, 2)
 
+        # Add learnable positional encoding to token embeddings so Q/K
+        # projections gain spatial awareness (standard transformer PE).
+        if self.positionalencoding is not None:
+            input_attn = input_attn + self.positionalencoding.transpose(1, 2)
+
         full_patches_flat = value_patches_full.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
         self.last_base_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
@@ -379,8 +381,8 @@ class PatchInpainting(nn.Module):
             input_attn,
             input_attn,
             full_patches_flat,
-            qpos=pos,
-            kpos=pos,
+            qpos=None,
+            kpos=None,
             qk_mask=None,
             k_mask=None,
             post_softmax_mask=post_softmax_mask,
