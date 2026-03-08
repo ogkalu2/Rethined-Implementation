@@ -360,6 +360,7 @@ def evaluate_refinement_health(
     freeze_coarse=False,
     model_image_size=None,
     joint_hr_pipeline=False,
+    refinement_eval_scale=None,
 ):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
@@ -368,6 +369,9 @@ def evaluate_refinement_health(
     if model_image_size is None:
         model_image_size = model.generator.image_size
     attn_upscaler = AttentionUpscaling(model.generator) if joint_hr_pipeline else None
+    original_refinement_scale = model.generator.refinement_runtime_scale
+    if refinement_eval_scale is not None:
+        model.generator.set_refinement_runtime_scale(refinement_eval_scale)
 
     stats = {
         "masked_l1_coarse": [],
@@ -515,7 +519,10 @@ def evaluate_refinement_health(
     ):
         warnings.append("raw_refinement_hurts_valid_region")
     result["warnings"] = warnings
+    result["runtime_refinement_scale"] = float(model.generator.refinement_runtime_scale)
 
+    if refinement_eval_scale is not None:
+        model.generator.set_refinement_runtime_scale(original_refinement_scale)
     model.train()
     set_parameter_trainability(model, freeze_coarse=freeze_coarse)
     return result
@@ -565,6 +572,7 @@ def run_eval_only(cfg, args):
         max_batches = cfg.get("logging", {}).get("eval_batches", 8)
         if max_batches is not None and max_batches <= 0:
             max_batches = None
+    eval_refinement_scale = cfg.get("logging", {}).get("eval_refinement_scale", 1.0)
 
     health = evaluate_refinement_health(
         model,
@@ -575,6 +583,7 @@ def run_eval_only(cfg, args):
         freeze_coarse=freeze_coarse,
         model_image_size=model_image_size,
         joint_hr_pipeline=joint_hr_pipeline,
+        refinement_eval_scale=eval_refinement_scale,
     )
 
     print("\nFull validation results:")
@@ -600,6 +609,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
     writer.add_scalar("val/refined_tie_rate", health["refined_tie_rate"], step)
     writer.add_scalar("val/refined_worse_rate", health["refined_worse_rate"], step)
+    writer.add_scalar("val/runtime_refinement_scale", health["runtime_refinement_scale"], step)
     writer.add_scalar("val/masked_delta_mean", health["masked_delta_mean"], step)
     if health.get("gain_abs_p50") is not None:
         writer.add_scalar("val/gain_abs_p25", health["gain_abs_p25"], step)
@@ -646,6 +656,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     warning_suffix = f" warnings={','.join(health['warnings'])}" if health["warnings"] else ""
     print(
         f"\nValidation step {step}: "
+        f"scale={health['runtime_refinement_scale']:.2f}, "
         f"masked L1 coarse={health['masked_l1_coarse']:.4f}, "
         f"refined={health['masked_l1_refined']:.4f}, "
         f"gain={health['refinement_gain_pct']:.2f}%, "
@@ -767,6 +778,7 @@ def train(cfg, args):
     # Logging
     log_cfg = cfg["logging"]
     eval_interval = log_cfg.get("eval_interval", 0)
+    eval_refinement_scale = log_cfg.get("eval_refinement_scale", 1.0)
     if args.overfit and eval_interval:
         eval_interval = min(eval_interval, max(200, total_steps // 10))
     log_dir = Path(log_cfg["log_dir"])
@@ -867,7 +879,7 @@ def train(cfg, args):
                     refined_raw,
                     image,
                     mask,
-                    refinement_loss_scale=refinement_scale,
+                    refinement_loss_scale=1.0,
                     refined_composite=refined,
                     hr_refined_raw=hr_refined_raw,
                     hr_target=batch_views["image_hr"] if hr_refined_raw is not None else None,
@@ -939,6 +951,7 @@ def train(cfg, args):
                 freeze_coarse=freeze_coarse,
                 model_image_size=model_image_size,
                 joint_hr_pipeline=joint_hr_pipeline,
+                refinement_eval_scale=eval_refinement_scale,
             )
             log_validation(
                 writer,
@@ -995,6 +1008,7 @@ def train(cfg, args):
             freeze_coarse=freeze_coarse,
             model_image_size=model_image_size,
             joint_hr_pipeline=joint_hr_pipeline,
+            refinement_eval_scale=eval_refinement_scale,
         )
         log_validation(
             writer,
