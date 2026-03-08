@@ -52,8 +52,6 @@ training:
   warmup_steps: 500
   refinement_start_step: 0
   refinement_warmup_steps: 1000
-  hr_refined_start_step: 1000
-  hr_refined_warmup_steps: 1000
   refinement_lr_scale: 1.0
   coarse_freeze_step: null
   min_lr: 0.000001
