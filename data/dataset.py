@@ -174,6 +174,23 @@ class InpaintingDataset(Dataset):
 
         return image, mask
 
+    def _resize_full_pair(self, image: Image.Image, mask: Image.Image):
+        """Resize the full paired image+mask to the model square.
+
+        Paired masks in manifest-driven datasets are already defined in the
+        source image coordinate space. Cropping a fixed 512x512 window from a
+        multi-megapixel image frequently removes the mask entirely or lands
+        almost fully inside it, which corrupts mask coverage statistics.
+        """
+        image = image.resize((self.image_size, self.image_size), Image.BICUBIC)
+        mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
+
+        if self.split == "train" and np.random.rand() < 0.5:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+
+        return image, mask
+
     def __len__(self):
         return len(self.samples)
 
@@ -186,8 +203,9 @@ class InpaintingDataset(Dataset):
             mask_img = Image.open(sample["mask_path"]).convert("L")
             if mask_img.size != image.size:
                 mask_img = mask_img.resize(image.size, Image.NEAREST)
-
-        image, mask_img = self._crop_pair(image, mask_img)
+            image, mask_img = self._resize_full_pair(image, mask_img)
+        else:
+            image, mask_img = self._crop_pair(image, mask_img)
         image = TF.to_tensor(image)
 
         if mask_img is not None:
