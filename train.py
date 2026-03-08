@@ -206,6 +206,7 @@ def compute_train_loss(
     target,
     mask,
     refinement_loss_scale=1.0,
+    hr_loss_scale=1.0,
     refined_composite=None,
     hr_refined_raw=None,
     hr_target=None,
@@ -253,9 +254,9 @@ def compute_train_loss(
         + refinement_loss_scale * criterion.refined_weight * l1_refined
         + refinement_loss_scale * criterion.perceptual_weight * perceptual
         + refinement_loss_scale * criterion.style_weight * style
-        + criterion.hr_refined_weight * hr_l1_refined
-        + criterion.hr_perceptual_weight * hr_perceptual
-        + criterion.hr_style_weight * hr_style
+        + hr_loss_scale * criterion.hr_refined_weight * hr_l1_refined
+        + hr_loss_scale * criterion.hr_perceptual_weight * hr_perceptual
+        + hr_loss_scale * criterion.hr_style_weight * hr_style
     )
 
     loss_dict = {
@@ -774,6 +775,8 @@ def train(cfg, args):
     grad_clip = cfg["training"]["grad_clip"]
     refinement_start_step = cfg["training"].get("refinement_start_step", 0)
     refinement_warmup_steps = cfg["training"].get("refinement_warmup_steps", 0)
+    hr_refined_start_step = cfg["training"].get("hr_refined_start_step", 0)
+    hr_refined_warmup_steps = cfg["training"].get("hr_refined_warmup_steps", 0)
     coarse_freeze_step = cfg["training"].get("coarse_freeze_step")
     # Logging
     log_cfg = cfg["logging"]
@@ -826,6 +829,7 @@ def train(cfg, args):
         step = step_idx + 1
         lr = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         refinement_scale = get_refinement_scale(step, refinement_start_step, refinement_warmup_steps)
+        hr_loss_scale = get_refinement_scale(step, hr_refined_start_step, hr_refined_warmup_steps)
         model.generator.set_refinement_runtime_scale(refinement_scale)
         target_coarse_frozen = should_freeze_coarse(step, freeze_coarse, coarse_freeze_step)
         if target_coarse_frozen != coarse_frozen_now:
@@ -880,6 +884,7 @@ def train(cfg, args):
                     image,
                     mask,
                     refinement_loss_scale=1.0,
+                    hr_loss_scale=hr_loss_scale,
                     refined_composite=refined,
                     hr_refined_raw=hr_refined_raw,
                     hr_target=batch_views["image_hr"] if hr_refined_raw is not None else None,
@@ -927,6 +932,7 @@ def train(cfg, args):
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("refinement_scale", refinement_scale, step)
+            writer.add_scalar("hr_loss_scale", hr_loss_scale, step)
             writer.add_scalar("refinement_lr", refinement_lr, step)
             writer.add_scalar("coarse_frozen", 1.0 if coarse_frozen_now else 0.0, step)
 
