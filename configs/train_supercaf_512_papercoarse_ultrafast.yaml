@@ -28,7 +28,7 @@ model:
     attn_add_residual: false
     token_use_mask_ratio: false
     attention_masking: true
-    paper_mask_renormalize: false
+    paper_mask_renormalize: true
 
 data:
   root_dir: "."

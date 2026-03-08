@@ -233,10 +233,14 @@ class PatchInpainting(nn.Module):
             1, self.patch_token_dim,
             int((image_size / stem_out_stride / self.kernel_size) ** 2)
         )) if use_kpos or use_qpos else None
-        self.paper_coherence_layer = torch.nn.Sequential(
-            nn.Conv2d(self.patch_value_dim, self.patch_value_dim, kernel_size=3, stride=1, padding=1, padding_mode='reflect'),
-            nn.Sigmoid(),
+        self.paper_coherence_layer = nn.Conv2d(
+            self.patch_value_dim, self.patch_value_dim,
+            kernel_size=3, stride=1, padding=1, padding_mode='reflect',
         ) if self.final_conv else None
+        # Zero-init so the residual coherence layer starts as identity
+        if self.paper_coherence_layer is not None:
+            nn.init.zeros_(self.paper_coherence_layer.weight)
+            nn.init.zeros_(self.paper_coherence_layer.bias)
         self.last_base_patches_flat = None
         self.last_pixel_mask_flat = None
         self.last_output_patches_flat = None
@@ -320,7 +324,7 @@ class PatchInpainting(nn.Module):
         n_w = output_size[1] // self.kernel_size
         B = patches.shape[0]
         patches_2d = patches.transpose(1, 2).view(B, -1, n_h, n_w)
-        patches_2d = self.paper_coherence_layer(patches_2d)
+        patches_2d = patches_2d + self.paper_coherence_layer(patches_2d)
         return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
 
     def forward(self, image, mask):
