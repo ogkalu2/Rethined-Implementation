@@ -434,7 +434,7 @@ class PatchInpainting(nn.Module):
         else:
             refinement_confidence = patch_mask
 
-        refinement_scale = torch.tanh(self.refinement_gate) * self.refinement_runtime_scale
+        refinement_scale = self.refinement_runtime_scale
         
         # Smoothly interpolate between the hallucinated coarse HF and the retrieved valid HF
         # Gated by both the learned global scale and the per-patch entropy confidence
@@ -703,7 +703,7 @@ class AttentionUpscaling(nn.Module):
             normalized_hr_attn = masked_hr_attn / masked_hr_attn_sum.clamp_min(1e-8)
             hr_attn = torch.where(masked_hr_attn_sum > 1e-8, normalized_hr_attn, hr_attn)
 
-        refinement_scale = torch.tanh(self.patch_inpainting.refinement_gate) * self.patch_inpainting.refinement_runtime_scale
+        refinement_scale = self.patch_inpainting.refinement_runtime_scale
 
         # Reuse the LR branch confidence so HR transfer is selective rather than
         # copying every attended patch equally.
