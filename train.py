@@ -677,8 +677,28 @@ def train(cfg, args):
     criterion = InpaintingLoss(**cfg["loss"]).to(device)
 
     # Optimizer
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(trainable_params, lr=cfg["training"]["lr"])
+    coarse_params = []
+    refinement_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.startswith("coarse_model."):
+            coarse_params.append(param)
+        else:
+            refinement_params.append(param)
+
+    refinement_lr_scale = cfg["training"].get("refinement_lr_scale", 0.1)
+    optimizer_groups = []
+    if coarse_params:
+        optimizer_groups.append({"params": coarse_params, "lr": cfg["training"]["lr"], "name": "coarse"})
+    if refinement_params:
+        optimizer_groups.append({
+            "params": refinement_params,
+            "lr": cfg["training"]["lr"] * refinement_lr_scale,
+            "name": "refinement",
+        })
+    trainable_params = coarse_params + refinement_params
+    optimizer = torch.optim.Adam(optimizer_groups)
     use_amp = is_amp_enabled(device, cfg["training"]["mixed_precision"])
     if cfg["training"]["mixed_precision"] and not use_amp:
         print("Mixed precision requested, but no supported accelerator is active; disabling AMP.")
@@ -784,10 +804,15 @@ def train(cfg, args):
         lr = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         refinement_scale = get_refinement_scale(step, refinement_start_step, refinement_warmup_steps)
         model.generator.set_refinement_runtime_scale(refinement_scale)
+        refinement_lr = lr * refinement_lr_scale if refinement_scale > 0 else 0.0
         for pg in optimizer.param_groups:
-            pg["lr"] = lr
+            if pg.get("name") == "refinement":
+                pg["lr"] = refinement_lr
+            else:
+                pg["lr"] = lr
 
         loss_sums = {k: 0.0 for k in loss_dict}
+        step_has_nonfinite = False
 
         for _ in range(grad_accum):
             # Get batch (cycle through dataset)
@@ -834,12 +859,23 @@ def train(cfg, args):
                     hr_mask=batch_views["mask_hr"] if hr_refined_raw is not None else None,
                     hr_refined_composite=hr_refined,
                 )
+                if not torch.isfinite(micro_loss):
+                    step_has_nonfinite = True
+                    break
                 loss = micro_loss / grad_accum
+
+            if step_has_nonfinite:
+                break
 
             # Backward
             scaler.scale(loss).backward()
             for key, value in micro_loss_dict.items():
                 loss_sums[key] += value
+
+        if step_has_nonfinite:
+            optimizer.zero_grad(set_to_none=True)
+            print(f"\nSkipping non-finite step {step}")
+            continue
 
         loss_dict = {k: v / grad_accum for k, v in loss_sums.items()}
 
@@ -864,6 +900,7 @@ def train(cfg, args):
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("refinement_scale", refinement_scale, step)
+            writer.add_scalar("refinement_lr", refinement_lr, step)
 
             peak_memory_gb = get_peak_memory_allocated_gb(device)
             if peak_memory_gb is not None:
