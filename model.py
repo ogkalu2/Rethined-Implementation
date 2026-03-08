@@ -662,7 +662,7 @@ class AttentionUpscaling(nn.Module):
         super().__init__()
         self.patch_inpainting = patch_inpainting_module
 
-    def forward(self, x_hr, x_lr_inpainted, attn_map):
+    def forward(self, x_hr, x_lr_inpainted, attn_map, mask_hr=None):
         hr_h, hr_w = x_hr.shape[-2:]
         lr_h, lr_w = x_lr_inpainted.shape[-2:]
 
@@ -693,15 +693,25 @@ class AttentionUpscaling(nn.Module):
         hr_hf_patches = hr_patches - hr_patches_blurred
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
 
+        hr_attn = attn_map.squeeze(1)
+        if mask_hr is not None:
+            hr_mask_patches, _ = self.patch_inpainting.unfold_native(mask_hr, hr_patch_size)
+            hr_mask_ratio = hr_mask_patches.mean(dim=1, keepdim=True).flatten(start_dim=2).squeeze(1)
+            valid_hr_keys = (hr_mask_ratio <= 1e-6).to(hr_attn.dtype)
+            masked_hr_attn = hr_attn * valid_hr_keys.unsqueeze(1)
+            masked_hr_attn_sum = masked_hr_attn.sum(dim=-1, keepdim=True)
+            normalized_hr_attn = masked_hr_attn / masked_hr_attn_sum.clamp_min(1e-8)
+            hr_attn = torch.where(masked_hr_attn_sum > 1e-8, normalized_hr_attn, hr_attn)
+
         refinement_scale = torch.tanh(self.patch_inpainting.refinement_gate) * self.patch_inpainting.refinement_runtime_scale
 
         # Reuse the LR branch confidence so HR transfer is selective rather than
         # copying every attended patch equally.
         confidence = self.patch_inpainting.last_refinement_confidence
         if confidence is not None:
-            reconstructed_hr_hf_patches = refinement_scale * confidence * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
+            reconstructed_hr_hf_patches = refinement_scale * confidence * torch.matmul(hr_attn, hr_hf_patches)
         else:
-            reconstructed_hr_hf_patches = refinement_scale * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
+            reconstructed_hr_hf_patches = refinement_scale * torch.matmul(hr_attn, hr_hf_patches)
 
         # Reassemble non-overlapping HR patches without an HR coherence layer.
         reconstructed_hr_hf_image = self.patch_inpainting.fold_native(

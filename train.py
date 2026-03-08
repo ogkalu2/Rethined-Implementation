@@ -167,7 +167,12 @@ def validate_joint_hr_pipeline(cfg, model):
 
 def compute_hr_refined(attn_upscaler, batch_views, refined_lr, attn_map):
     """Run the attention upscaler and preserve known HR pixels exactly."""
-    hr_refined_raw = attn_upscaler(batch_views["masked_image_hr"], refined_lr, attn_map)
+    hr_refined_raw = attn_upscaler(
+        batch_views["masked_image_hr"],
+        refined_lr,
+        attn_map,
+        mask_hr=batch_views["mask_hr"],
+    )
     hr_refined = composite_with_known(hr_refined_raw, batch_views["image_hr"], batch_views["mask_hr"])
     hr_base_raw = F.interpolate(
         refined_lr,
