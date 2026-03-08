@@ -389,6 +389,7 @@ class PatchInpainting(nn.Module):
 
         hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
+        blurred_patches_flat = blurred_patches_full.flatten(start_dim=2).transpose(1, 2)
         self.last_base_patches_flat = preserve_patches_flat
 
         pre_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
@@ -413,7 +414,11 @@ class PatchInpainting(nn.Module):
         refinement_confidence = (1.0 - attn_entropy / max_entropy.clamp_min(1e-6)).clamp(0.0, 1.0)
         refinement_confidence = refinement_confidence * patch_mask
         refinement_scale = torch.tanh(self.refinement_gate) * self.refinement_runtime_scale
-        out = (preserve_patches_flat + refinement_scale * refinement_confidence * out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        
+        # In the hole, base is blurred (low frequencies only) + the attention-mixed high frequencies.
+        # In the valid region, base is the raw image patches.
+        base_patches = blurred_patches_flat * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        out = base_patches + refinement_scale * refinement_confidence * out * patch_mask
         out = self.apply_paper_coherence(out, sizes)
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
