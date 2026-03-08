@@ -241,14 +241,17 @@ class PatchInpainting(nn.Module):
         )) if use_kpos or use_qpos else None
         self.refinement_gate = nn.Parameter(torch.tensor([1.0]))
         self.refinement_runtime_scale = 1.0
-        self.paper_coherence_layer = nn.Conv2d(
-            self.patch_value_dim, self.patch_value_dim,
-            kernel_size=3, stride=1, padding=1, padding_mode='reflect',
+        self.paper_coherence_layer = nn.Sequential(
+            nn.Conv2d(
+                self.patch_value_dim,
+                self.patch_value_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode='reflect',
+            ),
+            nn.Sigmoid(),
         ) if self.final_conv else None
-        # Zero-init so the residual coherence layer starts as identity
-        if self.paper_coherence_layer is not None:
-            nn.init.zeros_(self.paper_coherence_layer.weight)
-            nn.init.zeros_(self.paper_coherence_layer.bias)
         self.last_base_patches_flat = None
         self.last_pixel_mask_flat = None
         self.last_output_patches_flat = None
@@ -305,7 +308,13 @@ class PatchInpainting(nn.Module):
         B = patches.shape[0]
 
         # patches: (B, n_h*n_w, C*k*k)
-        C = patches.shape[2] // (kernel_size * kernel_size)
+        patch_channels = patches.shape[2]
+        if use_final_conv and self.paper_coherence_layer is not None:
+            patches_2d = patches.transpose(1, 2).contiguous().view(B, patch_channels, n_h, n_w)
+            patches_2d = self.paper_coherence_layer(patches_2d)
+            patches = patches_2d.view(B, patch_channels, n_h * n_w).transpose(1, 2).contiguous()
+
+        C = patch_channels // (kernel_size * kernel_size)
         # -> (B, n_h, n_w, C, k, k) -> (B, C, n_h, k, n_w, k) -> (B, C, H, W)
         patches = patches.view(B, n_h, n_w, C, kernel_size, kernel_size)
         patches = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
@@ -341,7 +350,7 @@ class PatchInpainting(nn.Module):
         n_w = output_size[1] // self.kernel_size
         B = patches.shape[0]
         patches_2d = patches.transpose(1, 2).view(B, -1, n_h, n_w)
-        patches_2d = patches_2d + self.paper_coherence_layer(patches_2d)
+        patches_2d = self.paper_coherence_layer(patches_2d)
         return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
 
     def set_refinement_runtime_scale(self, scale: float) -> None:
@@ -404,8 +413,6 @@ class PatchInpainting(nn.Module):
 
         hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
-        blurred_patches_flat = blurred_patches_full.flatten(start_dim=2).transpose(1, 2)
-        base_hf_flat = preserve_patches_flat - blurred_patches_flat
         self.last_base_patches_flat = preserve_patches_flat
 
         pre_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
@@ -419,7 +426,7 @@ class PatchInpainting(nn.Module):
             k_mask=None,
             post_softmax_mask=None,
             renorm_post_mask=False,
-            direct_patch_mixing=True,
+            direct_patch_mixing=False,
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
@@ -436,18 +443,13 @@ class PatchInpainting(nn.Module):
 
         refinement_scale = self.refinement_runtime_scale
         
-        # Smoothly interpolate between the hallucinated coarse HF and the retrieved valid HF
-        # Gated by both the learned global scale and the per-patch entropy confidence
-        delta = refinement_scale * refinement_confidence * (out - base_hf_flat) * patch_mask
-        delta = self.apply_paper_coherence(delta, sizes)
-        out = preserve_patches_flat + delta
-        out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        mixed_hf = refinement_scale * out + (1.0 - refinement_scale) * hf_patches_flat
+        out = mixed_hf * refinement_confidence + hf_patches_flat * (1 - refinement_confidence)
         self.last_output_patches_flat = out
         self.last_pixel_mask_flat = pixel_mask_flat
         self.last_refinement_confidence = refinement_confidence
 
-        # V2: Use native fold
-        out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
+        out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=True)
 
         return out, atten_weights, image_to_return
 
