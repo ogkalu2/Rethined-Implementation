@@ -190,6 +190,15 @@ def set_parameter_trainability(model, freeze_coarse: bool = False):
         model.coarse_model.eval()
 
 
+def should_freeze_coarse(step, initial_freeze_coarse, coarse_freeze_step=None):
+    """Return whether the coarse branch should be frozen at this step."""
+    if initial_freeze_coarse:
+        return True
+    if coarse_freeze_step is None:
+        return False
+    return step >= coarse_freeze_step
+
+
 def compute_train_loss(
     criterion,
     coarse_raw,
@@ -754,6 +763,7 @@ def train(cfg, args):
     grad_clip = cfg["training"]["grad_clip"]
     refinement_start_step = cfg["training"].get("refinement_start_step", 0)
     refinement_warmup_steps = cfg["training"].get("refinement_warmup_steps", 0)
+    coarse_freeze_step = cfg["training"].get("coarse_freeze_step")
     # Logging
     log_cfg = cfg["logging"]
     eval_interval = log_cfg.get("eval_interval", 0)
@@ -779,6 +789,7 @@ def train(cfg, args):
     # Training loop
     model.train()
     set_parameter_trainability(model, freeze_coarse=freeze_coarse)
+    coarse_frozen_now = freeze_coarse
     data_iter = iter(train_loader)
     optimizer.zero_grad()
 
@@ -804,12 +815,16 @@ def train(cfg, args):
         lr = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         refinement_scale = get_refinement_scale(step, refinement_start_step, refinement_warmup_steps)
         model.generator.set_refinement_runtime_scale(refinement_scale)
+        target_coarse_frozen = should_freeze_coarse(step, freeze_coarse, coarse_freeze_step)
+        if target_coarse_frozen != coarse_frozen_now:
+            set_parameter_trainability(model, freeze_coarse=target_coarse_frozen)
+            coarse_frozen_now = target_coarse_frozen
         refinement_lr = lr * refinement_lr_scale if refinement_scale > 0 else 0.0
         for pg in optimizer.param_groups:
             if pg.get("name") == "refinement":
                 pg["lr"] = refinement_lr
             else:
-                pg["lr"] = lr
+                pg["lr"] = 0.0 if coarse_frozen_now else lr
 
         loss_sums = {k: 0.0 for k in loss_dict}
         step_has_nonfinite = False
@@ -901,6 +916,7 @@ def train(cfg, args):
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("refinement_scale", refinement_scale, step)
             writer.add_scalar("refinement_lr", refinement_lr, step)
+            writer.add_scalar("coarse_frozen", 1.0 if coarse_frozen_now else 0.0, step)
 
             peak_memory_gb = get_peak_memory_allocated_gb(device)
             if peak_memory_gb is not None:

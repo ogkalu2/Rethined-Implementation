@@ -49,6 +49,7 @@ training:
   refinement_start_step: 1000
   refinement_warmup_steps: 1000
   refinement_lr_scale: 0.05
+  coarse_freeze_step: 1000
   min_lr: 0.000001
   grad_clip: 1.0
   mixed_precision: true
