@@ -117,9 +117,9 @@ def prepare_multiscale_batch(batch, device, model_image_size: int, blur_layer=No
         masked_image = masked_image_hr
     else:
         image = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
-        masked_image = gaussian_prefilter_downsample(masked_image_hr, model_image_size, blur_layer=blur_layer)
         mask = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
         mask = (mask > 0.5).to(image.dtype)
+        masked_image = image * (1 - mask)
 
     return {
         "image": image,
