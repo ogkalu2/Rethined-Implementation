@@ -26,6 +26,13 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
+from device_utils import (
+    get_autocast_device_type,
+    get_device_name,
+    get_peak_memory_allocated_gb,
+    is_amp_enabled,
+    resolve_device,
+)
 from model import AttentionUpscaling, InpaintingModel
 from losses import InpaintingLoss
 from data.dataset import get_dataloader
@@ -114,6 +121,13 @@ def prepare_multiscale_batch(batch, device, model_image_size: int, blur_layer=No
         "masked_image_hr": masked_image_hr,
         "has_hr_supervision": image_hr.shape[-2:] != image.shape[-2:],
     }
+
+
+def print_device_banner(device: torch.device):
+    """Print the active training device and accelerator name when present."""
+    print(f"Device: {device}")
+    if device.type in {"cuda", "xpu"}:
+        print(f"Accelerator: {get_device_name(device)}")
 
 
 def validate_joint_hr_pipeline(cfg, model):
@@ -330,6 +344,8 @@ def evaluate_refinement_health(
 ):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
+    amp_device_type = get_autocast_device_type(device)
+    amp_enabled = is_amp_enabled(device, use_amp)
     if model_image_size is None:
         model_image_size = model.generator.image_size
     attn_upscaler = AttentionUpscaling(model.generator) if joint_hr_pipeline else None
@@ -370,7 +386,7 @@ def evaluate_refinement_health(
         mask = batch_views["mask"]
         masked_image = batch_views["masked_image"]
 
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
             refined_raw, attn_map, coarse_raw = model(masked_image, mask)
 
         refined_raw = refined_raw.clamp(0, 1)
@@ -409,7 +425,7 @@ def evaluate_refinement_health(
         gain_pct_values.extend(gain_pct.detach().cpu().tolist())
 
         if joint_hr_pipeline and batch_views["has_hr_supervision"]:
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
                 _, hr_refined, _, hr_base = compute_hr_refined(
                     attn_upscaler,
                     batch_views,
@@ -491,10 +507,8 @@ def run_eval_only(cfg, args):
     if not args.resume:
         raise ValueError("--eval-only requires --resume CHECKPOINT")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    if device == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name()}")
+    device = resolve_device(args.device)
+    print_device_banner(device)
 
     torch.manual_seed(cfg["training"]["seed"])
 
@@ -626,10 +640,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
 
 
 def train(cfg, args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-    if device == "cuda":
-        print(f"GPU: {torch.cuda.get_device_name()}")
+    device = resolve_device(args.device)
+    print_device_banner(device)
 
     # Seed
     torch.manual_seed(cfg["training"]["seed"])
@@ -655,7 +667,10 @@ def train(cfg, args):
     # Optimizer
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.Adam(trainable_params, lr=cfg["training"]["lr"])
-    scaler = torch.amp.GradScaler("cuda", enabled=cfg["training"]["mixed_precision"])
+    use_amp = is_amp_enabled(device, cfg["training"]["mixed_precision"])
+    if cfg["training"]["mixed_precision"] and not use_amp:
+        print("Mixed precision requested, but no supported accelerator is active; disabling AMP.")
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
     # Data
     max_images = args.overfit if args.overfit else None
@@ -701,8 +716,6 @@ def train(cfg, args):
     min_lr = cfg["training"]["min_lr"]
     warmup_steps = cfg["training"]["warmup_steps"]
     grad_clip = cfg["training"]["grad_clip"]
-    use_amp = cfg["training"]["mixed_precision"]
-
     # Logging
     log_cfg = cfg["logging"]
     eval_interval = log_cfg.get("eval_interval", 0)
@@ -775,7 +788,7 @@ def train(cfg, args):
             masked_image = batch_views["masked_image"]
 
             # Forward
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast(device.type, enabled=use_amp):
                 refined_raw, attn, coarse_raw = model(masked_image, mask)
                 coarse = composite_with_known(coarse_raw, image, mask)
                 refined = composite_with_known(refined_raw, image, mask)
@@ -830,8 +843,13 @@ def train(cfg, args):
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
             writer.add_scalar("lr", lr, step)
 
-            if device == "cuda":
-                writer.add_scalar("vram_gb", torch.cuda.max_memory_allocated() / 1e9, step)
+            peak_memory_gb = get_peak_memory_allocated_gb(device)
+            if peak_memory_gb is not None:
+                writer.add_scalar("accelerator_mem_gb", peak_memory_gb, step)
+                if device.type == "cuda":
+                    writer.add_scalar("vram_gb", peak_memory_gb, step)
+                elif device.type == "xpu":
+                    writer.add_scalar("xpu_mem_gb", peak_memory_gb, step)
 
             # Write status file for remote monitoring
             write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr, train_start_time)
@@ -925,6 +943,7 @@ def main():
     parser = argparse.ArgumentParser(description="RETHINED Training")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
+    parser.add_argument("--device", type=str, default=None, help="Device override, e.g. xpu, cuda, cpu, or xpu:0")
     parser.add_argument("--overfit", type=int, default=None, help="Overfit on N images (sanity check)")
     parser.add_argument("--steps", type=int, default=None, help="Override total training steps")
     parser.add_argument("--eval-only", action="store_true", help="Run validation only on a checkpoint")

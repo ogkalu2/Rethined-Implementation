@@ -31,6 +31,13 @@ from skimage.metrics import structural_similarity as ssim
 from tqdm import tqdm
 
 from data.dataset import get_dataloader
+from device_utils import (
+    empty_device_cache,
+    get_device_name,
+    is_amp_enabled,
+    resolve_device,
+    time_device_call,
+)
 from model import InpaintingModel, AttentionUpscaling
 
 
@@ -61,6 +68,7 @@ def load_model(checkpoint_path, cfg, device):
 def evaluate_quality(model, dataloader, device, num_images=200):
     """Compute L1, SSIM, LPIPS on validation set."""
     lpips_fn = lpips.LPIPS(net="alex").to(device)
+    amp_enabled = is_amp_enabled(device, True)
 
     metrics = {
         "l1_coarse": [], "l1_refined": [],
@@ -78,7 +86,7 @@ def evaluate_quality(model, dataloader, device, num_images=200):
         masked_image = batch["masked_image"].to(device)
         bs = image.shape[0]
 
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast(device.type, enabled=amp_enabled):
             refined, attn, coarse = model(masked_image, mask)
 
         refined = refined.clamp(0, 1) * mask + image * (1 - mask)
@@ -128,6 +136,7 @@ def evaluate_quality(model, dataloader, device, num_images=200):
 def benchmark_speed(model, device, resolutions=(256, 512), num_runs=50, warmup=10):
     """Benchmark inference speed at different resolutions."""
     results = {}
+    amp_enabled = is_amp_enabled(device, True)
 
     for res in resolutions:
         # Check if resolution fits in VRAM
@@ -144,26 +153,18 @@ def benchmark_speed(model, device, resolutions=(256, 512), num_runs=50, warmup=1
             # Skip non-native resolutions for base model — test those with upscaling
             results[str(res)] = {"note": "non-native, use AttentionUpscaling"}
             del dummy_img, dummy_mask
-            torch.cuda.empty_cache()
+            empty_device_cache(device)
             continue
 
         # Warmup
         for _ in range(warmup):
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast(device.type, enabled=amp_enabled):
                 _ = model(dummy_img, dummy_mask)
-        torch.cuda.synchronize()
 
         # Benchmark
         latencies = []
         for _ in range(num_runs):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            with torch.amp.autocast("cuda"):
-                _ = model(dummy_img, dummy_mask)
-            end.record()
-            torch.cuda.synchronize()
-            latencies.append(start.elapsed_time(end))
+            latencies.append(time_device_call(lambda: model(dummy_img, dummy_mask), device))
 
         latencies = np.array(latencies)
         results[str(res)] = {
@@ -175,7 +176,7 @@ def benchmark_speed(model, device, resolutions=(256, 512), num_runs=50, warmup=1
         }
 
         del dummy_img, dummy_mask
-        torch.cuda.empty_cache()
+        empty_device_cache(device)
 
     return results
 
@@ -185,6 +186,7 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
     """Benchmark AttentionUpscaling speed at higher resolutions."""
     attn_upscaler = AttentionUpscaling(model.generator)
     results = {}
+    amp_enabled = is_amp_enabled(device, True)
 
     # Generate LR input + attention map
     dummy_lr = torch.randn(1, 3, lr_res, lr_res, device=device)
@@ -192,7 +194,7 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
     dummy_mask[:, :, lr_res//4:3*lr_res//4, lr_res//4:3*lr_res//4] = 1.0
 
     # Run LR inference to get attention map
-    with torch.amp.autocast("cuda"):
+    with torch.amp.autocast(device.type, enabled=amp_enabled):
         refined, attn_map, coarse = model(dummy_lr, dummy_mask)
 
     for hr_res in hr_resolutions:
@@ -201,21 +203,20 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
 
             # Warmup
             for _ in range(5):
-                with torch.amp.autocast("cuda"):
+                with torch.amp.autocast(device.type, enabled=amp_enabled):
                     _ = attn_upscaler(dummy_hr, refined, attn_map)
-            torch.cuda.synchronize()
 
             # Benchmark
             latencies = []
             for _ in range(30):
-                start = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                start.record()
-                with torch.amp.autocast("cuda"):
-                    hr_out = attn_upscaler(dummy_hr, refined, attn_map)
-                end.record()
-                torch.cuda.synchronize()
-                latencies.append(start.elapsed_time(end))
+                hr_out = None
+
+                def run_upscaler():
+                    nonlocal hr_out
+                    with torch.amp.autocast(device.type, enabled=amp_enabled):
+                        hr_out = attn_upscaler(dummy_hr, refined, attn_map)
+
+                latencies.append(time_device_call(run_upscaler, device))
 
             latencies = np.array(latencies)
             results[str(hr_res)] = {
@@ -227,14 +228,14 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
             }
 
             del dummy_hr, hr_out
-            torch.cuda.empty_cache()
+            empty_device_cache(device)
 
         except RuntimeError as e:
             results[str(hr_res)] = {"error": str(e)}
-            torch.cuda.empty_cache()
+            empty_device_cache(device)
 
     del dummy_lr, dummy_mask, refined, attn_map, coarse
-    torch.cuda.empty_cache()
+    empty_device_cache(device)
 
     return results
 
@@ -243,6 +244,7 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
 def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50):
     """Test if AttentionUpscaling maintains quality at higher resolution."""
     attn_upscaler = AttentionUpscaling(model.generator)
+    amp_enabled = is_amp_enabled(device, True)
 
     l1_values = []
     count = 0
@@ -255,7 +257,7 @@ def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50)
         mask = batch["mask"].to(device)
         masked_image = batch["masked_image"].to(device)
 
-        with torch.amp.autocast("cuda"):
+        with torch.amp.autocast(device.type, enabled=amp_enabled):
             refined, attn_map, coarse = model(masked_image, mask)
 
         # Upscale original image to HR for comparison
@@ -266,7 +268,7 @@ def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50)
         masked_hr = image_hr * (1 - mask_hr)
 
         try:
-            with torch.amp.autocast("cuda"):
+            with torch.amp.autocast(device.type, enabled=amp_enabled):
                 hr_output = attn_upscaler(masked_hr, refined.clamp(0, 1), attn_map)
             hr_output = hr_output.clamp(0, 1)
 
@@ -296,6 +298,7 @@ def main():
     parser = argparse.ArgumentParser(description="RETHINED Evaluation")
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_images", type=int, default=200)
     parser.add_argument("--speed_only", action="store_true")
     parser.add_argument("--upscale_test", action="store_true")
@@ -305,8 +308,10 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device(args.device)
     print(f"Device: {device}")
+    if device.type in {"cuda", "xpu"}:
+        print(f"Accelerator: {get_device_name(device)}")
 
     model = load_model(args.checkpoint, cfg, device)
     total_params = sum(p.numel() for p in model.parameters())

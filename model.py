@@ -269,7 +269,7 @@ class PatchInpainting(nn.Module):
         return weights
 
     def unfold_native(self, feature_map: torch.Tensor, kernel_size: int):
-        """CUDA-optimized unfolding using native F.unfold.
+        """Native accelerator-friendly unfolding using F.unfold.
 
         Replaces unfolding_coreml() which used F.conv2d with identity kernels.
         Produces identical output shape: (B, C*k*k, n_h, n_w).
