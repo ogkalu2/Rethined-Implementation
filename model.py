@@ -175,6 +175,9 @@ class PatchInpainting(nn.Module):
         attn_temperature: float = 1.0,
         token_use_mask_ratio: bool = False,
         paper_mask_renormalize: bool = False,
+        mask_patch_ratio_threshold: float = 0.05,
+        min_valid_patches: int = 8,
+        use_entropy_confidence: bool = False,
         model,
     ):
         self.cross_attention = cross_attention
@@ -196,6 +199,9 @@ class PatchInpainting(nn.Module):
         self.attn_temperature = attn_temperature
         self.token_use_mask_ratio = token_use_mask_ratio
         self.paper_mask_renormalize = paper_mask_renormalize
+        self.mask_patch_ratio_threshold = float(mask_patch_ratio_threshold)
+        self.min_valid_patches = max(1, int(min_valid_patches))
+        self.use_entropy_confidence = use_entropy_confidence
         super().__init__()
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -359,11 +365,20 @@ class PatchInpainting(nn.Module):
 
         # V2: Use native unfold for mask
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
-        # A patch is corrupted if any pixel inside it is corrupted.
-        mask_same_res_as_features_pooled = mask_as_patches.amax(dim=1, keepdim=True)
-        mask_same_res_as_features_pooled = mask_same_res_as_features_pooled.flatten(
-            start_dim=2).unsqueeze(-1)
         mask_ratio = mask_as_patches.mean(dim=1, keepdim=True)
+        mask_ratio_flat = mask_ratio.flatten(start_dim=2).squeeze(1)
+        masked_patch_flat = (mask_ratio_flat > self.mask_patch_ratio_threshold).to(mask_ratio.dtype)
+        valid_counts = (1.0 - masked_patch_flat).sum(dim=1).to(torch.int64)
+        if torch.any(valid_counts < self.min_valid_patches):
+            ranked = torch.argsort(mask_ratio_flat, dim=1)
+            needed = (self.min_valid_patches - valid_counts).clamp_min(0)
+            for batch_idx in torch.where(needed > 0)[0].tolist():
+                promote_count = int(min(needed[batch_idx].item(), masked_patch_flat.shape[1]))
+                if promote_count <= 0:
+                    continue
+                promote_idx = ranked[batch_idx, :promote_count]
+                masked_patch_flat[batch_idx, promote_idx] = 0.0
+        mask_same_res_as_features_pooled = masked_patch_flat.unsqueeze(1).unsqueeze(-1)
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
@@ -408,14 +423,17 @@ class PatchInpainting(nn.Module):
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        
-        attn_probs = atten_weights.squeeze(1)
-        attn_entropy = -(attn_probs.clamp_min(1e-8) * attn_probs.clamp_min(1e-8).log()).sum(dim=-1, keepdim=True)
-        valid_key_count = (1.0 - patch_mask.squeeze(-1)).sum(dim=1, keepdim=True)
-        max_entropy = valid_key_count.clamp_min(2.0).log().unsqueeze(-1)
-        refinement_confidence = (1.0 - attn_entropy / max_entropy.clamp_min(1e-6)).clamp(0.0, 1.0)
-        refinement_confidence = refinement_confidence * patch_mask
-        
+
+        if self.use_entropy_confidence:
+            attn_probs = atten_weights.squeeze(1)
+            attn_entropy = -(attn_probs.clamp_min(1e-8) * attn_probs.clamp_min(1e-8).log()).sum(dim=-1, keepdim=True)
+            valid_key_count = (1.0 - patch_mask.squeeze(-1)).sum(dim=1, keepdim=True)
+            max_entropy = valid_key_count.clamp_min(2.0).log().unsqueeze(-1)
+            refinement_confidence = (1.0 - attn_entropy / max_entropy.clamp_min(1e-6)).clamp(0.0, 1.0)
+            refinement_confidence = refinement_confidence * patch_mask
+        else:
+            refinement_confidence = patch_mask
+
         refinement_scale = torch.tanh(self.refinement_gate) * self.refinement_runtime_scale
         
         # Smoothly interpolate between the hallucinated coarse HF and the retrieved valid HF

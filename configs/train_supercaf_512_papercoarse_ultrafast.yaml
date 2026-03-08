@@ -30,6 +30,9 @@ model:
     token_use_mask_ratio: false
     attention_masking: true
     paper_mask_renormalize: true
+    mask_patch_ratio_threshold: 0.05
+    min_valid_patches: 8
+    use_entropy_confidence: false
 
 data:
   root_dir: "."
