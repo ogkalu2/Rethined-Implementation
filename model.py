@@ -345,9 +345,9 @@ class PatchInpainting(nn.Module):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
         if self.mask_inpainting:
-            coarse_composite = image_coarse_inpainting * mask + masked_input * (1 - mask)
+            coarse_composite = image_coarse_inpainting.detach() * mask + masked_input * (1 - mask)
         else:
-            coarse_composite = image_coarse_inpainting
+            coarse_composite = image_coarse_inpainting.detach()
         image_to_return = image_coarse_inpainting
 
         # Match the reference path: build attention tokens from the coarse
@@ -371,7 +371,7 @@ class PatchInpainting(nn.Module):
         preserve_patches_full = composite_patches_full
         features_to_concat = None
         if self.concat_features:
-            features_to_concat = features[self.feature_i]
+            features_to_concat = features[self.feature_i].detach()
             features_to_concat = F.interpolate(features_to_concat, size=hf_patches.shape[-2:], mode='bilinear', align_corners=False)
             token_map = torch.cat([match_patches, features_to_concat], dim=1)
         else:
