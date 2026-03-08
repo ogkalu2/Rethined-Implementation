@@ -35,15 +35,15 @@ data:
   manifest_path: "dataset/manifests/supercaf_manifest.csv"
   val_dir: null
   image_size: 512
-  batch_size: 4
-  eval_batch_size: 4
+  batch_size: 8
+  eval_batch_size: 8
   num_workers: 4
   mask_min_coverage: 0.30
   mask_max_coverage: 0.50
 
 training:
   total_steps: 800
-  grad_accum_steps: 4
+  grad_accum_steps: 2
   lr: 0.001
   warmup_steps: 100
   min_lr: 0.000001

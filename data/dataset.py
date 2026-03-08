@@ -213,6 +213,8 @@ def get_dataloader(
     split: str = "train",
     batch_size: int = 4,
     num_workers: int = 4,
+    persistent_workers: Optional[bool] = None,
+    prefetch_factor: Optional[int] = None,
     max_images: Optional[int] = None,
     mask_min_coverage: float = 0.3,
     mask_max_coverage: float = 0.5,
@@ -230,11 +232,20 @@ def get_dataloader(
         val_dir=val_dir,
         manifest_path=manifest_path,
     )
-    return torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(split == "train"),
-        num_workers=num_workers,
-        pin_memory=True,
-        drop_last=(split == "train"),
-    )
+    loader_kwargs = {
+        "dataset": dataset,
+        "batch_size": batch_size,
+        "shuffle": (split == "train"),
+        "num_workers": num_workers,
+        "pin_memory": True,
+        "drop_last": (split == "train"),
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = (
+            persistent_workers if persistent_workers is not None else True
+        )
+        loader_kwargs["prefetch_factor"] = (
+            prefetch_factor if prefetch_factor is not None else 2
+        )
+
+    return torch.utils.data.DataLoader(**loader_kwargs)
