@@ -1,12 +1,12 @@
 """RETHINED paper-path model."""
 
+import math
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-import math
-import numpy as np
 
-from mobileone import MobileOne, mobileone, reparameterize_model
+from mobileone import PARAMS, mobileone, reparameterize_model
 
 
 class NativeGaussianBlur2d(nn.Module):
@@ -419,15 +419,29 @@ class PositionalEncoding(nn.Module):
 class MobileOneCoarse(nn.Module):
     def __init__(self, variant='s4', **kwargs):
         super().__init__()
-        self.model = mobileone(variant=variant, **kwargs)
+        if variant not in PARAMS:
+            raise ValueError(f"Unsupported MobileOne variant: {variant}")
 
-        # Decoder - channels match standard MobileOne S4:
-        # stage0=64, stage1=192, stage2=448, stage3=896, stage4=2048
-        self.d4 = nn.ConvTranspose2d(2048, 896, kernel_size=4, stride=2, padding=1)
-        self.d3 = nn.ConvTranspose2d(896 + 896, 448, kernel_size=4, stride=2, padding=1)
-        self.d2 = nn.ConvTranspose2d(448 + 448, 192, kernel_size=4, stride=2, padding=1)
-        self.d1 = nn.ConvTranspose2d(192 + 192, 64, kernel_size=4, stride=2, padding=1)
-        self.d0 = nn.ConvTranspose2d(64 + 64, 3, kernel_size=4, stride=2, padding=1)
+        width_multipliers = PARAMS[variant]["width_multipliers"]
+        stage0_channels = min(64, int(64 * width_multipliers[0]))
+        stage1_channels = int(64 * width_multipliers[0])
+        stage2_channels = int(128 * width_multipliers[1])
+        stage3_channels = int(256 * width_multipliers[2])
+        stage4_channels = int(512 * width_multipliers[3])
+        self.feature_channels = [
+            stage0_channels,
+            stage1_channels,
+            stage2_channels,
+            stage3_channels,
+            stage4_channels,
+        ]
+
+        self.model = mobileone(variant=variant, **kwargs)
+        self.d4 = nn.ConvTranspose2d(stage4_channels, stage3_channels, kernel_size=4, stride=2, padding=1)
+        self.d3 = nn.ConvTranspose2d(stage3_channels + stage3_channels, stage2_channels, kernel_size=4, stride=2, padding=1)
+        self.d2 = nn.ConvTranspose2d(stage2_channels + stage2_channels, stage1_channels, kernel_size=4, stride=2, padding=1)
+        self.d1 = nn.ConvTranspose2d(stage1_channels + stage1_channels, stage0_channels, kernel_size=4, stride=2, padding=1)
+        self.d0 = nn.ConvTranspose2d(stage0_channels + stage0_channels, 3, kernel_size=4, stride=2, padding=1)
         self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
 
@@ -508,7 +522,27 @@ class InpaintingModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.coarse_model = MobileOneCoarse(**config['coarse_model']['parameters'])
-        self.generator = PatchInpainting(**config['generator']['params'], model=self.coarse_model)
+        generator_params = dict(config['generator']['params'])
+
+        if generator_params.get('concat_features', True):
+            feature_i = generator_params.get('feature_i', 3)
+            feature_channels = self.coarse_model.feature_channels
+            if feature_i < 0 or feature_i >= len(feature_channels):
+                raise ValueError(
+                    f"model.generator.feature_i={feature_i} is out of range for coarse feature maps"
+                )
+
+            inferred_feature_dim = feature_channels[feature_i]
+            configured_feature_dim = generator_params.get('feature_dim')
+            if configured_feature_dim is None:
+                generator_params['feature_dim'] = inferred_feature_dim
+            elif configured_feature_dim != inferred_feature_dim:
+                raise ValueError(
+                    "model.generator.feature_dim does not match the selected coarse feature map: "
+                    f"got {configured_feature_dim}, expected {inferred_feature_dim} for feature_i={feature_i}"
+                )
+
+        self.generator = PatchInpainting(**generator_params, model=self.coarse_model)
 
     def forward(self, image, mask):
         return self.generator(image, mask)

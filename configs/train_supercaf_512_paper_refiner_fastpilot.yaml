@@ -1,10 +1,9 @@
-# SuperCAF joint-HR pilot: 512px crops with a paper-facing 256px LR refiner.
-# This keeps the short pilot length used in prior experiments; the paper's full
-# schedule is still 600k steps.
+# Faster paper-facing pilot for debugging the refiner without paying full
+# s4+dK=2048+accum=32 cost. This is not meant to match the final paper schedule.
 
 model:
   coarse_model:
-    variant: "s4"
+    variant: "s1"
   generator:
     kernel_size: 8
     nheads: 1
@@ -12,15 +11,14 @@ model:
     stem_out_channels: 3
     merge_mode: "all"
     image_size: 256
-    embed_dim: 2048
+    embed_dim: 1024
     use_qpos: null
     use_kpos: null
     dropout: 0.1
     feature_i: 3
+    feature_dim: null
     concat_features: true
     final_conv: true
-    # Auto-derived from coarse_model.variant and feature_i.
-    feature_dim: null
     attention_type: "MultiHeadAttention"
     compute_v: false
     use_argmax: false
@@ -42,10 +40,10 @@ data:
   mask_max_coverage: 0.50
 
 training:
-  total_steps: 5000
-  grad_accum_steps: 32
+  total_steps: 1000
+  grad_accum_steps: 8
   lr: 0.001
-  warmup_steps: 1000
+  warmup_steps: 100
   min_lr: 0.000001
   grad_clip: 1.0
   mixed_precision: true
@@ -63,13 +61,13 @@ loss:
   hr_style_weight: 0.0
 
 logging:
-  log_dir: "logs/train_supercaf_512_to_256_paper_refiner_pilot"
-  log_interval: 100
-  vis_interval: 2500
-  eval_interval: 1000
+  log_dir: "logs/train_supercaf_512_to_256_paper_refiner_fastpilot"
+  log_interval: 50
+  vis_interval: 500
+  eval_interval: 200
   eval_batches: 8
-  save_interval: 5000
+  save_interval: 1000
   save_checkpoints: true
   save_final_checkpoint: true
-  checkpoint_steps: [5000]
+  checkpoint_steps: [1000]
   keep_last_checkpoints: 3
