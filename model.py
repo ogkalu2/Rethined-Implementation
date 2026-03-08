@@ -344,16 +344,12 @@ class PatchInpainting(nn.Module):
             coarse_composite = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
 
-        # The paper path uses raw coarse patches for token construction and the
-        # masked LR input for value mixing / preservation.
-        coarse_patches_full, sizes = self.unfold_native(image_coarse_inpainting, self.kernel_size)
-        known_patches_full, _ = self.unfold_native(masked_input, self.kernel_size)
-
-        # High-frequency content of the known image for residual attention.
-        # Mirrors Section 3.4 HR pipeline: attention mixes HF as an additive
-        # residual on top of the coarse base instead of replacing patches.
-        hf_input = masked_input - self.final_gaussian_blur(masked_input)
-        hf_patches, _ = self.unfold_native(hf_input, self.kernel_size)
+        # Match the reference path: build attention tokens from the coarse
+        # composite image decomposed into low/high frequencies.
+        composite_blurred = self.final_gaussian_blur(coarse_composite)
+        composite_patches_full, sizes = self.unfold_native(coarse_composite, self.kernel_size)
+        blurred_patches_full, _ = self.unfold_native(composite_blurred, self.kernel_size)
+        hf_patches = composite_patches_full - blurred_patches_full
 
         # V2: Use native unfold for mask
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
@@ -365,12 +361,12 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
-        match_patches = coarse_patches_full
-        preserve_patches_full = known_patches_full
+        match_patches = hf_patches
+        preserve_patches_full = composite_patches_full
         features_to_concat = None
         if self.concat_features:
             features_to_concat = features[self.feature_i]
-            features_to_concat = F.interpolate(features_to_concat, size=coarse_patches_full.shape[-2:], mode='bilinear', align_corners=False)
+            features_to_concat = F.interpolate(features_to_concat, size=hf_patches.shape[-2:], mode='bilinear', align_corners=False)
             token_map = torch.cat([match_patches, features_to_concat], dim=1)
         else:
             token_map = match_patches
@@ -386,9 +382,9 @@ class PatchInpainting(nn.Module):
             input_attn = input_attn + self.positionalencoding.transpose(1, 2)
 
         hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
+        blurred_patches_flat = blurred_patches_full.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
-        coarse_patches_flat = coarse_patches_full.flatten(start_dim=2).transpose(1, 2)
-        self.last_base_patches_flat = coarse_patches_flat
+        self.last_base_patches_flat = preserve_patches_flat
 
         pre_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
         out, atten_weights = self.multihead_attention(
@@ -405,7 +401,7 @@ class PatchInpainting(nn.Module):
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        out = (coarse_patches_flat + out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        out = (blurred_patches_flat + out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
         out = self.apply_paper_coherence(out, sizes)
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
