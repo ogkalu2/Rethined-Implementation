@@ -233,6 +233,7 @@ class PatchInpainting(nn.Module):
             1, self.patch_token_dim,
             int((image_size / stem_out_stride / self.kernel_size) ** 2)
         )) if use_kpos or use_qpos else None
+        self.refinement_gate = nn.Parameter(torch.tensor([0.05]))
         self.paper_coherence_layer = nn.Conv2d(
             self.patch_value_dim, self.patch_value_dim,
             kernel_size=3, stride=1, padding=1, padding_mode='reflect',
@@ -401,7 +402,8 @@ class PatchInpainting(nn.Module):
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
-        out = (blurred_patches_flat + out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
+        refinement_scale = torch.tanh(self.refinement_gate)
+        out = (blurred_patches_flat + refinement_scale * out) * patch_mask + preserve_patches_flat * (1 - patch_mask)
         out = self.apply_paper_coherence(out, sizes)
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
@@ -654,7 +656,8 @@ class AttentionUpscaling(nn.Module):
         hr_hf_patches = hr_patches - hr_patches_blurred
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
 
-        reconstructed_hr_hf_patches = torch.matmul(attn_map.squeeze(1), hr_hf_patches)
+        refinement_scale = torch.tanh(self.patch_inpainting.refinement_gate)
+        reconstructed_hr_hf_patches = refinement_scale * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
 
         # Reassemble non-overlapping HR patches without an HR coherence layer.
         reconstructed_hr_hf_image = self.patch_inpainting.fold_native(

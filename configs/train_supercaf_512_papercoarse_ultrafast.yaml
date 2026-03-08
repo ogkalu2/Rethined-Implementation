@@ -58,7 +58,7 @@ loss:
   l1_valid_weight: 1.0
   perceptual_weight: 0.1
   style_weight: 0.0
-  hr_refined_weight: 1.0
+  hr_refined_weight: 0.0
   hr_perceptual_weight: 0.0
   hr_style_weight: 0.0
 
