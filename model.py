@@ -408,16 +408,25 @@ class PatchInpainting(nn.Module):
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
+        
+        attn_probs = atten_weights.squeeze(1)
+        attn_entropy = -(attn_probs.clamp_min(1e-8) * attn_probs.clamp_min(1e-8).log()).sum(dim=-1, keepdim=True)
+        valid_key_count = (1.0 - patch_mask.squeeze(-1)).sum(dim=1, keepdim=True)
+        max_entropy = valid_key_count.clamp_min(2.0).log().unsqueeze(-1)
+        refinement_confidence = (1.0 - attn_entropy / max_entropy.clamp_min(1e-6)).clamp(0.0, 1.0)
+        refinement_confidence = refinement_confidence * patch_mask
+        
         refinement_scale = torch.tanh(self.refinement_gate) * self.refinement_runtime_scale
         
         # Smoothly interpolate between the hallucinated coarse HF and the retrieved valid HF
-        delta = refinement_scale * (out - base_hf_flat) * patch_mask
+        # Gated by both the learned global scale and the per-patch entropy confidence
+        delta = refinement_scale * refinement_confidence * (out - base_hf_flat) * patch_mask
         delta = self.apply_paper_coherence(delta, sizes)
         out = preserve_patches_flat + delta
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
         self.last_pixel_mask_flat = pixel_mask_flat
-        self.last_refinement_confidence = None
+        self.last_refinement_confidence = refinement_confidence
 
         # V2: Use native fold
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
@@ -667,7 +676,13 @@ class AttentionUpscaling(nn.Module):
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
 
         refinement_scale = torch.tanh(self.patch_inpainting.refinement_gate) * self.patch_inpainting.refinement_runtime_scale
-        reconstructed_hr_hf_patches = refinement_scale * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
+        
+        # Pull confidence from the LR pass if available
+        confidence = self.patch_inpainting.last_refinement_confidence
+        if confidence is not None:
+            reconstructed_hr_hf_patches = refinement_scale * confidence * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
+        else:
+            reconstructed_hr_hf_patches = refinement_scale * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
 
         # Reassemble non-overlapping HR patches without an HR coherence layer.
         reconstructed_hr_hf_image = self.patch_inpainting.fold_native(
