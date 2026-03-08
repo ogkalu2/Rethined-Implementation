@@ -693,9 +693,15 @@ class AttentionUpscaling(nn.Module):
         hr_hf_patches = hr_patches - hr_patches_blurred
         hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
 
-        # Section 3.4 transfers HR high frequencies using the LR attention map
-        # without applying an extra learned LR refinement gate on the HR branch.
-        reconstructed_hr_hf_patches = torch.matmul(attn_map.squeeze(1), hr_hf_patches)
+        refinement_scale = torch.tanh(self.patch_inpainting.refinement_gate) * self.patch_inpainting.refinement_runtime_scale
+
+        # Reuse the LR branch confidence so HR transfer is selective rather than
+        # copying every attended patch equally.
+        confidence = self.patch_inpainting.last_refinement_confidence
+        if confidence is not None:
+            reconstructed_hr_hf_patches = refinement_scale * confidence * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
+        else:
+            reconstructed_hr_hf_patches = refinement_scale * torch.matmul(attn_map.squeeze(1), hr_hf_patches)
 
         # Reassemble non-overlapping HR patches without an HR coherence layer.
         reconstructed_hr_hf_image = self.patch_inpainting.fold_native(
