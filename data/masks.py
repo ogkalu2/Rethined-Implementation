@@ -69,14 +69,15 @@ class FreeFormMaskGenerator:
         y = rng.randint(0, h - rect_h + 1)
         mask[y:y + rect_h, x:x + rect_w] = 1
 
-    def __call__(self) -> np.ndarray:
+    def __call__(self, rng: np.random.RandomState | None = None) -> np.ndarray:
         """Generate a random mask.
 
         Returns:
             np.ndarray: Binary mask of shape (H, W), dtype float32.
                         1 = hole, 0 = valid.
         """
-        rng = np.random.RandomState()
+        if rng is None:
+            rng = np.random.RandomState()
 
         for _ in range(self.max_retries):
             mask = np.zeros((self.image_size, self.image_size), dtype=np.float32)

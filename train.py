@@ -756,6 +756,7 @@ def train(cfg, args):
 
     # Data
     max_images = args.overfit if args.overfit else None
+    deterministic_overfit = bool(args.overfit)
     val_dir = cfg["data"].get("val_dir")
     manifest_path = cfg["data"].get("manifest_path")
     train_loader = get_dataloader(
@@ -771,6 +772,9 @@ def train(cfg, args):
         mask_max_coverage=cfg["data"]["mask_max_coverage"],
         val_dir=val_dir,
         manifest_path=manifest_path,
+        deterministic=deterministic_overfit,
+        fixed_mask_seed=cfg["training"]["seed"],
+        shuffle_override=(False if deterministic_overfit else None),
     )
     print(f"Training images: {len(train_loader.dataset)}")
 
@@ -779,10 +783,11 @@ def train(cfg, args):
     if log_cfg := cfg.get("logging"):
         pass
     if cfg["logging"].get("eval_interval", 0):
+        eval_split = "train" if deterministic_overfit else "val"
         eval_loader = get_dataloader(
             root_dir=cfg["data"]["root_dir"],
             image_size=cfg["data"]["image_size"],
-            split="val",
+            split=eval_split,
             batch_size=cfg["data"].get("eval_batch_size", cfg["data"]["batch_size"]),
             num_workers=max(1, min(2, cfg["data"]["num_workers"])),
             persistent_workers=cfg["data"].get("persistent_workers"),
@@ -792,8 +797,13 @@ def train(cfg, args):
             mask_max_coverage=cfg["data"]["mask_max_coverage"],
             val_dir=val_dir,
             manifest_path=manifest_path,
+            deterministic=deterministic_overfit,
+            fixed_mask_seed=cfg["training"]["seed"],
+            shuffle_override=False,
         )
         print(f"Validation images: {len(eval_loader.dataset)}")
+        if deterministic_overfit:
+            print("Overfit eval uses the same deterministic training subset and masks.")
 
     # Training params
     total_steps = args.steps if args.steps else cfg["training"]["total_steps"]

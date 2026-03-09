@@ -93,10 +93,14 @@ class InpaintingDataset(Dataset):
         max_images: Optional[int] = None,
         val_dir: Optional[str] = None,
         manifest_path: Optional[str] = None,
+        deterministic: bool = False,
+        fixed_mask_seed: int = 0,
     ):
         self.image_size = image_size
         self.split = split
         self.manifest_path = Path(manifest_path) if manifest_path else None
+        self.deterministic = deterministic
+        self.fixed_mask_seed = int(fixed_mask_seed)
 
         if self.manifest_path is not None:
             self.samples = _load_manifest(self.manifest_path, split)
@@ -155,7 +159,7 @@ class InpaintingDataset(Dataset):
         image, mask = self._resize_if_needed(image, mask)
         w, h = image.size
 
-        if self.split == "train":
+        if self.split == "train" and not self.deterministic:
             x = np.random.randint(0, w - self.image_size + 1)
             y = np.random.randint(0, h - self.image_size + 1)
         else:
@@ -167,7 +171,7 @@ class InpaintingDataset(Dataset):
         if mask is not None:
             mask = mask.crop(box)
 
-        if self.split == "train" and np.random.rand() < 0.5:
+        if self.split == "train" and not self.deterministic and np.random.rand() < 0.5:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
             if mask is not None:
                 mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
@@ -185,7 +189,7 @@ class InpaintingDataset(Dataset):
         image = image.resize((self.image_size, self.image_size), Image.BICUBIC)
         mask = mask.resize((self.image_size, self.image_size), Image.NEAREST)
 
-        if self.split == "train" and np.random.rand() < 0.5:
+        if self.split == "train" and not self.deterministic and np.random.rand() < 0.5:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
             mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
 
@@ -212,7 +216,10 @@ class InpaintingDataset(Dataset):
             mask = TF.to_tensor(mask_img)
             mask = (mask > 0.5).float()
         else:
-            mask_np = self.mask_gen()
+            rng = None
+            if self.deterministic:
+                rng = np.random.RandomState(self.fixed_mask_seed + idx)
+            mask_np = self.mask_gen(rng=rng)
             mask = torch.from_numpy(mask_np).unsqueeze(0)
 
         masked_image = image * (1 - mask)
@@ -238,6 +245,9 @@ def get_dataloader(
     mask_max_coverage: float = 0.5,
     val_dir: Optional[str] = None,
     manifest_path: Optional[str] = None,
+    deterministic: bool = False,
+    fixed_mask_seed: int = 0,
+    shuffle_override: Optional[bool] = None,
 ):
     """Create a DataLoader for inpainting training/evaluation."""
     dataset = InpaintingDataset(
@@ -249,14 +259,16 @@ def get_dataloader(
         max_images=max_images,
         val_dir=val_dir,
         manifest_path=manifest_path,
+        deterministic=deterministic,
+        fixed_mask_seed=fixed_mask_seed,
     )
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": batch_size,
-        "shuffle": (split == "train"),
+        "shuffle": (split == "train") if shuffle_override is None else shuffle_override,
         "num_workers": num_workers,
         "pin_memory": True,
-        "drop_last": (split == "train"),
+        "drop_last": ((split == "train") if shuffle_override is None else shuffle_override),
     }
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = (
