@@ -209,19 +209,20 @@ def validate_joint_hr_pipeline(cfg, model):
 
 def compute_hr_refined(attn_upscaler, batch_views, refined_lr, attn_map):
     """Run the attention upscaler and preserve known HR pixels exactly."""
+    refined_lr = refined_lr.clamp(0, 1)
     hr_refined_raw = attn_upscaler(
         batch_views["masked_image_hr"],
         refined_lr,
         attn_map,
         mask_hr=batch_views["mask_hr"],
-    )
+    ).clamp(0, 1)
     hr_refined = composite_with_known(hr_refined_raw, batch_views["image_hr"], batch_views["mask_hr"])
     hr_base_raw = F.interpolate(
         refined_lr,
         size=batch_views["image_hr"].shape[-2:],
         mode="bicubic",
         align_corners=False,
-    )
+    ).clamp(0, 1)
     hr_base = composite_with_known(hr_base_raw, batch_views["image_hr"], batch_views["mask_hr"])
     return hr_refined_raw, hr_refined, hr_base_raw, hr_base
 
@@ -273,7 +274,9 @@ def compute_train_loss(
     hr_l1_refined = zero
     hr_perceptual = zero
     hr_style = zero
-    refined_for_perceptual = refined_composite if refined_composite is not None else refined_raw
+    refined_for_perceptual = (
+        refined_composite if refined_composite is not None else refined_raw.clamp(0, 1)
+    ).clamp(0, 1)
 
     if criterion.perceptual_weight > 0:
         perceptual = criterion.perceptual_loss(refined_for_perceptual, target)
@@ -287,7 +290,7 @@ def compute_train_loss(
     ):
         hr_for_perceptual = (
             hr_refined_composite if hr_refined_composite is not None else hr_refined_raw
-        )
+        ).clamp(0, 1)
         if criterion.hr_refined_weight > 0:
             # HR inference restores known pixels after attention transfer, so the
             # HR L1 term should supervise that same composited prediction.
@@ -302,9 +305,9 @@ def compute_train_loss(
         + refinement_loss_scale * criterion.refined_weight * l1_refined
         + refinement_loss_scale * criterion.perceptual_weight * perceptual
         + refinement_loss_scale * criterion.style_weight * style
-        + criterion.hr_refined_weight * hr_l1_refined
-        + criterion.hr_perceptual_weight * hr_perceptual
-        + criterion.hr_style_weight * hr_style
+        + refinement_loss_scale * criterion.hr_refined_weight * hr_l1_refined
+        + refinement_loss_scale * criterion.hr_perceptual_weight * hr_perceptual
+        + refinement_loss_scale * criterion.hr_style_weight * hr_style
     )
 
     loss_dict = {
@@ -902,8 +905,8 @@ def train(cfg, args):
             # Forward
             with torch.amp.autocast(device.type, enabled=use_amp):
                 refined_raw, attn, coarse_raw = model(masked_image, mask)
-                coarse = composite_with_known(coarse_raw, image, mask)
-                refined = composite_with_known(refined_raw, image, mask)
+                coarse = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
+                refined = composite_with_known(refined_raw.clamp(0, 1), image, mask)
                 hr_refined_raw = None
                 hr_refined = None
                 if joint_hr_pipeline and batch_views["has_hr_supervision"]:
@@ -919,7 +922,7 @@ def train(cfg, args):
                     refined_raw,
                     image,
                     mask,
-                    refinement_loss_scale=1.0,
+                    refinement_loss_scale=refinement_scale,
                     refined_composite=refined,
                     hr_refined_raw=hr_refined_raw,
                     hr_target=batch_views["image_hr"] if hr_refined_raw is not None else None,
