@@ -53,6 +53,18 @@ def gram_matrix(x):
         return gram / (c * h * w)
 
 
+def masked_gram_matrix(x, mask):
+    """Compute a Gram matrix over only the masked spatial support."""
+    with torch.amp.autocast(get_autocast_device_type(x.device), enabled=False):
+        b, c, h, w = x.shape
+        mask = F.interpolate(mask.float(), size=(h, w), mode="nearest")
+        mask = mask.view(b, 1, h * w)
+        f = x.float().view(b, c, h * w) * mask
+        gram = torch.bmm(f, f.transpose(1, 2))
+        denom = (c * mask.sum(dim=2, keepdim=True)).clamp_min(1e-6)
+        return gram / denom
+
+
 class PerceptualLoss(nn.Module):
     """Perceptual loss: L1 between VGG features of prediction and target."""
 
@@ -73,19 +85,25 @@ class PerceptualLoss(nn.Module):
 
 
 class StyleLoss(nn.Module):
-    """Style loss: L1 between Gram matrices of VGG features."""
+    """Style loss: L1 between VGG Gram matrices, optionally over the hole only."""
 
     def __init__(self, weights=(1.0, 1.0, 1.0, 1.0)):
         super().__init__()
         self.vgg = VGGFeatureExtractor()
         self.weights = weights
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, mask=None):
         pred_features = self.vgg(pred)
         with torch.no_grad():
             target_features = self.vgg(target)
 
         loss = 0
         for w, pf, tf in zip(self.weights, pred_features, target_features):
-            loss += w * F.l1_loss(gram_matrix(pf), gram_matrix(tf))
+            if mask is None:
+                pred_gram = gram_matrix(pf)
+                target_gram = gram_matrix(tf)
+            else:
+                pred_gram = masked_gram_matrix(pf, mask)
+                target_gram = masked_gram_matrix(tf, mask)
+            loss += w * F.l1_loss(pred_gram, target_gram)
         return loss

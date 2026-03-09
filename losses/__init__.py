@@ -10,8 +10,8 @@ from losses.perceptual import PerceptualLoss, StyleLoss
 class InpaintingLoss(nn.Module):
     """Combined loss for RETHINED: masked L1 + perceptual.
 
-    Style loss stays configurable, but defaults to off because its weighting is
-    unspecified by the paper.
+    Style loss is mask-aware when enabled, but still defaults to off because
+    its weighting is unspecified by the paper.
     """
 
     def __init__(

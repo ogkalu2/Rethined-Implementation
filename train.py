@@ -278,7 +278,7 @@ def compute_train_loss(
     if criterion.perceptual_weight > 0:
         perceptual = criterion.perceptual_loss(refined_for_perceptual, target)
     if criterion.style_weight > 0:
-        style = criterion.style_loss(refined_for_perceptual, target)
+        style = criterion.style_loss(refined_for_perceptual, target, mask=mask)
 
     if (
         hr_refined_raw is not None
@@ -295,7 +295,7 @@ def compute_train_loss(
         if criterion.hr_perceptual_weight > 0:
             hr_perceptual = criterion.perceptual_loss(hr_for_perceptual, hr_target)
         if criterion.hr_style_weight > 0:
-            hr_style = criterion.style_loss(hr_for_perceptual, hr_target)
+            hr_style = criterion.style_loss(hr_for_perceptual, hr_target, mask=hr_mask)
 
     total = (
         criterion.coarse_weight * l1_coarse
