@@ -151,6 +151,53 @@ def _fuse_conv_bn_pair(conv: nn.Module, bn: nn.Module) -> tuple[nn.Module, nn.Mo
     return fuse_conv_bn_eval(conv.eval(), bn.eval()), nn.Identity()
 
 
+def _fuse_conv_bn_to_weight_bias(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the fused kernel and bias tensors for a Conv2d+BN branch."""
+    fused = fuse_conv_bn_eval(conv.eval(), bn.eval())
+    return fused.weight.detach().clone(), fused.bias.detach().clone()
+
+
+def _pad_kernel_to_size(kernel: torch.Tensor, target_size: int) -> torch.Tensor:
+    """Center-pad a smaller spatial kernel to a target square size."""
+    current_size = kernel.shape[-1]
+    if current_size == target_size:
+        return kernel
+    if current_size > target_size or (target_size - current_size) % 2 != 0:
+        raise ValueError(f"Cannot pad kernel {current_size} to target {target_size}")
+    pad = (target_size - current_size) // 2
+    return F.pad(kernel, [pad, pad, pad, pad])
+
+
+def _fuse_identity_bn_to_weight_bias(
+    num_channels: int,
+    bn: nn.BatchNorm2d,
+    kernel_size: int,
+    groups: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return the fused kernel and bias tensors for an identity+BN branch."""
+    if num_channels % groups != 0:
+        raise ValueError(f"Identity fusion expects num_channels divisible by groups (got {num_channels}, {groups})")
+
+    input_dim = num_channels // groups
+    kernel = torch.zeros(
+        (num_channels, input_dim, kernel_size, kernel_size),
+        dtype=bn.weight.dtype,
+        device=bn.weight.device,
+    )
+    center = kernel_size // 2
+    channel_idx = torch.arange(num_channels, device=kernel.device)
+    kernel[channel_idx, channel_idx % input_dim, center, center] = 1.0
+
+    gamma = bn.weight.detach()
+    beta = bn.bias.detach()
+    mean = bn.running_mean.detach()
+    var = bn.running_var.detach()
+    std = torch.sqrt(var + bn.eps)
+    scale = (gamma / std).reshape(-1, 1, 1, 1)
+    bias = beta - mean * gamma / std
+    return kernel * scale, bias
+
+
 class PatchInpainting(nn.Module):
     def __init__(
         self,
@@ -575,6 +622,113 @@ class DepthwiseSeparableBlock(nn.Module):
         return self
 
 
+class RepDepthwiseSeparableBlock(nn.Module):
+    """Depthwise-separable block with a reparameterizable multi-branch depthwise stage."""
+
+    def __init__(self, in_channels: int, out_channels: int, stride: int = 1, use_residual: bool = True):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.stride = int(stride)
+        self.use_residual = use_residual
+        self.activation = nn.ReLU(inplace=True)
+
+        self.depthwise = nn.Conv2d(
+            self.in_channels,
+            self.in_channels,
+            kernel_size=3,
+            stride=self.stride,
+            padding=1,
+            groups=self.in_channels,
+            bias=False,
+        )
+        self.depthwise_bn = nn.BatchNorm2d(self.in_channels)
+
+        self.depthwise_scale = nn.Conv2d(
+            self.in_channels,
+            self.in_channels,
+            kernel_size=1,
+            stride=self.stride,
+            padding=0,
+            groups=self.in_channels,
+            bias=False,
+        )
+        self.depthwise_scale_bn = nn.BatchNorm2d(self.in_channels)
+        nn.init.zeros_(self.depthwise_scale_bn.weight)
+        nn.init.zeros_(self.depthwise_scale_bn.bias)
+
+        self.depthwise_identity_bn = None
+        if self.stride == 1:
+            self.depthwise_identity_bn = nn.BatchNorm2d(self.in_channels)
+            nn.init.zeros_(self.depthwise_identity_bn.weight)
+            nn.init.zeros_(self.depthwise_identity_bn.bias)
+
+        self.pointwise = nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, bias=False)
+        self.pointwise_bn = nn.BatchNorm2d(self.out_channels)
+
+        self.proj = None
+        if self.use_residual and (self.stride != 1 or self.in_channels != self.out_channels):
+            self.proj = nn.Sequential(
+                nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, stride=self.stride, bias=False),
+                nn.BatchNorm2d(self.out_channels),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = self.depthwise_bn(self.depthwise(x))
+        if self.depthwise_scale is not None:
+            out = out + self.depthwise_scale_bn(self.depthwise_scale(x))
+        if self.depthwise_identity_bn is not None:
+            out = out + self.depthwise_identity_bn(x)
+        out = self.activation(out)
+
+        out = self.pointwise_bn(self.pointwise(out))
+        if self.use_residual:
+            if self.proj is not None:
+                residual = self.proj(residual)
+            out = out + residual
+        return self.activation(out)
+
+    def reparameterize(self):
+        dw_kernel, dw_bias = _fuse_conv_bn_to_weight_bias(self.depthwise, self.depthwise_bn)
+        scale_kernel, scale_bias = _fuse_conv_bn_to_weight_bias(self.depthwise_scale, self.depthwise_scale_bn)
+        dw_kernel = dw_kernel + _pad_kernel_to_size(scale_kernel, target_size=3)
+        dw_bias = dw_bias + scale_bias
+        if self.depthwise_identity_bn is not None:
+            id_kernel, id_bias = _fuse_identity_bn_to_weight_bias(
+                num_channels=self.in_channels,
+                bn=self.depthwise_identity_bn,
+                kernel_size=3,
+                groups=self.in_channels,
+            )
+            dw_kernel = dw_kernel + id_kernel
+            dw_bias = dw_bias + id_bias
+
+        fused_depthwise = nn.Conv2d(
+            self.in_channels,
+            self.in_channels,
+            kernel_size=3,
+            stride=self.stride,
+            padding=1,
+            groups=self.in_channels,
+            bias=True,
+        ).to(device=dw_kernel.device, dtype=dw_kernel.dtype)
+        fused_depthwise.weight.data.copy_(dw_kernel)
+        fused_depthwise.bias.data.copy_(dw_bias)
+        self.depthwise = fused_depthwise
+        self.depthwise_bn = nn.Identity()
+        self.depthwise_scale = None
+        self.depthwise_scale_bn = None
+        self.depthwise_identity_bn = None
+
+        self.pointwise, self.pointwise_bn = _fuse_conv_bn_pair(self.pointwise, self.pointwise_bn)
+        if isinstance(self.proj, nn.Sequential) and len(self.proj) == 2:
+            fused_proj, proj_bn = _fuse_conv_bn_pair(self.proj[0], self.proj[1])
+            if isinstance(proj_bn, nn.Identity):
+                self.proj = fused_proj
+        return self
+
+
 class HRResidualRefiner(nn.Module):
     """Patch-grid HR residual corrector with compute tied to the LR query grid."""
 
@@ -698,10 +852,10 @@ class HRResidualRefiner(nn.Module):
 
 
 class PaperEncoderStage(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, in_channels: int, out_channels: int, block_cls: type[nn.Module] = DepthwiseSeparableBlock):
         super().__init__()
-        self.down = DepthwiseSeparableBlock(in_channels, out_channels, stride=2, use_residual=True)
-        self.refine = DepthwiseSeparableBlock(out_channels, out_channels, stride=1, use_residual=True)
+        self.down = block_cls(in_channels, out_channels, stride=2, use_residual=True)
+        self.refine = block_cls(out_channels, out_channels, stride=1, use_residual=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.down(x)
@@ -714,15 +868,21 @@ class PaperEncoderStage(nn.Module):
 
 
 class PaperUpBlock(nn.Module):
-    def __init__(self, in_channels: int, skip_channels: int, out_channels: int):
+    def __init__(
+        self,
+        in_channels: int,
+        skip_channels: int,
+        out_channels: int,
+        block_cls: type[nn.Module] = DepthwiseSeparableBlock,
+    ):
         super().__init__()
-        self.block1 = DepthwiseSeparableBlock(
+        self.block1 = block_cls(
             in_channels + skip_channels,
             out_channels,
             stride=1,
             use_residual=True,
         )
-        self.block2 = DepthwiseSeparableBlock(out_channels, out_channels, stride=1, use_residual=True)
+        self.block2 = block_cls(out_channels, out_channels, stride=1, use_residual=True)
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
@@ -737,7 +897,7 @@ class PaperUpBlock(nn.Module):
 
 
 class PaperCoarse(nn.Module):
-    def __init__(self, channels=None, head_channels: int = 32, **kwargs):
+    def __init__(self, channels=None, head_channels: int = 32, use_rep_blocks: bool = False, **kwargs):
         super().__init__()
         if kwargs:
             raise ValueError(f"Unsupported PaperCoarse arguments: {sorted(kwargs)}")
@@ -749,19 +909,21 @@ class PaperCoarse(nn.Module):
 
         c0, c1, c2, c3, c4 = [int(c) for c in channels]
         self.feature_channels = [c0, c1, c2, c3, c4]
+        self.use_rep_blocks = bool(use_rep_blocks)
+        block_cls = RepDepthwiseSeparableBlock if self.use_rep_blocks else DepthwiseSeparableBlock
 
-        self.stage0 = PaperEncoderStage(3, c0)
-        self.stage1 = PaperEncoderStage(c0, c1)
-        self.stage2 = PaperEncoderStage(c1, c2)
-        self.stage3 = PaperEncoderStage(c2, c3)
-        self.stage4 = PaperEncoderStage(c3, c4)
+        self.stage0 = PaperEncoderStage(3, c0, block_cls=block_cls)
+        self.stage1 = PaperEncoderStage(c0, c1, block_cls=block_cls)
+        self.stage2 = PaperEncoderStage(c1, c2, block_cls=block_cls)
+        self.stage3 = PaperEncoderStage(c2, c3, block_cls=block_cls)
+        self.stage4 = PaperEncoderStage(c3, c4, block_cls=block_cls)
 
-        self.up4 = PaperUpBlock(c4, c3, c3)
-        self.up3 = PaperUpBlock(c3, c2, c2)
-        self.up2 = PaperUpBlock(c2, c1, c1)
-        self.up1 = PaperUpBlock(c1, c0, c0)
+        self.up4 = PaperUpBlock(c4, c3, c3, block_cls=block_cls)
+        self.up3 = PaperUpBlock(c3, c2, c2, block_cls=block_cls)
+        self.up2 = PaperUpBlock(c2, c1, c1, block_cls=block_cls)
+        self.up1 = PaperUpBlock(c1, c0, c0, block_cls=block_cls)
         self.head_channels = int(head_channels)
-        self.head_block = DepthwiseSeparableBlock(c0 + 3, self.head_channels, stride=1, use_residual=True)
+        self.head_block = block_cls(c0 + 3, self.head_channels, stride=1, use_residual=True)
         self.out_conv = nn.Conv2d(self.head_channels, 3, kernel_size=1)
         self.sigmoid = nn.Sigmoid()
 

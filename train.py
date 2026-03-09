@@ -95,6 +95,11 @@ def load_model_checkpoint(model, state_dict):
     filtered_state = {}
     dropped_shape_mismatches = []
     allowed_prefixes = ("generator.hr_",)
+    allowed_missing_substrings = (
+        ".depthwise_scale.",
+        ".depthwise_scale_bn.",
+        ".depthwise_identity_bn.",
+    )
     for key, value in state_dict.items():
         if key not in model_state:
             filtered_state[key] = value
@@ -110,7 +115,10 @@ def load_model_checkpoint(model, state_dict):
         filtered_state[key] = value
 
     incompatible = model.load_state_dict(filtered_state, strict=False)
-    missing = [k for k in incompatible.missing_keys if not k.startswith(allowed_prefixes)]
+    missing = [
+        k for k in incompatible.missing_keys
+        if not k.startswith(allowed_prefixes) and not any(token in k for token in allowed_missing_substrings)
+    ]
     unexpected = [k for k in incompatible.unexpected_keys if not k.startswith(allowed_prefixes)]
     if missing or unexpected:
         problems = []
@@ -120,7 +128,7 @@ def load_model_checkpoint(model, state_dict):
             problems.append(f"unexpected keys: {unexpected}")
         raise RuntimeError("Checkpoint/model mismatch: " + "; ".join(problems))
     if incompatible.missing_keys or dropped_shape_mismatches:
-        print("Initialized new HR rescoring parameters from scratch.")
+        print("Initialized new HR/rep-branch parameters from scratch.")
 
 
 def composite_with_known(pred, target, mask):
