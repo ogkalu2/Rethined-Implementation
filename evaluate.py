@@ -46,7 +46,7 @@ def build_model_config(cfg):
     coarse_cfg = cfg["model"]["coarse_model"]
     return {
         "coarse_model": {
-            "class": coarse_cfg.get("class", "MobileOneCoarse"),
+            "class": coarse_cfg.get("class", "PaperCoarse"),
             "parameters": {k: v for k, v in coarse_cfg.items() if k != "class"},
         },
         "generator": {

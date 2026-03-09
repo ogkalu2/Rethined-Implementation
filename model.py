@@ -6,8 +6,6 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from mobileone import MobileOne, PARAMS, reparameterize_model
-
 
 class NativeGaussianBlur2d(nn.Module):
     """Drop-in replacement for kornia.filters.GaussianBlur2d.
@@ -668,65 +666,7 @@ class PaperCoarse(nn.Module):
         return self
 
 
-class MobileOneCoarse(nn.Module):
-    def __init__(self, variant='s4', **kwargs):
-        super().__init__()
-        if variant not in PARAMS:
-            raise ValueError(f"Unsupported MobileOne variant: {variant}")
-
-        variant_params = dict(PARAMS[variant])
-        variant_params.update(kwargs)
-        width_multipliers = variant_params["width_multipliers"]
-        stage0_channels = min(64, int(64 * width_multipliers[0]))
-        stage1_channels = int(64 * width_multipliers[0])
-        stage2_channels = int(128 * width_multipliers[1])
-        stage3_channels = int(256 * width_multipliers[2])
-        stage4_channels = int(512 * width_multipliers[3])
-        self.feature_channels = [
-            stage0_channels,
-            stage1_channels,
-            stage2_channels,
-            stage3_channels,
-            stage4_channels,
-        ]
-
-        self.model = MobileOne(**variant_params)
-        self.d4 = nn.ConvTranspose2d(stage4_channels, stage3_channels, kernel_size=4, stride=2, padding=1)
-        self.d3 = nn.ConvTranspose2d(stage3_channels + stage3_channels, stage2_channels, kernel_size=4, stride=2, padding=1)
-        self.d2 = nn.ConvTranspose2d(stage2_channels + stage2_channels, stage1_channels, kernel_size=4, stride=2, padding=1)
-        self.d1 = nn.ConvTranspose2d(stage1_channels + stage1_channels, stage0_channels, kernel_size=4, stride=2, padding=1)
-        self.d0 = nn.ConvTranspose2d(stage0_channels + stage0_channels, 3, kernel_size=4, stride=2, padding=1)
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        features = []
-        x0 = self.model.stage0(x)
-        features.append(x0)
-        x1 = self.model.stage1(x0)
-        features.append(x1)
-        x2 = self.model.stage2(x1)
-        features.append(x2)
-        x3 = self.model.stage3(x2)
-        features.append(x3)
-        x4 = self.model.stage4(x3)
-        features.append(x4)
-
-        out = self.relu(self.d4(x4))
-        out = torch.cat([out, x3], dim=1)
-        out = self.relu(self.d3(out))
-        out = torch.cat([out, x2], dim=1)
-        out = self.relu(self.d2(out))
-        out = torch.cat([out, x1], dim=1)
-        out = self.relu(self.d1(out))
-        out = torch.cat([out, x0], dim=1)
-        out = self.sigmoid(self.d0(out))
-
-        return out, features
-
-
 COARSE_MODEL_REGISTRY = {
-    "MobileOneCoarse": MobileOneCoarse,
     "PaperCoarse": PaperCoarse,
 }
 
@@ -898,7 +838,7 @@ class AttentionUpscaling(nn.Module):
 class InpaintingModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        coarse_class_name = config['coarse_model'].get('class', 'MobileOneCoarse')
+        coarse_class_name = config['coarse_model'].get('class', 'PaperCoarse')
         coarse_class = COARSE_MODEL_REGISTRY.get(coarse_class_name)
         if coarse_class is None:
             raise ValueError(f"Unsupported coarse model class: {coarse_class_name}")
@@ -930,13 +870,7 @@ class InpaintingModel(nn.Module):
         return self.generator(image, mask)
 
     def reparameterize(self):
-        """Fuse MobileOne multi-branch+BN into single conv for inference.
-
-        This is a one-way operation — the model can no longer be trained after this.
-        Call after loading checkpoint, before inference.
-        """
+        """Apply any model-specific inference-time reparameterization."""
         if hasattr(self.coarse_model, 'reparameterize'):
             self.coarse_model.reparameterize()
-        elif hasattr(self.coarse_model, 'model'):
-            self.coarse_model.model = reparameterize_model(self.coarse_model.model)
         return self
