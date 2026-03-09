@@ -68,6 +68,7 @@ training:
   seed: 42
   joint_hr_pipeline: true
   freeze_coarse: false
+  auto_freeze_coarse: true
 
 loss:
   coarse_weight: 1.0
@@ -79,6 +80,8 @@ loss:
   hr_refined_weight: 2.0
   hr_perceptual_weight: 0.1
   hr_style_weight: 0.0
+  gain_ratio_weight: 0.25
+  hr_gain_ratio_weight: 1.0
 
 logging:
   log_dir: "logs/train_supercaf_1024_to_512_papercoarse_ultrafast"

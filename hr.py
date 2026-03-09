@@ -241,28 +241,62 @@ class AttentionUpscaling(nn.Module):
         hr_patches, _ = self.patch_inpainting.unfold_native(x_hr, hr_patch_size)
         hr_base_blurred = self.patch_inpainting.final_gaussian_blur(x_hr_base)
         hr_base_patches, _ = self.patch_inpainting.unfold_native(x_hr_base, hr_patch_size)
+        hr_base_patches_blurred, _ = self.patch_inpainting.unfold_native(hr_base_blurred, hr_patch_size)
 
         hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
         hr_patches_blurred, _ = self.patch_inpainting.unfold_native(hr_blurred, hr_patch_size)
 
         hr_hf_patches_full = hr_patches - hr_patches_blurred
+        hr_base_hf_patches_full = hr_base_patches - hr_base_patches_blurred
         hr_hf_patches = hr_hf_patches_full.flatten(start_dim=2).transpose(1, 2)
         hr_base_patches_flat = hr_base_patches.flatten(start_dim=2).transpose(1, 2)
+        hr_source_patches_flat = hr_patches.flatten(start_dim=2).transpose(1, 2)
+        grid_size = (hr_h // hr_patch_size, hr_w // hr_patch_size)
+        hr_mask_patches_flat = None
 
         hr_attn = attn_map.squeeze(1)
         if mask_hr is not None:
             hr_mask_patches, _ = self.patch_inpainting.unfold_native(mask_hr, hr_patch_size)
+            hr_mask_patches_flat = hr_mask_patches.flatten(start_dim=2).transpose(1, 2)
             hr_mask_ratio = hr_mask_patches.mean(dim=1, keepdim=True).flatten(start_dim=2).squeeze(1)
             valid_hr_keys = (hr_mask_ratio <= 1e-6).to(hr_attn.dtype)
             masked_hr_attn = hr_attn * valid_hr_keys.unsqueeze(1)
             masked_hr_attn_sum = masked_hr_attn.sum(dim=-1, keepdim=True)
             normalized_hr_attn = masked_hr_attn / masked_hr_attn_sum.clamp_min(1e-8)
             hr_attn = torch.where(masked_hr_attn_sum > 1e-8, normalized_hr_attn, hr_attn)
+        else:
+            hr_mask_patches_flat = hr_hf_patches.new_zeros(
+                hr_hf_patches.shape[0],
+                hr_hf_patches.shape[1],
+                hr_patch_size * hr_patch_size,
+            )
 
-        # Paper Sect. 3.4: transfer the LR attention map directly onto HR
-        # high-frequency tokens, then add them to the upsampled LR base.
-        reconstructed_hr_hf_patches = torch.matmul(hr_attn.to(hr_hf_patches.dtype), hr_hf_patches)
+        topk = min(self.patch_inpainting.hr_candidate_topk, hr_attn.size(-1))
+        rescored_hr_hf_patches = self._rescore_topk_attention(
+            hr_attn,
+            hr_hf_patches_full,
+            hr_base_hf_patches_full,
+            topk=topk,
+        )
+
+        refinement_scale = self.patch_inpainting.refinement_runtime_scale
+        confidence = self.patch_inpainting.last_refinement_confidence
+        if confidence is not None:
+            reconstructed_hr_hf_patches = refinement_scale * confidence * rescored_hr_hf_patches
+        else:
+            reconstructed_hr_hf_patches = refinement_scale * rescored_hr_hf_patches
         final_hr_patches = hr_base_patches_flat + reconstructed_hr_hf_patches
+        if self.patch_inpainting.hr_residual_refiner is not None:
+            hr_residual_patches = self.patch_inpainting.hr_residual_refiner(
+                candidate_patches_flat=final_hr_patches,
+                base_patches_flat=hr_base_patches_flat,
+                transferred_hf_patches_flat=reconstructed_hr_hf_patches,
+                source_patches_flat=hr_source_patches_flat,
+                mask_patches_flat=hr_mask_patches_flat,
+                patch_size=hr_patch_size,
+                grid_size=grid_size,
+            )
+            final_hr_patches = final_hr_patches + hr_residual_patches
 
         final_hr_image = self.patch_inpainting.fold_native(
             final_hr_patches,

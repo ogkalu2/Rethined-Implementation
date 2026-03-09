@@ -247,6 +247,12 @@ def should_freeze_coarse(step, initial_freeze_coarse, coarse_freeze_step=None):
     return step >= coarse_freeze_step
 
 
+def masked_l1_per_sample(pred, target, mask):
+    """Per-sample masked L1 aligned with the reported gain metrics."""
+    denom = (mask.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp_min(1e-8)
+    return (torch.abs(pred - target) * mask).sum(dim=(1, 2, 3)) / denom
+
+
 def compute_train_loss(
     criterion,
     coarse_raw,
@@ -254,10 +260,12 @@ def compute_train_loss(
     target,
     mask,
     refinement_loss_scale=1.0,
+    coarse_composite=None,
     refined_composite=None,
     hr_refined_raw=None,
     hr_target=None,
     hr_mask=None,
+    hr_base_composite=None,
     hr_refined_composite=None,
 ):
     """Compute the paper-path training loss.
@@ -274,6 +282,8 @@ def compute_train_loss(
     hr_l1_refined = zero
     hr_perceptual = zero
     hr_style = zero
+    gain_ratio = zero
+    hr_gain_ratio = zero
     refined_for_perceptual = (
         refined_composite if refined_composite is not None else refined_raw.clamp(0, 1)
     ).clamp(0, 1)
@@ -282,6 +292,15 @@ def compute_train_loss(
         perceptual = criterion.perceptual_loss(refined_for_perceptual, target)
     if criterion.style_weight > 0:
         style = criterion.style_loss(refined_for_perceptual, target)
+
+    if (
+        criterion.gain_ratio_weight > 0
+        and coarse_composite is not None
+        and refined_composite is not None
+    ):
+        coarse_hole = masked_l1_per_sample(coarse_composite, target, mask).detach()
+        refined_hole = masked_l1_per_sample(refined_composite, target, mask)
+        gain_ratio = (refined_hole / coarse_hole.clamp_min(1e-4)).mean()
 
     if (
         hr_refined_raw is not None
@@ -299,6 +318,10 @@ def compute_train_loss(
             hr_perceptual = criterion.perceptual_loss(hr_for_perceptual, hr_target)
         if criterion.hr_style_weight > 0:
             hr_style = criterion.style_loss(hr_for_perceptual, hr_target)
+        if criterion.hr_gain_ratio_weight > 0 and hr_base_composite is not None:
+            hr_base_hole = masked_l1_per_sample(hr_base_composite, hr_target, hr_mask).detach()
+            hr_refined_hole = masked_l1_per_sample(hr_for_perceptual, hr_target, hr_mask)
+            hr_gain_ratio = (hr_refined_hole / hr_base_hole.clamp_min(1e-4)).mean()
 
     total = (
         criterion.coarse_weight * l1_coarse
@@ -308,6 +331,8 @@ def compute_train_loss(
         + refinement_loss_scale * criterion.hr_refined_weight * hr_l1_refined
         + refinement_loss_scale * criterion.hr_perceptual_weight * hr_perceptual
         + refinement_loss_scale * criterion.hr_style_weight * hr_style
+        + refinement_loss_scale * criterion.gain_ratio_weight * gain_ratio
+        + refinement_loss_scale * criterion.hr_gain_ratio_weight * hr_gain_ratio
     )
 
     loss_dict = {
@@ -318,6 +343,8 @@ def compute_train_loss(
         "hr_l1_refined": hr_l1_refined.item(),
         "hr_perceptual": hr_perceptual.item(),
         "hr_style": hr_style.item(),
+        "gain_ratio": gain_ratio.item(),
+        "hr_gain_ratio": hr_gain_ratio.item(),
         "total": total.item(),
     }
     return total, loss_dict
@@ -818,6 +845,9 @@ def train(cfg, args):
     refinement_start_step = cfg["training"].get("refinement_start_step", 0)
     refinement_warmup_steps = cfg["training"].get("refinement_warmup_steps", 0)
     coarse_freeze_step = cfg["training"].get("coarse_freeze_step")
+    auto_freeze_coarse = cfg["training"].get("auto_freeze_coarse", joint_hr_pipeline)
+    if coarse_freeze_step is None and auto_freeze_coarse:
+        coarse_freeze_step = refinement_start_step + max(refinement_warmup_steps, 1)
     # Logging
     log_cfg = cfg["logging"]
     eval_interval = log_cfg.get("eval_interval", 0)
@@ -859,6 +889,8 @@ def train(cfg, args):
         "hr_l1_refined": 0.0,
         "hr_perceptual": 0.0,
         "hr_style": 0.0,
+        "gain_ratio": 0.0,
+        "hr_gain_ratio": 0.0,
         "total": 0.0,
     }
     coarse = None
@@ -909,8 +941,9 @@ def train(cfg, args):
                 refined = composite_with_known(refined_raw.clamp(0, 1), image, mask)
                 hr_refined_raw = None
                 hr_refined = None
+                hr_base = None
                 if joint_hr_pipeline and batch_views["has_hr_supervision"]:
-                    hr_refined_raw, hr_refined, _, _ = compute_hr_refined(
+                    hr_refined_raw, hr_refined, _, hr_base = compute_hr_refined(
                         attn_upscaler,
                         batch_views,
                         refined,
@@ -923,10 +956,12 @@ def train(cfg, args):
                     image,
                     mask,
                     refinement_loss_scale=refinement_scale,
+                    coarse_composite=coarse,
                     refined_composite=refined,
                     hr_refined_raw=hr_refined_raw,
                     hr_target=batch_views["image_hr"] if hr_refined_raw is not None else None,
                     hr_mask=batch_views["mask_hr"] if hr_refined_raw is not None else None,
+                    hr_base_composite=hr_base,
                     hr_refined_composite=hr_refined,
                 )
                 if not torch.isfinite(micro_loss):
@@ -968,6 +1003,8 @@ def train(cfg, args):
             writer.add_scalar("loss/hr_l1_refined", loss_dict["hr_l1_refined"], step)
             writer.add_scalar("loss/hr_perceptual", loss_dict["hr_perceptual"], step)
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
+            writer.add_scalar("loss/gain_ratio", loss_dict["gain_ratio"], step)
+            writer.add_scalar("loss/hr_gain_ratio", loss_dict["hr_gain_ratio"], step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("refinement_scale", refinement_scale, step)
             writer.add_scalar("refinement_lr", refinement_lr, step)
