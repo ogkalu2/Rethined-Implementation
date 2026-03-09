@@ -265,6 +265,7 @@ def compute_train_loss(
     hr_refined_raw=None,
     hr_target=None,
     hr_mask=None,
+    hr_base_raw=None,
     hr_base_composite=None,
     hr_refined_composite=None,
 ):
@@ -282,6 +283,7 @@ def compute_train_loss(
     hr_l1_refined = zero
     hr_perceptual = zero
     hr_style = zero
+    hr_delta = zero
     gain_ratio = zero
     hr_gain_ratio = zero
     refined_for_perceptual = (
@@ -314,6 +316,13 @@ def compute_train_loss(
             # HR inference restores known pixels after attention transfer, so the
             # HR L1 term should supervise that same composited prediction.
             hr_l1_refined = criterion.masked_l1(hr_for_perceptual, hr_target, hr_mask)
+        if criterion.hr_delta_weight > 0 and hr_base_raw is not None:
+            hr_base_raw_detached = hr_base_raw.detach()
+            hr_delta = criterion.masked_l1(
+                hr_refined_raw - hr_base_raw_detached,
+                hr_target - hr_base_raw_detached,
+                hr_mask,
+            )
         if criterion.hr_perceptual_weight > 0:
             hr_perceptual = criterion.perceptual_loss(hr_for_perceptual, hr_target)
         if criterion.hr_style_weight > 0:
@@ -329,6 +338,7 @@ def compute_train_loss(
         + refinement_loss_scale * criterion.perceptual_weight * perceptual
         + refinement_loss_scale * criterion.style_weight * style
         + refinement_loss_scale * criterion.hr_refined_weight * hr_l1_refined
+        + refinement_loss_scale * criterion.hr_delta_weight * hr_delta
         + refinement_loss_scale * criterion.hr_perceptual_weight * hr_perceptual
         + refinement_loss_scale * criterion.hr_style_weight * hr_style
         + refinement_loss_scale * criterion.gain_ratio_weight * gain_ratio
@@ -341,6 +351,7 @@ def compute_train_loss(
         "perceptual": perceptual.item(),
         "style": style.item(),
         "hr_l1_refined": hr_l1_refined.item(),
+        "hr_delta": hr_delta.item(),
         "hr_perceptual": hr_perceptual.item(),
         "hr_style": hr_style.item(),
         "gain_ratio": gain_ratio.item(),
@@ -887,6 +898,7 @@ def train(cfg, args):
         "perceptual": 0.0,
         "style": 0.0,
         "hr_l1_refined": 0.0,
+        "hr_delta": 0.0,
         "hr_perceptual": 0.0,
         "hr_style": 0.0,
         "gain_ratio": 0.0,
@@ -941,9 +953,10 @@ def train(cfg, args):
                 refined = composite_with_known(refined_raw.clamp(0, 1), image, mask)
                 hr_refined_raw = None
                 hr_refined = None
+                hr_base_raw = None
                 hr_base = None
                 if joint_hr_pipeline and batch_views["has_hr_supervision"]:
-                    hr_refined_raw, hr_refined, _, hr_base = compute_hr_refined(
+                    hr_refined_raw, hr_refined, hr_base_raw, hr_base = compute_hr_refined(
                         attn_upscaler,
                         batch_views,
                         refined,
@@ -961,6 +974,7 @@ def train(cfg, args):
                     hr_refined_raw=hr_refined_raw,
                     hr_target=batch_views["image_hr"] if hr_refined_raw is not None else None,
                     hr_mask=batch_views["mask_hr"] if hr_refined_raw is not None else None,
+                    hr_base_raw=hr_base_raw,
                     hr_base_composite=hr_base,
                     hr_refined_composite=hr_refined,
                 )
@@ -1001,6 +1015,7 @@ def train(cfg, args):
             writer.add_scalar("loss/perceptual", loss_dict["perceptual"], step)
             writer.add_scalar("loss/style", loss_dict["style"], step)
             writer.add_scalar("loss/hr_l1_refined", loss_dict["hr_l1_refined"], step)
+            writer.add_scalar("loss/hr_delta", loss_dict["hr_delta"], step)
             writer.add_scalar("loss/hr_perceptual", loss_dict["hr_perceptual"], step)
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
             writer.add_scalar("loss/gain_ratio", loss_dict["gain_ratio"], step)

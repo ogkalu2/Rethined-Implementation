@@ -23,10 +23,12 @@ class HRResidualRefiner(nn.Module):
         num_blocks: int = 4,
         template_size: int = 4,
         gain_limit: float = 0.35,
+        residual_limit: float = 0.10,
     ):
         super().__init__()
         self.template_size = max(1, int(template_size))
         self.gain_limit = max(0.0, float(gain_limit))
+        self.residual_limit = max(0.0, float(residual_limit))
         patch_hidden = max(8, hidden_channels // 2)
         self.patch_encoder = nn.Sequential(
             nn.Conv2d(in_channels, patch_hidden, kernel_size=3, padding=1, bias=False),
@@ -53,7 +55,7 @@ class HRResidualRefiner(nn.Module):
         )
         self.out_conv = nn.Conv2d(
             hidden_channels,
-            self.template_size * self.template_size,
+            4,
             kernel_size=1,
         )
         nn.init.zeros_(self.out_conv.weight)
@@ -138,22 +140,13 @@ class HRResidualRefiner(nn.Module):
         )
         encoded = self.blocks(encoded)
 
-        gate_template = self.out_conv(encoded)
-        gate_template = (
-            gate_template.permute(0, 2, 3, 1)
-            .contiguous()
-            .view(batch_size * num_patches, 1, self.template_size, self.template_size)
-        )
-        gate_logits = F.interpolate(
-            gate_template,
-            size=(patch_size, patch_size),
+        outputs = self.out_conv(encoded)
+        gate_image = F.interpolate(
+            outputs[:, :1],
+            size=(grid_h * patch_size, grid_w * patch_size),
             mode="bilinear",
             align_corners=False,
         )
-        mask = mask_patches_flat.reshape(batch_size * num_patches, 1, patch_size, patch_size)
-        gate_logits = gate_logits * mask
-        gate_logits = gate_logits.reshape(batch_size, num_patches, patch_size * patch_size)
-        gate_image = self._flat_to_image(gate_logits, channels=1, patch_size=patch_size, grid_size=grid_size)
         mask_image = self._flat_to_image(mask_patches_flat, channels=1, patch_size=patch_size, grid_size=grid_size)
         gate_image = 0.5 * gate_image + 0.5 * self.residual_smoother(gate_image)
         gate_image = gate_image * mask_image
@@ -166,8 +159,16 @@ class HRResidualRefiner(nn.Module):
         )
         gain = 1.0 + self.gain_limit * torch.tanh(gate_image)
         hf_delta_image = (gain - 1.0) * transferred_hf_image
-        hf_delta_image = hf_delta_image * mask_image
-        return self._image_to_flat(hf_delta_image, patch_size)
+        residual_image = F.interpolate(
+            outputs[:, 1:4],
+            size=(grid_h * patch_size, grid_w * patch_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        residual_image = 0.5 * residual_image + 0.5 * self.residual_smoother(residual_image)
+        residual_image = self.residual_limit * torch.tanh(residual_image)
+        total_delta_image = (hf_delta_image + residual_image) * mask_image
+        return self._image_to_flat(total_delta_image, patch_size)
 
     def reparameterize(self):
         if isinstance(self.patch_encoder, nn.Sequential) and len(self.patch_encoder) >= 5:

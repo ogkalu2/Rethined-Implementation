@@ -78,6 +78,7 @@ loss:
   perceptual_weight: 0.1
   style_weight: 0.0
   hr_refined_weight: 2.0
+  hr_delta_weight: 1.0
   hr_perceptual_weight: 0.1
   hr_style_weight: 0.0
   gain_ratio_weight: 0.25
