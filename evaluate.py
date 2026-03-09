@@ -183,62 +183,75 @@ def benchmark_speed(model, device, resolutions=(256, 512), num_runs=50, warmup=1
 
 
 @torch.no_grad()
-def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
+def benchmark_upscaling(
+    model,
+    device,
+    lr_res=256,
+    hr_resolutions=(512, 1024),
+    disable_hr_residual_refiner=False,
+    num_runs=30,
+    warmup=5,
+):
     """Benchmark AttentionUpscaling speed at higher resolutions."""
     attn_upscaler = AttentionUpscaling(model.generator)
     results = {}
     amp_enabled = is_amp_enabled(device, True)
+    original_hr_refiner = model.generator.hr_residual_refiner
+    if disable_hr_residual_refiner:
+        model.generator.hr_residual_refiner = None
 
-    # Generate LR input + attention map
-    dummy_lr = torch.randn(1, 3, lr_res, lr_res, device=device)
-    dummy_mask = torch.zeros(1, 1, lr_res, lr_res, device=device)
-    dummy_mask[:, :, lr_res//4:3*lr_res//4, lr_res//4:3*lr_res//4] = 1.0
+    try:
+        # Generate LR input + attention map
+        dummy_lr = torch.randn(1, 3, lr_res, lr_res, device=device)
+        dummy_mask = torch.zeros(1, 1, lr_res, lr_res, device=device)
+        dummy_mask[:, :, lr_res//4:3*lr_res//4, lr_res//4:3*lr_res//4] = 1.0
 
-    # Run LR inference to get attention map
-    with torch.amp.autocast(device.type, enabled=amp_enabled):
-        refined, attn_map, coarse = model(dummy_lr, dummy_mask)
+        # Run LR inference to get attention map
+        with torch.amp.autocast(device.type, enabled=amp_enabled):
+            refined, attn_map, coarse = model(dummy_lr, dummy_mask)
 
-    for hr_res in hr_resolutions:
-        try:
-            dummy_hr = torch.randn(1, 3, hr_res, hr_res, device=device)
-            dummy_hr_mask = torch.zeros(1, 1, hr_res, hr_res, device=device)
-            dummy_hr_mask[:, :, hr_res // 4:3 * hr_res // 4, hr_res // 4:3 * hr_res // 4] = 1.0
+        for hr_res in hr_resolutions:
+            try:
+                dummy_hr = torch.randn(1, 3, hr_res, hr_res, device=device)
+                dummy_hr_mask = torch.zeros(1, 1, hr_res, hr_res, device=device)
+                dummy_hr_mask[:, :, hr_res // 4:3 * hr_res // 4, hr_res // 4:3 * hr_res // 4] = 1.0
 
-            # Warmup
-            for _ in range(5):
-                with torch.amp.autocast(device.type, enabled=amp_enabled):
-                    _ = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
-
-            # Benchmark
-            latencies = []
-            for _ in range(30):
-                hr_out = None
-
-                def run_upscaler():
-                    nonlocal hr_out
+                # Warmup
+                for _ in range(warmup):
                     with torch.amp.autocast(device.type, enabled=amp_enabled):
-                        hr_out = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
+                        _ = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
 
-                latencies.append(time_device_call(run_upscaler, device))
+                # Benchmark
+                latencies = []
+                for _ in range(num_runs):
+                    hr_out = None
 
-            latencies = np.array(latencies)
-            results[str(hr_res)] = {
-                "mean_ms": float(np.mean(latencies)),
-                "p50_ms": float(np.percentile(latencies, 50)),
-                "p95_ms": float(np.percentile(latencies, 95)),
-                "output_shape": list(hr_out.shape),
-                "total_pipeline_ms": float(np.mean(latencies)) + results.get("lr_inference_ms", 0),
-            }
+                    def run_upscaler():
+                        nonlocal hr_out
+                        with torch.amp.autocast(device.type, enabled=amp_enabled):
+                            hr_out = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
 
-            del dummy_hr, dummy_hr_mask, hr_out
-            empty_device_cache(device)
+                    latencies.append(time_device_call(run_upscaler, device))
 
-        except RuntimeError as e:
-            results[str(hr_res)] = {"error": str(e)}
-            empty_device_cache(device)
+                latencies = np.array(latencies)
+                results[str(hr_res)] = {
+                    "mean_ms": float(np.mean(latencies)),
+                    "p50_ms": float(np.percentile(latencies, 50)),
+                    "p95_ms": float(np.percentile(latencies, 95)),
+                    "output_shape": list(hr_out.shape),
+                }
 
-    del dummy_lr, dummy_mask, refined, attn_map, coarse
-    empty_device_cache(device)
+                del dummy_hr, dummy_hr_mask, hr_out
+                empty_device_cache(device)
+
+            except RuntimeError as e:
+                results[str(hr_res)] = {"error": str(e)}
+                empty_device_cache(device)
+
+        del dummy_lr, dummy_mask, refined, attn_map, coarse
+        empty_device_cache(device)
+    finally:
+        model.generator.hr_residual_refiner = original_hr_refiner
 
     return results
 
@@ -304,7 +317,14 @@ def main():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_images", type=int, default=200)
     parser.add_argument("--speed_only", action="store_true")
+    parser.add_argument("--compare_hr_refiner", action="store_true")
     parser.add_argument("--upscale_test", action="store_true")
+    parser.add_argument("--speed_runs", type=int, default=50)
+    parser.add_argument("--speed_warmup", type=int, default=10)
+    parser.add_argument("--upscale_runs", type=int, default=30)
+    parser.add_argument("--upscale_warmup", type=int, default=5)
+    parser.add_argument("--hr_resolutions", type=str, default=None,
+                        help="Comma-separated HR resolutions for upscaling benchmark, e.g. 512,1024")
     parser.add_argument("--output", type=str, default="results/eval_results.json")
     args = parser.parse_args()
 
@@ -325,7 +345,13 @@ def main():
     # Speed benchmark (always run)
     native_lr_res = model.generator.image_size
     print("\n--- Speed Benchmark (base model) ---")
-    speed = benchmark_speed(model, device, resolutions=(native_lr_res,))
+    speed = benchmark_speed(
+        model,
+        device,
+        resolutions=(native_lr_res,),
+        num_runs=args.speed_runs,
+        warmup=args.speed_warmup,
+    )
     results["speed"] = speed
     for res, data in speed.items():
         if "mean_ms" in data:
@@ -336,14 +362,49 @@ def main():
     # Upscaling speed benchmark
     print("\n--- AttentionUpscaling Speed ---")
     data_hr_res = cfg["data"]["image_size"]
-    hr_resolutions = tuple(dict.fromkeys([data_hr_res, 1024, 2048]))
-    upscale_speed = benchmark_upscaling(model, device, lr_res=native_lr_res, hr_resolutions=hr_resolutions)
+    if args.hr_resolutions:
+        hr_resolutions = tuple(int(x.strip()) for x in args.hr_resolutions.split(",") if x.strip())
+    else:
+        hr_resolutions = tuple(dict.fromkeys([data_hr_res, 1024, 2048]))
+    upscale_speed = benchmark_upscaling(
+        model,
+        device,
+        lr_res=native_lr_res,
+        hr_resolutions=hr_resolutions,
+        num_runs=args.upscale_runs,
+        warmup=args.upscale_warmup,
+    )
     results["upscaling_speed"] = upscale_speed
     for res, data in upscale_speed.items():
         if "mean_ms" in data:
             print(f"  LR={native_lr_res} -> HR={res}: {data['mean_ms']:.2f}ms (upscale only)")
         else:
             print(f"  LR={native_lr_res} -> HR={res}: {data}")
+
+    if args.compare_hr_refiner and model.generator.hr_residual_refiner is not None:
+        print("\n--- AttentionUpscaling Speed (HRResidualRefiner disabled) ---")
+        upscale_speed_no_hr = benchmark_upscaling(
+            model,
+            device,
+            lr_res=native_lr_res,
+            hr_resolutions=hr_resolutions,
+            disable_hr_residual_refiner=True,
+            num_runs=args.upscale_runs,
+            warmup=args.upscale_warmup,
+        )
+        results["upscaling_speed_no_hr_refiner"] = upscale_speed_no_hr
+        for res, data in upscale_speed_no_hr.items():
+            if "mean_ms" in data:
+                full_ms = upscale_speed.get(res, {}).get("mean_ms")
+                delta_suffix = ""
+                if full_ms is not None:
+                    delta_suffix = f", delta={full_ms - data['mean_ms']:.2f}ms"
+                print(
+                    f"  LR={native_lr_res} -> HR={res}: {data['mean_ms']:.2f}ms "
+                    f"(upscale only, no HR refiner){delta_suffix}"
+                )
+            else:
+                print(f"  LR={native_lr_res} -> HR={res}: {data}")
 
     if args.speed_only:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
