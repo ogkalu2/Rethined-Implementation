@@ -272,6 +272,14 @@ class PatchInpainting(nn.Module):
         )
         nn.init.zeros_(self.hr_pair_rescorer[-1].weight)
         nn.init.zeros_(self.hr_pair_rescorer[-1].bias)
+        self.hr_transfer_gate = nn.Sequential(
+            nn.LayerNorm(self.hr_rescore_dim + 3),
+            nn.Linear(self.hr_rescore_dim + 3, self.hr_rescore_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hr_rescore_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.hr_transfer_gate[-1].weight)
+        nn.init.constant_(self.hr_transfer_gate[-1].bias, -3.0)
         self.hr_residual_refiner = (
             HRResidualRefiner(
                 in_channels=13,

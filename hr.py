@@ -236,6 +236,22 @@ class AttentionUpscaling(nn.Module):
         key_embed_all = self._encode_patch_descriptors(hr_hf_tokens, self.patch_inpainting.hr_key_encoder)
         query_embed_all = self._encode_patch_descriptors(base_hf_tokens, self.patch_inpainting.hr_query_encoder)
         hr_hf_flat = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
+        top1 = topk_prior[..., 0]
+        if topk > 1:
+            margin = topk_prior[..., 0] - topk_prior[..., 1]
+        else:
+            margin = top1
+        topk_mass = topk_prior.sum(dim=-1)
+        gate_inputs = torch.cat(
+            [
+                query_embed_all,
+                top1.unsqueeze(-1),
+                margin.unsqueeze(-1),
+                topk_mass.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        transfer_gate = torch.sigmoid(self.patch_inpainting.hr_transfer_gate(gate_inputs))
 
         batch_idx = torch.arange(batch_size, device=hr_attn.device)
         rescored_chunks = []
@@ -264,6 +280,7 @@ class AttentionUpscaling(nn.Module):
             weights = F.softmax(logits, dim=-1).to(hr_hf_flat.dtype)
             key_hf_chunk = hr_hf_flat[gather_batch, idx_chunk]
             rescored_chunk = (weights.unsqueeze(-1) * key_hf_chunk).sum(dim=2)
+            rescored_chunk = rescored_chunk * transfer_gate[:, start:end, :]
             rescored_chunks.append(rescored_chunk)
 
         return torch.cat(rescored_chunks, dim=1)
@@ -289,12 +306,16 @@ class AttentionUpscaling(nn.Module):
 
         hr_patch_size = self.patch_inpainting.kernel_size * scale_h
 
-        hr_patches, _ = self.patch_inpainting.unfold_native(x_hr, hr_patch_size)
         hr_base_blurred = self.patch_inpainting.final_gaussian_blur(x_hr_base)
         hr_base_patches, _ = self.patch_inpainting.unfold_native(x_hr_base, hr_patch_size)
         hr_base_patches_blurred, _ = self.patch_inpainting.unfold_native(hr_base_blurred, hr_patch_size)
+        if mask_hr is not None:
+            x_hr_proxy = x_hr * (1 - mask_hr) + x_hr_base * mask_hr
+        else:
+            x_hr_proxy = x_hr
 
-        hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
+        hr_patches, _ = self.patch_inpainting.unfold_native(x_hr_proxy, hr_patch_size)
+        hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr_proxy)
         hr_patches_blurred, _ = self.patch_inpainting.unfold_native(hr_blurred, hr_patch_size)
 
         hr_hf_patches_full = hr_patches - hr_patches_blurred
@@ -310,7 +331,20 @@ class AttentionUpscaling(nn.Module):
             hr_mask_patches, _ = self.patch_inpainting.unfold_native(mask_hr, hr_patch_size)
             hr_mask_patches_flat = hr_mask_patches.flatten(start_dim=2).transpose(1, 2)
             hr_mask_ratio = hr_mask_patches.mean(dim=1, keepdim=True).flatten(start_dim=2).squeeze(1)
-            valid_hr_keys = (hr_mask_ratio <= 1e-6).to(hr_attn.dtype)
+            masked_hr_patch_flat = (
+                hr_mask_ratio > self.patch_inpainting.mask_patch_ratio_threshold
+            ).to(hr_attn.dtype)
+            valid_counts = (1.0 - masked_hr_patch_flat).sum(dim=1).to(torch.int64)
+            if torch.any(valid_counts < self.patch_inpainting.min_valid_patches):
+                ranked = torch.argsort(hr_mask_ratio, dim=1)
+                needed = (self.patch_inpainting.min_valid_patches - valid_counts).clamp_min(0)
+                for batch_idx in torch.where(needed > 0)[0].tolist():
+                    promote_count = int(min(needed[batch_idx].item(), masked_hr_patch_flat.shape[1]))
+                    if promote_count <= 0:
+                        continue
+                    promote_idx = ranked[batch_idx, :promote_count]
+                    masked_hr_patch_flat[batch_idx, promote_idx] = 0.0
+            valid_hr_keys = (1.0 - masked_hr_patch_flat).to(hr_attn.dtype)
             masked_hr_attn = hr_attn * valid_hr_keys.unsqueeze(1)
             masked_hr_attn_sum = masked_hr_attn.sum(dim=-1, keepdim=True)
             normalized_hr_attn = masked_hr_attn / masked_hr_attn_sum.clamp_min(1e-8)
