@@ -183,6 +183,9 @@ class PatchInpainting(nn.Module):
         hr_rescore_dim: int = 64,
         hr_rescore_hidden_dim: int = 128,
         hr_query_chunk_size: int = 128,
+        use_hr_residual_refiner: bool = True,
+        hr_refiner_channels: int = 32,
+        hr_refiner_blocks: int = 4,
         model,
     ):
         self.cross_attention = cross_attention
@@ -214,6 +217,9 @@ class PatchInpainting(nn.Module):
         self.hr_rescore_dim = max(8, int(hr_rescore_dim))
         self.hr_rescore_hidden_dim = max(8, int(hr_rescore_hidden_dim))
         self.hr_query_chunk_size = max(1, int(hr_query_chunk_size))
+        self.use_hr_residual_refiner = bool(use_hr_residual_refiner)
+        self.hr_refiner_channels = max(8, int(hr_refiner_channels))
+        self.hr_refiner_blocks = max(1, int(hr_refiner_blocks))
         super().__init__()
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -280,6 +286,15 @@ class PatchInpainting(nn.Module):
         )
         nn.init.zeros_(self.hr_pair_rescorer[-1].weight)
         nn.init.zeros_(self.hr_pair_rescorer[-1].bias)
+        self.hr_residual_refiner = (
+            HRResidualRefiner(
+                in_channels=13,
+                hidden_channels=self.hr_refiner_channels,
+                num_blocks=self.hr_refiner_blocks,
+            )
+            if self.use_hr_residual_refiner
+            else None
+        )
         self.last_base_patches_flat = None
         self.last_pixel_mask_flat = None
         self.last_output_patches_flat = None
@@ -535,6 +550,37 @@ class DepthwiseSeparableBlock(nn.Module):
                 residual = self.proj(residual)
             out = out + residual
         return self.activation(out)
+
+
+class HRResidualRefiner(nn.Module):
+    """Small HR-only residual corrector on top of the transferred HR candidate."""
+
+    def __init__(self, in_channels: int = 13, hidden_channels: int = 32, num_blocks: int = 4):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hidden_channels),
+            nn.ReLU(inplace=True),
+        )
+        blocks = []
+        for _ in range(num_blocks):
+            blocks.append(
+                DepthwiseSeparableBlock(
+                    hidden_channels,
+                    hidden_channels,
+                    stride=1,
+                    use_residual=True,
+                )
+            )
+        self.blocks = nn.Sequential(*blocks)
+        self.out_conv = nn.Conv2d(hidden_channels, 3, kernel_size=3, padding=1)
+        nn.init.zeros_(self.out_conv.weight)
+        nn.init.zeros_(self.out_conv.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.blocks(x)
+        return self.out_conv(x)
 
 
 class PaperEncoderStage(nn.Module):
@@ -836,6 +882,15 @@ class AttentionUpscaling(nn.Module):
             reconstructed_hr_hf_patches, (hr_h, hr_w), kernel_size=hr_patch_size, use_final_conv=False)
 
         final_hr_image = x_hr_base + reconstructed_hr_hf_image
+        if self.patch_inpainting.hr_residual_refiner is not None:
+            if mask_hr is None:
+                mask_hr = x_hr.new_zeros((x_hr.shape[0], 1, hr_h, hr_w))
+            hr_refiner_input = torch.cat(
+                [final_hr_image, x_hr_base, reconstructed_hr_hf_image, x_hr, mask_hr],
+                dim=1,
+            )
+            hr_residual = self.patch_inpainting.hr_residual_refiner(hr_refiner_input)
+            final_hr_image = final_hr_image + hr_residual * mask_hr
 
         return final_hr_image
 
