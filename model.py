@@ -5,6 +5,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.nn.utils.fusion import fuse_conv_bn_eval
 
 
 class NativeGaussianBlur2d(nn.Module):
@@ -141,6 +142,13 @@ class MultiHeadAttention(nn.Module):
             head_output = head_output.transpose(1, 2).contiguous()
             return output, attn, head_output
         return output, attn
+
+
+def _fuse_conv_bn_pair(conv: nn.Module, bn: nn.Module) -> tuple[nn.Module, nn.Module]:
+    """Fuse a Conv2d+BatchNorm2d pair for inference."""
+    if not isinstance(conv, nn.Conv2d) or not isinstance(bn, nn.BatchNorm2d):
+        return conv, bn
+    return fuse_conv_bn_eval(conv.eval(), bn.eval()), nn.Identity()
 
 
 class PatchInpainting(nn.Module):
@@ -394,6 +402,11 @@ class PatchInpainting(nn.Module):
     def set_refinement_runtime_scale(self, scale: float) -> None:
         self.refinement_runtime_scale = float(scale)
 
+    def reparameterize(self):
+        if self.hr_residual_refiner is not None and hasattr(self.hr_residual_refiner, "reparameterize"):
+            self.hr_residual_refiner.reparameterize()
+        return self
+
     def forward(self, image, mask):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
@@ -552,6 +565,15 @@ class DepthwiseSeparableBlock(nn.Module):
             out = out + residual
         return self.activation(out)
 
+    def reparameterize(self):
+        self.depthwise, self.depthwise_bn = _fuse_conv_bn_pair(self.depthwise, self.depthwise_bn)
+        self.pointwise, self.pointwise_bn = _fuse_conv_bn_pair(self.pointwise, self.pointwise_bn)
+        if isinstance(self.proj, nn.Sequential) and len(self.proj) == 2:
+            fused_proj, proj_bn = _fuse_conv_bn_pair(self.proj[0], self.proj[1])
+            if isinstance(proj_bn, nn.Identity):
+                self.proj = fused_proj
+        return self
+
 
 class HRResidualRefiner(nn.Module):
     """Patch-grid HR residual corrector with compute tied to the LR query grid."""
@@ -661,6 +683,19 @@ class HRResidualRefiner(nn.Module):
         residual = residual * mask
         return residual.reshape(batch_size, num_patches, 3 * patch_size * patch_size)
 
+    def reparameterize(self):
+        if isinstance(self.patch_encoder, nn.Sequential) and len(self.patch_encoder) >= 5:
+            self.patch_encoder[0], self.patch_encoder[1] = _fuse_conv_bn_pair(
+                self.patch_encoder[0], self.patch_encoder[1]
+            )
+            self.patch_encoder[3], self.patch_encoder[4] = _fuse_conv_bn_pair(
+                self.patch_encoder[3], self.patch_encoder[4]
+            )
+        for block in self.blocks:
+            if hasattr(block, "reparameterize"):
+                block.reparameterize()
+        return self
+
 
 class PaperEncoderStage(nn.Module):
     def __init__(self, in_channels: int, out_channels: int):
@@ -671,6 +706,11 @@ class PaperEncoderStage(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.down(x)
         return self.refine(x)
+
+    def reparameterize(self):
+        self.down.reparameterize()
+        self.refine.reparameterize()
+        return self
 
 
 class PaperUpBlock(nn.Module):
@@ -689,6 +729,11 @@ class PaperUpBlock(nn.Module):
         x = torch.cat([x, skip], dim=1)
         x = self.block1(x)
         return self.block2(x)
+
+    def reparameterize(self):
+        self.block1.reparameterize()
+        self.block2.reparameterize()
+        return self
 
 
 class PaperCoarse(nn.Module):
@@ -744,6 +789,16 @@ class PaperCoarse(nn.Module):
         return out, features
 
     def reparameterize(self):
+        self.stage0.reparameterize()
+        self.stage1.reparameterize()
+        self.stage2.reparameterize()
+        self.stage3.reparameterize()
+        self.stage4.reparameterize()
+        self.up4.reparameterize()
+        self.up3.reparameterize()
+        self.up2.reparameterize()
+        self.up1.reparameterize()
+        self.head_block.reparameterize()
         return self
 
 
@@ -970,4 +1025,6 @@ class InpaintingModel(nn.Module):
         """Apply any model-specific inference-time reparameterization."""
         if hasattr(self.coarse_model, 'reparameterize'):
             self.coarse_model.reparameterize()
+        if hasattr(self.generator, 'reparameterize'):
+            self.generator.reparameterize()
         return self

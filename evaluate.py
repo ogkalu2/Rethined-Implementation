@@ -321,6 +321,8 @@ def main():
     parser.add_argument("--num_images", type=int, default=200)
     parser.add_argument("--speed_only", action="store_true")
     parser.add_argument("--compare_hr_refiner", action="store_true")
+    parser.add_argument("--reparameterize", action="store_true",
+                        help="Apply inference-time Conv-BN fusion before evaluation/benchmarking.")
     parser.add_argument("--random_init", action="store_true",
                         help="Build the model with random weights instead of loading a checkpoint. Useful for speed-only benchmarking.")
     parser.add_argument("--upscale_test", action="store_true")
@@ -345,10 +347,19 @@ def main():
         print(f"Accelerator: {get_device_name(device)}")
 
     model = load_model(args.checkpoint, cfg, device, random_init=args.random_init)
+    if args.reparameterize:
+        model.reparameterize()
+        model.eval()
+        print("Applied inference reparameterization.")
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    results = {"checkpoint": args.checkpoint, "random_init": args.random_init, "params": total_params}
+    results = {
+        "checkpoint": args.checkpoint,
+        "random_init": args.random_init,
+        "reparameterized": args.reparameterize,
+        "params": total_params,
+    }
 
     # Speed benchmark (always run)
     native_lr_res = model.generator.image_size
