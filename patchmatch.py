@@ -361,10 +361,7 @@ class PatchInpainting(nn.Module):
             coarse_composite = image_coarse_inpainting
         image_to_return = image_coarse_inpainting
 
-        composite_blurred = self.final_gaussian_blur(coarse_composite)
         composite_patches_full, sizes = self.unfold_native(coarse_composite, self.kernel_size)
-        blurred_patches_full, _ = self.unfold_native(composite_blurred, self.kernel_size)
-        hf_patches = composite_patches_full - blurred_patches_full
 
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
         mask_ratio = mask_as_patches.mean(dim=1, keepdim=True)
@@ -384,13 +381,15 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
-        match_patches = hf_patches
+        # Sect. 3.3 reconstructs full LR patches; HF-only mixing is reserved for
+        # the separate HR attention-transfer module in Sect. 3.4.
+        match_patches = composite_patches_full
         preserve_patches_full = composite_patches_full
         if self.concat_features:
             features_to_concat = features[self.feature_i]
             features_to_concat = F.interpolate(
                 features_to_concat,
-                size=hf_patches.shape[-2:],
+                size=match_patches.shape[-2:],
                 mode="bilinear",
                 align_corners=False,
             )
@@ -406,10 +405,8 @@ class PatchInpainting(nn.Module):
         if self.positionalencoding is not None:
             input_attn = input_attn + self.positionalencoding.transpose(1, 2)
 
-        hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
+        match_patches_flat = match_patches.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
-        blurred_patches_flat = blurred_patches_full.flatten(start_dim=2).transpose(1, 2)
-        base_hf_flat = preserve_patches_flat - blurred_patches_flat
         self.last_base_patches_flat = preserve_patches_flat
 
         pre_softmax_mask = (
@@ -418,7 +415,7 @@ class PatchInpainting(nn.Module):
         out, atten_weights = self.multihead_attention(
             input_attn,
             input_attn,
-            hf_patches_flat,
+            match_patches_flat,
             None,
             None,
             qk_mask=pre_softmax_mask,
@@ -438,10 +435,8 @@ class PatchInpainting(nn.Module):
             refinement_confidence = patch_mask
 
         refinement_scale = self.refinement_runtime_scale
-
-        delta = refinement_scale * refinement_confidence * (out - base_hf_flat) * patch_mask
-        delta = self.apply_paper_coherence(delta, sizes)
-        out = preserve_patches_flat + delta
+        out = self.apply_paper_coherence(out, sizes)
+        out = preserve_patches_flat + refinement_scale * refinement_confidence * (out - preserve_patches_flat)
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
         self.last_pixel_mask_flat = pixel_mask_flat
