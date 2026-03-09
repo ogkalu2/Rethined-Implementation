@@ -41,7 +41,7 @@ model:
     use_hr_residual_refiner: true
     hr_refiner_channels: 32
     hr_refiner_blocks: 4
-    hr_refiner_template_size: 6
+    hr_refiner_template_size: 4
 
 data:
   root_dir: "."
