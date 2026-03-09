@@ -4,11 +4,10 @@ import argparse
 import random
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from PIL import Image
-from torchvision.transforms import functional as TF
 from torchvision.utils import save_image
 
 from data.dataset import InpaintingDataset
@@ -28,32 +27,31 @@ def load_model_and_cfg(checkpoint_path: Path, config_path: Path, device: torch.d
     return model, cfg
 
 
-def make_dataset_sample(dataset: InpaintingDataset, idx: int, random_masks: bool):
+def make_dataset_sample(
+    dataset: InpaintingDataset,
+    idx: int,
+    random_masks: bool,
+    random_mask_seed: int | None = None,
+):
     sample = dataset.samples[idx]
-    image = Image.open(sample["image_path"]).convert("RGB")
-    mask_img = None
+    dataset_sample = dataset[idx]
+    image = dataset_sample["image"]
 
-    if sample["mask_path"] is not None and not random_masks:
-        mask_img = Image.open(sample["mask_path"]).convert("L")
-        if mask_img.size != image.size:
-            mask_img = mask_img.resize(image.size, Image.NEAREST)
-        image, mask_img = dataset._resize_full_pair(image, mask_img)
+    if random_masks:
+        rng = None
+        if random_mask_seed is not None:
+            rng = np.random.RandomState(random_mask_seed + idx)
+        mask = torch.from_numpy(dataset.mask_gen(rng=rng)).unsqueeze(0)
+        masked_image = image * (1 - mask)
     else:
-        image, _ = dataset._crop_pair(image, None)
+        mask = dataset_sample["mask"]
+        masked_image = dataset_sample["masked_image"]
 
-    image = TF.to_tensor(image)
-    if mask_img is not None:
-        mask = TF.to_tensor(mask_img)
-        mask = (mask > 0.5).float()
-    else:
-        mask = torch.from_numpy(dataset.mask_gen()).unsqueeze(0)
-
-    masked_image = image * (1 - mask)
     return {
         "image": image,
         "mask": mask,
         "masked_image": masked_image,
-        "source": sample["source"],
+        "source": dataset_sample["source"],
         "image_path": str(sample["image_path"]),
     }
 
@@ -114,6 +112,9 @@ def main():
     parser.add_argument("--num_samples", type=int, default=6)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--random_masks", action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--fixed_mask_seed", type=int, default=0)
+    parser.add_argument("--max_images", type=int, default=None)
     args = parser.parse_args()
 
     device = resolve_device(args.device)
@@ -127,9 +128,16 @@ def main():
         split=args.split,
         mask_min_coverage=cfg["data"]["mask_min_coverage"],
         mask_max_coverage=cfg["data"]["mask_max_coverage"],
+        max_images=args.max_images,
         val_dir=cfg["data"].get("val_dir"),
         manifest_path=cfg["data"].get("manifest_path"),
+        deterministic=args.deterministic,
+        fixed_mask_seed=args.fixed_mask_seed,
     )
+    if args.random_masks and any(sample["mask_path"] is not None for sample in dataset.samples):
+        print(
+            "Warning: --random_masks overrides manifest masks, so renders will not match paired-mask training/eval."
+        )
 
     rng = random.Random(args.seed)
     indices = rng.sample(range(len(dataset)), min(args.num_samples, len(dataset)))
@@ -142,6 +150,9 @@ def main():
         f"device: {device}",
         f"split: {args.split}",
         f"random_masks: {args.random_masks}",
+        f"deterministic: {args.deterministic}",
+        f"fixed_mask_seed: {args.fixed_mask_seed}",
+        f"max_images: {args.max_images}",
         f"indices: {indices}",
         "Columns: ground_truth | masked_input | coarse_x2 | lr_refined_x2 | hr_final | mask",
         "",
@@ -149,7 +160,12 @@ def main():
 
     panels = []
     for slot, idx in enumerate(indices):
-        batch = make_dataset_sample(dataset, idx, random_masks=args.random_masks)
+        batch = make_dataset_sample(
+            dataset,
+            idx,
+            random_masks=args.random_masks,
+            random_mask_seed=(args.fixed_mask_seed if args.deterministic else None),
+        )
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
         panel = render_sample(model, attn_upscaler, batch, model_image_size)
         panel_name = f"sample_{slot:02d}_idx_{idx}.png"

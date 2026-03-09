@@ -150,6 +150,7 @@ class PatchInpainting(nn.Module):
         hr_refiner_channels: int = 32,
         hr_refiner_blocks: int = 4,
         hr_refiner_template_size: int = 4,
+        positional_grid_size: int = 32,
         model,
     ):
         super().__init__()
@@ -209,14 +210,15 @@ class PatchInpainting(nn.Module):
         )
         self.stem_out_channels = stem_out_channels
         self.stem_out_stride = stem_out_stride
+        self.token_grid_size = int(image_size / stem_out_stride / self.kernel_size)
+        self.positional_grid_size = max(1, min(int(positional_grid_size), self.token_grid_size))
         self.register_buffer(
             "qk_mask",
-            1e4
-            * torch.eye(int((image_size / stem_out_stride / self.kernel_size) ** 2)).unsqueeze(0).unsqueeze(0),
+            1e4 * torch.eye(self.token_grid_size ** 2).unsqueeze(0).unsqueeze(0),
         )
         if not mask_query_with_segmentation_mask:
             self.mask_query = torch.nn.Parameter(
-                torch.zeros(1, int((image_size / stem_out_stride / self.kernel_size) ** 2), 1, 1).float()
+                torch.zeros(1, self.token_grid_size ** 2, 1, 1).float()
             )
 
         self.encoder_decoder = model
@@ -226,7 +228,8 @@ class PatchInpainting(nn.Module):
                 torch.zeros(
                     1,
                     self.patch_token_dim,
-                    int((image_size / stem_out_stride / self.kernel_size) ** 2),
+                    self.positional_grid_size,
+                    self.positional_grid_size,
                 )
             )
             if use_kpos or use_qpos
@@ -352,6 +355,21 @@ class PatchInpainting(nn.Module):
             self.hr_residual_refiner.reparameterize()
         return self
 
+    def get_positional_encoding(self) -> torch.Tensor | None:
+        """Upsample the learnable positional grid to the current token grid."""
+        if self.positionalencoding is None:
+            return None
+        if self.positionalencoding.shape[-2:] == (self.token_grid_size, self.token_grid_size):
+            pe = self.positionalencoding
+        else:
+            pe = F.interpolate(
+                self.positionalencoding,
+                size=(self.token_grid_size, self.token_grid_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return pe.flatten(start_dim=2).transpose(1, 2)
+
     def forward(self, image, mask):
         masked_input = image
         image_coarse_inpainting, features = self.encoder_decoder(masked_input)
@@ -406,8 +424,9 @@ class PatchInpainting(nn.Module):
 
         input_attn = token_map.flatten(start_dim=2).transpose(1, 2)
 
-        if self.positionalencoding is not None:
-            input_attn = input_attn + self.positionalencoding.transpose(1, 2)
+        positional_encoding = self.get_positional_encoding()
+        if positional_encoding is not None:
+            input_attn = input_attn + positional_encoding
 
         match_patches_flat = match_patches.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)

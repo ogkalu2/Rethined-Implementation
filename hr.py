@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 
 class HRResidualRefiner(nn.Module):
-    """Patch-grid HR residual corrector with compute tied to the LR query grid."""
+    """Patch-grid HR transfer modulator tied to the LR query grid."""
 
     def __init__(
         self,
@@ -22,9 +22,11 @@ class HRResidualRefiner(nn.Module):
         hidden_channels: int = 32,
         num_blocks: int = 4,
         template_size: int = 4,
+        gain_limit: float = 0.35,
     ):
         super().__init__()
         self.template_size = max(1, int(template_size))
+        self.gain_limit = max(0.0, float(gain_limit))
         patch_hidden = max(8, hidden_channels // 2)
         self.patch_encoder = nn.Sequential(
             nn.Conv2d(in_channels, patch_hidden, kernel_size=3, padding=1, bias=False),
@@ -51,7 +53,7 @@ class HRResidualRefiner(nn.Module):
         )
         self.out_conv = nn.Conv2d(
             hidden_channels,
-            3 * self.template_size * self.template_size,
+            self.template_size * self.template_size,
             kernel_size=1,
         )
         nn.init.zeros_(self.out_conv.weight)
@@ -136,35 +138,47 @@ class HRResidualRefiner(nn.Module):
         )
         encoded = self.blocks(encoded)
 
-        residual_template = self.out_conv(encoded)
-        residual_template = (
-            residual_template.permute(0, 2, 3, 1)
+        gate_template = self.out_conv(encoded)
+        gate_template = (
+            gate_template.permute(0, 2, 3, 1)
             .contiguous()
-            .view(batch_size * num_patches, 3, self.template_size, self.template_size)
+            .view(batch_size * num_patches, 1, self.template_size, self.template_size)
         )
-        residual = F.interpolate(
-            residual_template,
+        gate_logits = F.interpolate(
+            gate_template,
             size=(patch_size, patch_size),
             mode="bilinear",
             align_corners=False,
         )
         mask = mask_patches_flat.reshape(batch_size * num_patches, 1, patch_size, patch_size)
-        residual = residual * mask
-        residual = residual.reshape(batch_size, num_patches, 3 * patch_size * patch_size)
-        residual_image = self._flat_to_image(residual, channels=3, patch_size=patch_size, grid_size=grid_size)
+        gate_logits = gate_logits * mask
+        gate_logits = gate_logits.reshape(batch_size, num_patches, patch_size * patch_size)
+        gate_image = self._flat_to_image(gate_logits, channels=1, patch_size=patch_size, grid_size=grid_size)
         mask_image = self._flat_to_image(mask_patches_flat, channels=1, patch_size=patch_size, grid_size=grid_size)
-        residual_image = 0.5 * residual_image + 0.5 * self.residual_smoother(residual_image)
-        residual_image = residual_image * mask_image
-        return self._image_to_flat(residual_image, patch_size)
+        gate_image = 0.5 * gate_image + 0.5 * self.residual_smoother(gate_image)
+        gate_image = gate_image * mask_image
+
+        transferred_hf_image = self._flat_to_image(
+            transferred_hf_patches_flat,
+            channels=3,
+            patch_size=patch_size,
+            grid_size=grid_size,
+        )
+        gain = 1.0 + self.gain_limit * torch.tanh(gate_image)
+        hf_delta_image = (gain - 1.0) * transferred_hf_image
+        hf_delta_image = hf_delta_image * mask_image
+        return self._image_to_flat(hf_delta_image, patch_size)
 
     def reparameterize(self):
         if isinstance(self.patch_encoder, nn.Sequential) and len(self.patch_encoder) >= 5:
-            self.patch_encoder[0], self.patch_encoder[1] = fuse_conv_bn_pair(
-                self.patch_encoder[0], self.patch_encoder[1]
-            )
-            self.patch_encoder[3], self.patch_encoder[4] = fuse_conv_bn_pair(
-                self.patch_encoder[3], self.patch_encoder[4]
-            )
+            if isinstance(self.patch_encoder[1], nn.BatchNorm2d):
+                self.patch_encoder[0], self.patch_encoder[1] = fuse_conv_bn_pair(
+                    self.patch_encoder[0], self.patch_encoder[1]
+                )
+            if isinstance(self.patch_encoder[4], nn.BatchNorm2d):
+                self.patch_encoder[3], self.patch_encoder[4] = fuse_conv_bn_pair(
+                    self.patch_encoder[3], self.patch_encoder[4]
+                )
         for block in self.blocks:
             if hasattr(block, "reparameterize"):
                 block.reparameterize()
