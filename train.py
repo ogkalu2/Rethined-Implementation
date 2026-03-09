@@ -410,6 +410,7 @@ def evaluate_refinement_health(
     model_image_size=None,
     joint_hr_pipeline=False,
     refinement_eval_scale=None,
+    criterion=None,
 ):
     """Quick validation focused on whether refinement helps or hurts."""
     model.eval()
@@ -438,6 +439,8 @@ def evaluate_refinement_health(
         "hr_refined_better_flags": [],
         "hr_refined_tie_flags": [],
         "hr_refined_worse_flags": [],
+        "style": [],
+        "hr_style": [],
     }
     gain_abs_values = []
     gain_pct_values = []
@@ -466,6 +469,10 @@ def evaluate_refinement_health(
         refined = composite_with_known(refined_raw, image, mask)
         coarse = composite_with_known(coarse_raw, image, mask)
         valid_mask = 1 - mask
+
+        if criterion is not None and criterion.style_weight > 0:
+            style_val = criterion.style_loss(refined, image, mask=mask)
+            stats["style"].append(float(style_val.detach().cpu().item()))
 
         hole_denom = (mask.sum(dim=(1, 2, 3)) * image.shape[1]).clamp_min(1e-8)
         valid_denom = (valid_mask.sum(dim=(1, 2, 3)) * image.shape[1]).clamp_min(1e-8)
@@ -507,6 +514,9 @@ def evaluate_refinement_health(
 
             image_hr = batch_views["image_hr"]
             mask_hr = batch_views["mask_hr"]
+            if criterion is not None and criterion.hr_style_weight > 0:
+                hr_style_val = criterion.style_loss(hr_refined, image_hr, mask=mask_hr)
+                stats["hr_style"].append(float(hr_style_val.detach().cpu().item()))
             hole_denom_hr = (mask_hr.sum(dim=(1, 2, 3)) * image_hr.shape[1]).clamp_min(1e-8)
             hr_base_hole = (torch.abs(hr_base - image_hr) * mask_hr).sum(dim=(1, 2, 3)) / hole_denom_hr
             hr_refined_hole = (torch.abs(hr_refined - image_hr) * mask_hr).sum(dim=(1, 2, 3)) / hole_denom_hr
@@ -637,6 +647,7 @@ def run_eval_only(cfg, args):
         model_image_size=model_image_size,
         joint_hr_pipeline=joint_hr_pipeline,
         refinement_eval_scale=eval_refinement_scale,
+        criterion=InpaintingLoss(**cfg["loss"]).to(device),
     )
 
     print("\nFull validation results:")
@@ -656,6 +667,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     writer.add_scalar("val/masked_l1_refined", health["masked_l1_refined"], step)
     writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
     writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
+    if health.get("style") is not None:
+        writer.add_scalar("val/style", health["style"], step)
     if health.get("gain_pct_p50") is not None:
         writer.add_scalar("val/gain_pct_p50", health["gain_pct_p50"], step)
     if health.get("hr_masked_l1_base") is not None:
@@ -668,6 +681,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         writer.add_scalar("val/hr_refined_better_rate", health["hr_refined_better_rate"], step)
     if health.get("hr_gain_pct_p50") is not None:
         writer.add_scalar("val/hr_gain_pct_p50", health["hr_gain_pct_p50"], step)
+    if health.get("hr_style") is not None:
+        writer.add_scalar("val/hr_style", health["hr_style"], step)
     write_status(
         log_dir,
         step,
@@ -688,6 +703,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         )
         if health.get("hr_gain_pct_p50") is not None:
             hr_suffix += f", p50 {health['hr_gain_pct_p50']:.2f}%"
+        if health.get("hr_style") is not None:
+            hr_suffix += f", style {health['hr_style']:.4f}"
         hr_suffix += ")"
     valid_suffix = ""
     if "raw_refinement_hurts_valid_region" in health["warnings"]:
@@ -982,6 +999,7 @@ def train(cfg, args):
                 model_image_size=model_image_size,
                 joint_hr_pipeline=joint_hr_pipeline,
                 refinement_eval_scale=eval_refinement_scale,
+                criterion=criterion,
             )
             log_validation(
                 writer,
@@ -1039,6 +1057,7 @@ def train(cfg, args):
             model_image_size=model_image_size,
             joint_hr_pipeline=joint_hr_pipeline,
             refinement_eval_scale=eval_refinement_scale,
+            criterion=criterion,
         )
         log_validation(
             writer,
