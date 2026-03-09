@@ -39,6 +39,7 @@ from device_utils import (
     time_device_call,
 )
 from model import InpaintingModel, AttentionUpscaling
+from train import load_model_checkpoint
 
 
 def build_model_config(cfg):
@@ -59,7 +60,7 @@ def load_model(checkpoint_path, cfg, device):
     model_config = build_model_config(cfg)
     model = InpaintingModel(model_config).to(device)
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_model_checkpoint(model, ckpt["model_state_dict"])
     model.eval()
     return model
 
@@ -200,11 +201,13 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
     for hr_res in hr_resolutions:
         try:
             dummy_hr = torch.randn(1, 3, hr_res, hr_res, device=device)
+            dummy_hr_mask = torch.zeros(1, 1, hr_res, hr_res, device=device)
+            dummy_hr_mask[:, :, hr_res // 4:3 * hr_res // 4, hr_res // 4:3 * hr_res // 4] = 1.0
 
             # Warmup
             for _ in range(5):
                 with torch.amp.autocast(device.type, enabled=amp_enabled):
-                    _ = attn_upscaler(dummy_hr, refined, attn_map)
+                    _ = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
 
             # Benchmark
             latencies = []
@@ -214,7 +217,7 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
                 def run_upscaler():
                     nonlocal hr_out
                     with torch.amp.autocast(device.type, enabled=amp_enabled):
-                        hr_out = attn_upscaler(dummy_hr, refined, attn_map)
+                        hr_out = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
 
                 latencies.append(time_device_call(run_upscaler, device))
 
@@ -227,7 +230,7 @@ def benchmark_upscaling(model, device, lr_res=256, hr_resolutions=(512, 1024)):
                 "total_pipeline_ms": float(np.mean(latencies)) + results.get("lr_inference_ms", 0),
             }
 
-            del dummy_hr, hr_out
+            del dummy_hr, dummy_hr_mask, hr_out
             empty_device_cache(device)
 
         except RuntimeError as e:
@@ -269,7 +272,7 @@ def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50)
 
         try:
             with torch.amp.autocast(device.type, enabled=amp_enabled):
-                hr_output = attn_upscaler(masked_hr, refined.clamp(0, 1), attn_map)
+                hr_output = attn_upscaler(masked_hr, refined.clamp(0, 1), attn_map, mask_hr=mask_hr)
             hr_output = hr_output.clamp(0, 1)
 
             # L1 in masked region
@@ -320,8 +323,9 @@ def main():
     results = {"checkpoint": args.checkpoint, "params": total_params}
 
     # Speed benchmark (always run)
+    native_lr_res = model.generator.image_size
     print("\n--- Speed Benchmark (base model) ---")
-    speed = benchmark_speed(model, device, resolutions=(cfg["data"]["image_size"],))
+    speed = benchmark_speed(model, device, resolutions=(native_lr_res,))
     results["speed"] = speed
     for res, data in speed.items():
         if "mean_ms" in data:
@@ -331,14 +335,15 @@ def main():
 
     # Upscaling speed benchmark
     print("\n--- AttentionUpscaling Speed ---")
-    lr_res = cfg["data"]["image_size"]
-    upscale_speed = benchmark_upscaling(model, device, lr_res=lr_res, hr_resolutions=(512, 1024, 2048))
+    data_hr_res = cfg["data"]["image_size"]
+    hr_resolutions = tuple(dict.fromkeys([data_hr_res, 1024, 2048]))
+    upscale_speed = benchmark_upscaling(model, device, lr_res=native_lr_res, hr_resolutions=hr_resolutions)
     results["upscaling_speed"] = upscale_speed
     for res, data in upscale_speed.items():
         if "mean_ms" in data:
-            print(f"  LR={lr_res} -> HR={res}: {data['mean_ms']:.2f}ms (upscale only)")
+            print(f"  LR={native_lr_res} -> HR={res}: {data['mean_ms']:.2f}ms (upscale only)")
         else:
-            print(f"  LR={lr_res} -> HR={res}: {data}")
+            print(f"  LR={native_lr_res} -> HR={res}: {data}")
 
     if args.speed_only:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
