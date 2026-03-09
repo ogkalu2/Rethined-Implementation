@@ -3,7 +3,7 @@
 
 model:
   coarse_model:
-    class: "PaperCoarse"
+    class: "CoarseModel"
     channels: [64, 128, 280, 400, 528]
     head_channels: 32
     use_rep_blocks: true
