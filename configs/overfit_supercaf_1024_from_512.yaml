@@ -79,6 +79,9 @@ loss:
   l1_hole_weight: 6.0
   l1_valid_weight: 1.0
   perceptual_weight: 0.1
+  perceptual_crop_size: 256
+  hr_perceptual_crop_size: 384
+  perceptual_crop_pad_frac: 0.35
   style_weight: 0.0
   hr_refined_weight: 2.0
   hr_delta_weight: 1.0

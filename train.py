@@ -269,6 +269,41 @@ def resize_for_aux_loss(pred, target, mask, image_size):
     return pred_small, target_small, mask_small
 
 
+def extract_mask_focus_crops(pred, target, mask, crop_size, pad_frac=0.25):
+    """Crop around each hole with some context, then resize for focused perceptual loss."""
+    if crop_size is None:
+        return pred, target
+
+    crops_pred = []
+    crops_target = []
+    batch_size, _, height, width = pred.shape
+    mask_bool = mask[:, 0] > 0.5
+    for batch_idx in range(batch_size):
+        nonzero = torch.nonzero(mask_bool[batch_idx], as_tuple=False)
+        if nonzero.numel() == 0:
+            y0, x0, y1, x1 = 0, 0, height, width
+        else:
+            y0 = int(nonzero[:, 0].min().item())
+            y1 = int(nonzero[:, 0].max().item()) + 1
+            x0 = int(nonzero[:, 1].min().item())
+            x1 = int(nonzero[:, 1].max().item()) + 1
+            span = max(y1 - y0, x1 - x0)
+            pad = max(4, int(round(span * pad_frac)))
+            y0 = max(0, y0 - pad)
+            y1 = min(height, y1 + pad)
+            x0 = max(0, x0 - pad)
+            x1 = min(width, x1 + pad)
+
+        pred_crop = pred[batch_idx:batch_idx + 1, :, y0:y1, x0:x1]
+        target_crop = target[batch_idx:batch_idx + 1, :, y0:y1, x0:x1]
+        if pred_crop.shape[-2:] != (crop_size, crop_size):
+            pred_crop = F.interpolate(pred_crop, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+            target_crop = F.interpolate(target_crop, size=(crop_size, crop_size), mode="bilinear", align_corners=False)
+        crops_pred.append(pred_crop)
+        crops_target.append(target_crop)
+    return torch.cat(crops_pred, dim=0), torch.cat(crops_target, dim=0)
+
+
 def compute_train_loss(
     criterion,
     coarse_raw,
@@ -307,9 +342,23 @@ def compute_train_loss(
     ).clamp(0, 1)
 
     if criterion.perceptual_weight > 0:
-        perceptual = criterion.perceptual_loss(refined_for_perceptual, target)
+        perceptual_pred, perceptual_target = extract_mask_focus_crops(
+            refined_for_perceptual,
+            target,
+            mask,
+            getattr(criterion, "perceptual_crop_size", None),
+            getattr(criterion, "perceptual_crop_pad_frac", 0.25),
+        )
+        perceptual = criterion.perceptual_loss(perceptual_pred, perceptual_target)
     if criterion.style_weight > 0:
-        style = criterion.style_loss(refined_for_perceptual, target)
+        style_pred, style_target = extract_mask_focus_crops(
+            refined_for_perceptual,
+            target,
+            mask,
+            getattr(criterion, "perceptual_crop_size", None),
+            getattr(criterion, "perceptual_crop_pad_frac", 0.25),
+        )
+        style = criterion.style_loss(style_pred, style_target)
 
     if (
         criterion.gain_ratio_weight > 0
@@ -329,6 +378,9 @@ def compute_train_loss(
             hr_refined_composite if hr_refined_composite is not None else hr_refined_raw
         ).clamp(0, 1)
         hr_aux_image_size = getattr(criterion, "hr_aux_image_size", None)
+        hr_perceptual_crop_size = getattr(criterion, "hr_perceptual_crop_size", None)
+        if hr_perceptual_crop_size is None:
+            hr_perceptual_crop_size = hr_aux_image_size
         if criterion.hr_refined_weight > 0:
             # HR inference restores known pixels after attention transfer, so the
             # HR L1 term should supervise that same composited prediction.
@@ -349,19 +401,21 @@ def compute_train_loss(
                 hr_delta_mask,
             )
         if criterion.hr_perceptual_weight > 0:
-            hr_perceptual_pred, hr_perceptual_target, _ = resize_for_aux_loss(
+            hr_perceptual_pred, hr_perceptual_target = extract_mask_focus_crops(
                 hr_for_perceptual,
                 hr_target,
                 hr_mask,
-                hr_aux_image_size,
+                hr_perceptual_crop_size,
+                getattr(criterion, "perceptual_crop_pad_frac", 0.25),
             )
             hr_perceptual = criterion.perceptual_loss(hr_perceptual_pred, hr_perceptual_target)
         if criterion.hr_style_weight > 0:
-            hr_style_pred, hr_style_target, _ = resize_for_aux_loss(
+            hr_style_pred, hr_style_target = extract_mask_focus_crops(
                 hr_for_perceptual,
                 hr_target,
                 hr_mask,
-                hr_aux_image_size,
+                hr_perceptual_crop_size,
+                getattr(criterion, "perceptual_crop_pad_frac", 0.25),
             )
             hr_style = criterion.style_loss(hr_style_pred, hr_style_target)
         if criterion.hr_gain_ratio_weight > 0 and hr_base_composite is not None:

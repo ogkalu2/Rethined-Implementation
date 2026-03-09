@@ -22,6 +22,9 @@ class InpaintingLoss(nn.Module):
         l1_valid_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         style_weight: float = 0.0,
+        perceptual_crop_size: int | None = None,
+        hr_perceptual_crop_size: int | None = None,
+        perceptual_crop_pad_frac: float = 0.25,
         hr_refined_weight: float = 0.0,
         hr_perceptual_weight: float = 0.0,
         hr_style_weight: float = 0.0,
@@ -37,6 +40,13 @@ class InpaintingLoss(nn.Module):
         self.l1_valid_weight = l1_valid_weight
         self.perceptual_weight = perceptual_weight
         self.style_weight = style_weight
+        self.perceptual_crop_size = (
+            None if perceptual_crop_size is None else max(1, int(perceptual_crop_size))
+        )
+        self.hr_perceptual_crop_size = (
+            None if hr_perceptual_crop_size is None else max(1, int(hr_perceptual_crop_size))
+        )
+        self.perceptual_crop_pad_frac = max(0.0, float(perceptual_crop_pad_frac))
         self.hr_refined_weight = hr_refined_weight
         self.hr_perceptual_weight = hr_perceptual_weight
         self.hr_style_weight = hr_style_weight
