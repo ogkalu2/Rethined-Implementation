@@ -1,5 +1,4 @@
-# Paper-style coarse model pilot.
-# Replaces MobileOne with a small 5-level depthwise-separable encoder-decoder.
+# Paper-style coarse model pilot at 512px native resolution.
 
 model:
   coarse_model:
@@ -12,7 +11,7 @@ model:
     stem_out_stride: 1
     stem_out_channels: 3
     merge_mode: "all"
-    image_size: 256
+    image_size: 512
     embed_dim: 576
     use_qpos: true
     use_kpos: true
@@ -47,9 +46,9 @@ data:
   root_dir: "."
   manifest_path: "dataset/manifests/supercaf_manifest.csv"
   val_dir: null
-  image_size: 512
-  batch_size: 8
-  eval_batch_size: 8
+  image_size: 1024
+  batch_size: 4
+  eval_batch_size: 4
   num_workers: 4
   mask_min_coverage: 0.30
   mask_max_coverage: 0.50
@@ -82,7 +81,7 @@ loss:
   hr_style_weight: 0.0
 
 logging:
-  log_dir: "logs/train_supercaf_512_to_256_papercoarse_ultrafast"
+  log_dir: "logs/train_supercaf_1024_to_512_papercoarse_ultrafast"
   log_interval: 25
   vis_interval: 500
   eval_interval: 250

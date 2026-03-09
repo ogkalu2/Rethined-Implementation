@@ -56,11 +56,14 @@ def build_model_config(cfg):
     }
 
 
-def load_model(checkpoint_path, cfg, device):
+def load_model(checkpoint_path, cfg, device, random_init=False):
     model_config = build_model_config(cfg)
     model = InpaintingModel(model_config).to(device)
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    load_model_checkpoint(model, ckpt["model_state_dict"])
+    if not random_init:
+        if not checkpoint_path:
+            raise ValueError("checkpoint_path is required unless random_init=True")
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        load_model_checkpoint(model, ckpt["model_state_dict"])
     model.eval()
     return model
 
@@ -312,12 +315,14 @@ def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50)
 
 def main():
     parser = argparse.ArgumentParser(description="RETHINED Evaluation")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_images", type=int, default=200)
     parser.add_argument("--speed_only", action="store_true")
     parser.add_argument("--compare_hr_refiner", action="store_true")
+    parser.add_argument("--random_init", action="store_true",
+                        help="Build the model with random weights instead of loading a checkpoint. Useful for speed-only benchmarking.")
     parser.add_argument("--upscale_test", action="store_true")
     parser.add_argument("--speed_runs", type=int, default=50)
     parser.add_argument("--speed_warmup", type=int, default=10)
@@ -331,16 +336,19 @@ def main():
     with open(args.config) as f:
         cfg = yaml.safe_load(f)
 
+    if not args.random_init and not args.checkpoint:
+        parser.error("--checkpoint is required unless --random_init is set")
+
     device = resolve_device(args.device)
     print(f"Device: {device}")
     if device.type in {"cuda", "xpu"}:
         print(f"Accelerator: {get_device_name(device)}")
 
-    model = load_model(args.checkpoint, cfg, device)
+    model = load_model(args.checkpoint, cfg, device, random_init=args.random_init)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {total_params:,}")
 
-    results = {"checkpoint": args.checkpoint, "params": total_params}
+    results = {"checkpoint": args.checkpoint, "random_init": args.random_init, "params": total_params}
 
     # Speed benchmark (always run)
     native_lr_res = model.generator.image_size

@@ -91,8 +91,25 @@ def save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, path):
 
 def load_model_checkpoint(model, state_dict):
     """Load model state while allowing newly added HR rescoring modules."""
-    incompatible = model.load_state_dict(state_dict, strict=False)
+    model_state = model.state_dict()
+    filtered_state = {}
+    dropped_shape_mismatches = []
     allowed_prefixes = ("generator.hr_",)
+    for key, value in state_dict.items():
+        if key not in model_state:
+            filtered_state[key] = value
+            continue
+        if model_state[key].shape != value.shape:
+            if key.startswith(allowed_prefixes):
+                dropped_shape_mismatches.append(key)
+                continue
+            raise RuntimeError(
+                "Checkpoint/model mismatch: "
+                f"shape mismatch for {key}: checkpoint {tuple(value.shape)} vs model {tuple(model_state[key].shape)}"
+            )
+        filtered_state[key] = value
+
+    incompatible = model.load_state_dict(filtered_state, strict=False)
     missing = [k for k in incompatible.missing_keys if not k.startswith(allowed_prefixes)]
     unexpected = [k for k in incompatible.unexpected_keys if not k.startswith(allowed_prefixes)]
     if missing or unexpected:
@@ -102,7 +119,7 @@ def load_model_checkpoint(model, state_dict):
         if unexpected:
             problems.append(f"unexpected keys: {unexpected}")
         raise RuntimeError("Checkpoint/model mismatch: " + "; ".join(problems))
-    if incompatible.missing_keys:
+    if incompatible.missing_keys or dropped_shape_mismatches:
         print("Initialized new HR rescoring parameters from scratch.")
 
 

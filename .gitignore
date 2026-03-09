@@ -20,3 +20,4 @@ demo_*.py
 # Misc Folders
 datasets/
 logs/
+results/

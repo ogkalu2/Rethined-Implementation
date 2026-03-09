@@ -184,6 +184,7 @@ class PatchInpainting(nn.Module):
         use_hr_residual_refiner: bool = True,
         hr_refiner_channels: int = 32,
         hr_refiner_blocks: int = 4,
+        hr_refiner_template_size: int = 4,
         model,
     ):
         self.cross_attention = cross_attention
@@ -218,6 +219,7 @@ class PatchInpainting(nn.Module):
         self.use_hr_residual_refiner = bool(use_hr_residual_refiner)
         self.hr_refiner_channels = max(8, int(hr_refiner_channels))
         self.hr_refiner_blocks = max(1, int(hr_refiner_blocks))
+        self.hr_refiner_template_size = max(1, int(hr_refiner_template_size))
         super().__init__()
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -289,6 +291,7 @@ class PatchInpainting(nn.Module):
                 in_channels=13,
                 hidden_channels=self.hr_refiner_channels,
                 num_blocks=self.hr_refiner_blocks,
+                template_size=self.hr_refiner_template_size,
             )
             if self.use_hr_residual_refiner
             else None
@@ -551,13 +554,24 @@ class DepthwiseSeparableBlock(nn.Module):
 
 
 class HRResidualRefiner(nn.Module):
-    """Small HR-only residual corrector on top of the transferred HR candidate."""
+    """Patch-grid HR residual corrector with compute tied to the LR query grid."""
 
-    def __init__(self, in_channels: int = 13, hidden_channels: int = 32, num_blocks: int = 4):
+    def __init__(
+        self,
+        in_channels: int = 13,
+        hidden_channels: int = 32,
+        num_blocks: int = 4,
+        template_size: int = 4,
+    ):
         super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, hidden_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
+        self.template_size = max(1, int(template_size))
+        patch_hidden = max(8, hidden_channels // 2)
+        self.patch_encoder = nn.Sequential(
+            nn.Conv2d(in_channels, patch_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(patch_hidden),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(patch_hidden, patch_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(patch_hidden),
             nn.ReLU(inplace=True),
         )
         blocks = []
@@ -571,14 +585,81 @@ class HRResidualRefiner(nn.Module):
                 )
             )
         self.blocks = nn.Sequential(*blocks)
-        self.out_conv = nn.Conv2d(hidden_channels, 3, kernel_size=3, padding=1)
+        self.patch_to_grid = nn.Linear(
+            patch_hidden * self.template_size * self.template_size,
+            hidden_channels,
+        )
+        self.out_conv = nn.Conv2d(
+            hidden_channels,
+            3 * self.template_size * self.template_size,
+            kernel_size=1,
+        )
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)
-        x = self.blocks(x)
-        return self.out_conv(x)
+    def _pool_flat_patches(
+        self,
+        patches_flat: torch.Tensor,
+        channels: int,
+        patch_size: int,
+    ) -> torch.Tensor:
+        """Reshape flat non-overlapping patches and adaptively pool to a fixed template."""
+        batch_size, num_patches, _ = patches_flat.shape
+        patches = patches_flat.reshape(batch_size * num_patches, channels, patch_size, patch_size)
+        return F.adaptive_avg_pool2d(patches, output_size=(self.template_size, self.template_size))
+
+    def forward(
+        self,
+        candidate_patches_flat: torch.Tensor,
+        base_patches_flat: torch.Tensor,
+        transferred_hf_patches_flat: torch.Tensor,
+        source_patches_flat: torch.Tensor,
+        mask_patches_flat: torch.Tensor,
+        patch_size: int,
+        grid_size: tuple[int, int],
+    ) -> torch.Tensor:
+        batch_size, num_patches, _ = candidate_patches_flat.shape
+        grid_h, grid_w = grid_size
+        if num_patches != grid_h * grid_w:
+            raise ValueError(
+                f"HRResidualRefiner expected {grid_h * grid_w} patches, got {num_patches}"
+            )
+
+        pooled_inputs = torch.cat(
+            [
+                self._pool_flat_patches(candidate_patches_flat, channels=3, patch_size=patch_size),
+                self._pool_flat_patches(base_patches_flat, channels=3, patch_size=patch_size),
+                self._pool_flat_patches(transferred_hf_patches_flat, channels=3, patch_size=patch_size),
+                self._pool_flat_patches(source_patches_flat, channels=3, patch_size=patch_size),
+                self._pool_flat_patches(mask_patches_flat, channels=1, patch_size=patch_size),
+            ],
+            dim=1,
+        )
+        encoded = self.patch_encoder(pooled_inputs)
+        encoded = encoded.flatten(start_dim=1)
+        encoded = self.patch_to_grid(encoded)
+        encoded = (
+            encoded.view(batch_size, grid_h, grid_w, -1)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
+        encoded = self.blocks(encoded)
+
+        residual_template = self.out_conv(encoded)
+        residual_template = (
+            residual_template.permute(0, 2, 3, 1)
+            .contiguous()
+            .view(batch_size * num_patches, 3, self.template_size, self.template_size)
+        )
+        residual = F.interpolate(
+            residual_template,
+            size=(patch_size, patch_size),
+            mode='bilinear',
+            align_corners=False,
+        )
+        mask = mask_patches_flat.reshape(batch_size * num_patches, 1, patch_size, patch_size)
+        residual = residual * mask
+        return residual.reshape(batch_size, num_patches, 3 * patch_size * patch_size)
 
 
 class PaperEncoderStage(nn.Module):
@@ -788,16 +869,27 @@ class AttentionUpscaling(nn.Module):
         hr_hf_patches_full = hr_patches - hr_patches_blurred
         hr_base_hf_patches_full = hr_base_patches - hr_base_patches_blurred
         hr_hf_patches = hr_hf_patches_full.flatten(start_dim=2).transpose(1, 2)
+        hr_base_patches_flat = hr_base_patches.flatten(start_dim=2).transpose(1, 2)
+        hr_source_patches_flat = hr_patches.flatten(start_dim=2).transpose(1, 2)
+        grid_size = (hr_h // hr_patch_size, hr_w // hr_patch_size)
+        hr_mask_patches_flat = None
 
         hr_attn = attn_map.squeeze(1)
         if mask_hr is not None:
             hr_mask_patches, _ = self.patch_inpainting.unfold_native(mask_hr, hr_patch_size)
+            hr_mask_patches_flat = hr_mask_patches.flatten(start_dim=2).transpose(1, 2)
             hr_mask_ratio = hr_mask_patches.mean(dim=1, keepdim=True).flatten(start_dim=2).squeeze(1)
             valid_hr_keys = (hr_mask_ratio <= 1e-6).to(hr_attn.dtype)
             masked_hr_attn = hr_attn * valid_hr_keys.unsqueeze(1)
             masked_hr_attn_sum = masked_hr_attn.sum(dim=-1, keepdim=True)
             normalized_hr_attn = masked_hr_attn / masked_hr_attn_sum.clamp_min(1e-8)
             hr_attn = torch.where(masked_hr_attn_sum > 1e-8, normalized_hr_attn, hr_attn)
+        else:
+            hr_mask_patches_flat = hr_hf_patches.new_zeros(
+                hr_hf_patches.shape[0],
+                hr_hf_patches.shape[1],
+                hr_patch_size * hr_patch_size,
+            )
 
         topk = min(self.patch_inpainting.hr_candidate_topk, hr_attn.size(-1))
         rescored_hr_hf_patches = self._rescore_topk_attention(
@@ -817,20 +909,25 @@ class AttentionUpscaling(nn.Module):
         else:
             reconstructed_hr_hf_patches = refinement_scale * rescored_hr_hf_patches
 
-        # Reassemble non-overlapping HR patches without an HR coherence layer.
-        reconstructed_hr_hf_image = self.patch_inpainting.fold_native(
-            reconstructed_hr_hf_patches, (hr_h, hr_w), kernel_size=hr_patch_size, use_final_conv=False)
-
-        final_hr_image = x_hr_base + reconstructed_hr_hf_image
+        final_hr_patches = hr_base_patches_flat + reconstructed_hr_hf_patches
         if self.patch_inpainting.hr_residual_refiner is not None:
-            if mask_hr is None:
-                mask_hr = x_hr.new_zeros((x_hr.shape[0], 1, hr_h, hr_w))
-            hr_refiner_input = torch.cat(
-                [final_hr_image, x_hr_base, reconstructed_hr_hf_image, x_hr, mask_hr],
-                dim=1,
+            hr_residual_patches = self.patch_inpainting.hr_residual_refiner(
+                candidate_patches_flat=final_hr_patches,
+                base_patches_flat=hr_base_patches_flat,
+                transferred_hf_patches_flat=reconstructed_hr_hf_patches,
+                source_patches_flat=hr_source_patches_flat,
+                mask_patches_flat=hr_mask_patches_flat,
+                patch_size=hr_patch_size,
+                grid_size=grid_size,
             )
-            hr_residual = self.patch_inpainting.hr_residual_refiner(hr_refiner_input)
-            final_hr_image = final_hr_image + hr_residual * mask_hr
+            final_hr_patches = final_hr_patches + hr_residual_patches
+
+        final_hr_image = self.patch_inpainting.fold_native(
+            final_hr_patches,
+            (hr_h, hr_w),
+            kernel_size=hr_patch_size,
+            use_final_conv=False,
+        )
 
         return final_hr_image
 
