@@ -1,0 +1,180 @@
+"""Render a few dataset samples from a checkpoint for visual inspection."""
+
+import argparse
+import random
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+import yaml
+from PIL import Image
+from torchvision.transforms import functional as TF
+from torchvision.utils import save_image
+
+from data.dataset import InpaintingDataset
+from device_utils import resolve_device
+from model import AttentionUpscaling, InpaintingModel
+from train import build_model_config, composite_with_known, gaussian_prefilter_downsample, load_model_checkpoint
+
+
+def load_model_and_cfg(checkpoint_path: Path, config_path: Path, device: torch.device):
+    with open(config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    model = InpaintingModel(build_model_config(cfg)).to(device)
+    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    load_model_checkpoint(model, ckpt["model_state_dict"])
+    model.eval()
+    return model, cfg
+
+
+def make_dataset_sample(dataset: InpaintingDataset, idx: int, random_masks: bool):
+    sample = dataset.samples[idx]
+    image = Image.open(sample["image_path"]).convert("RGB")
+    mask_img = None
+
+    if sample["mask_path"] is not None and not random_masks:
+        mask_img = Image.open(sample["mask_path"]).convert("L")
+        if mask_img.size != image.size:
+            mask_img = mask_img.resize(image.size, Image.NEAREST)
+        image, mask_img = dataset._resize_full_pair(image, mask_img)
+    else:
+        image, _ = dataset._crop_pair(image, None)
+
+    image = TF.to_tensor(image)
+    if mask_img is not None:
+        mask = TF.to_tensor(mask_img)
+        mask = (mask > 0.5).float()
+    else:
+        mask = torch.from_numpy(dataset.mask_gen()).unsqueeze(0)
+
+    masked_image = image * (1 - mask)
+    return {
+        "image": image,
+        "mask": mask,
+        "masked_image": masked_image,
+        "source": sample["source"],
+        "image_path": str(sample["image_path"]),
+    }
+
+
+@torch.no_grad()
+def render_sample(model, attn_upscaler, batch, model_image_size: int):
+    image_hr = batch["image"].unsqueeze(0)
+    mask_hr = batch["mask"].unsqueeze(0)
+    masked_hr = batch["masked_image"].unsqueeze(0)
+
+    blur_layer = model.generator.final_gaussian_blur
+    image_lr = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
+    mask_lr = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
+    mask_lr = (mask_lr > 0.5).to(image_lr.dtype)
+    masked_lr = image_lr * (1 - mask_lr)
+
+    refined_raw, attn_map, coarse_raw = model(masked_lr, mask_lr)
+    refined_lr = composite_with_known(refined_raw.clamp(0, 1), image_lr, mask_lr)
+    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), image_lr, mask_lr)
+
+    coarse_hr = composite_with_known(
+        F.interpolate(coarse_lr, size=image_hr.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),
+        image_hr,
+        mask_hr,
+    )
+    lr_refined_hr = composite_with_known(
+        F.interpolate(refined_lr, size=image_hr.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),
+        image_hr,
+        mask_hr,
+    )
+    hr_final = composite_with_known(
+        attn_upscaler(masked_hr, refined_lr, attn_map, mask_hr=mask_hr).clamp(0, 1),
+        image_hr,
+        mask_hr,
+    )
+    mask_rgb = mask_hr.repeat(1, 3, 1, 1)
+
+    return torch.cat(
+        [
+            image_hr.cpu(),
+            masked_hr.cpu(),
+            coarse_hr.cpu(),
+            lr_refined_hr.cpu(),
+            hr_final.cpu(),
+            mask_rgb.cpu(),
+        ],
+        dim=3,
+    ).squeeze(0)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Render sample outputs from a checkpoint.")
+    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--num_samples", type=int, default=6)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--random_masks", action="store_true")
+    args = parser.parse_args()
+
+    device = resolve_device(args.device)
+    model, cfg = load_model_and_cfg(Path(args.checkpoint), Path(args.config), device)
+    model_image_size = model.generator.image_size
+    attn_upscaler = AttentionUpscaling(model.generator).to(device).eval()
+
+    dataset = InpaintingDataset(
+        root_dir=cfg["data"].get("root_dir"),
+        image_size=cfg["data"]["image_size"],
+        split=args.split,
+        mask_min_coverage=cfg["data"]["mask_min_coverage"],
+        mask_max_coverage=cfg["data"]["mask_max_coverage"],
+        val_dir=cfg["data"].get("val_dir"),
+        manifest_path=cfg["data"].get("manifest_path"),
+    )
+
+    rng = random.Random(args.seed)
+    indices = rng.sample(range(len(dataset)), min(args.num_samples, len(dataset)))
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata = [
+        f"checkpoint: {args.checkpoint}",
+        f"config: {args.config}",
+        f"device: {device}",
+        f"split: {args.split}",
+        f"random_masks: {args.random_masks}",
+        f"indices: {indices}",
+        "Columns: ground_truth | masked_input | coarse_x2 | lr_refined_x2 | hr_final | mask",
+        "",
+    ]
+
+    panels = []
+    for slot, idx in enumerate(indices):
+        batch = make_dataset_sample(dataset, idx, random_masks=args.random_masks)
+        batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        panel = render_sample(model, attn_upscaler, batch, model_image_size)
+        panel_name = f"sample_{slot:02d}_idx_{idx}.png"
+        save_image(panel, output_dir / panel_name)
+        panels.append(panel)
+        metadata.extend(
+            [
+                f"sample_{slot:02d}:",
+                f"  idx: {idx}",
+                f"  source: {batch['source']}",
+                f"  image_path: {batch['image_path']}",
+                f"  panel: {panel_name}",
+                "",
+            ]
+        )
+
+    if panels:
+        save_image(torch.cat(panels, dim=1), output_dir / "grid.png")
+
+    with open(output_dir / "README.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(metadata))
+
+    print(f"Saved {len(panels)} sample panels to {output_dir}")
+    print(f"Grid: {output_dir / 'grid.png'}")
+
+
+if __name__ == "__main__":
+    main()
