@@ -89,6 +89,23 @@ def save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, path):
         return False
 
 
+def load_model_checkpoint(model, state_dict):
+    """Load model state while allowing newly added HR rescoring modules."""
+    incompatible = model.load_state_dict(state_dict, strict=False)
+    allowed_prefixes = ("generator.hr_",)
+    missing = [k for k in incompatible.missing_keys if not k.startswith(allowed_prefixes)]
+    unexpected = [k for k in incompatible.unexpected_keys if not k.startswith(allowed_prefixes)]
+    if missing or unexpected:
+        problems = []
+        if missing:
+            problems.append(f"missing keys: {missing}")
+        if unexpected:
+            problems.append(f"unexpected keys: {unexpected}")
+        raise RuntimeError("Checkpoint/model mismatch: " + "; ".join(problems))
+    if incompatible.missing_keys:
+        print("Initialized new HR rescoring parameters from scratch.")
+
+
 def composite_with_known(pred, target, mask):
     """Preserve known pixels exactly and only use predictions inside the hole."""
     return pred * mask + target * (1 - mask)
@@ -552,7 +569,7 @@ def run_eval_only(cfg, args):
     set_parameter_trainability(model, freeze_coarse=freeze_coarse)
 
     ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    load_model_checkpoint(model, ckpt["model_state_dict"])
     print(f"Loaded checkpoint: {args.resume}")
 
     val_dir = cfg["data"].get("val_dir")
@@ -799,7 +816,7 @@ def train(cfg, args):
     start_step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state_dict"])
+        load_model_checkpoint(model, ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         scaler.load_state_dict(ckpt["scaler_state_dict"])
         start_step = ckpt["step"]

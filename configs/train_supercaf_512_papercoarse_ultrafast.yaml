@@ -33,6 +33,11 @@ model:
     mask_patch_ratio_threshold: 0.05
     min_valid_patches: 8
     use_entropy_confidence: false
+    hr_candidate_topk: 32
+    hr_feature_pool_size: 4
+    hr_rescore_dim: 64
+    hr_rescore_hidden_dim: 128
+    hr_query_chunk_size: 128
 
 data:
   root_dir: "."

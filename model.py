@@ -178,6 +178,11 @@ class PatchInpainting(nn.Module):
         mask_patch_ratio_threshold: float = 0.05,
         min_valid_patches: int = 8,
         use_entropy_confidence: bool = False,
+        hr_candidate_topk: int | None = None,
+        hr_feature_pool_size: int = 4,
+        hr_rescore_dim: int = 64,
+        hr_rescore_hidden_dim: int = 128,
+        hr_query_chunk_size: int = 128,
         model,
     ):
         self.cross_attention = cross_attention
@@ -202,6 +207,13 @@ class PatchInpainting(nn.Module):
         self.mask_patch_ratio_threshold = float(mask_patch_ratio_threshold)
         self.min_valid_patches = max(1, int(min_valid_patches))
         self.use_entropy_confidence = use_entropy_confidence
+        self.hr_candidate_topk = int(hr_candidate_topk) if hr_candidate_topk is not None else (
+            int(attn_topk) if attn_topk is not None and int(attn_topk) > 0 else 16
+        )
+        self.hr_feature_pool_size = max(1, int(hr_feature_pool_size))
+        self.hr_rescore_dim = max(8, int(hr_rescore_dim))
+        self.hr_rescore_hidden_dim = max(8, int(hr_rescore_hidden_dim))
+        self.hr_query_chunk_size = max(1, int(hr_query_chunk_size))
         super().__init__()
         # V3-A: Native Gaussian blur (replaces Kornia — no CUDA graph break)
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -241,17 +253,33 @@ class PatchInpainting(nn.Module):
         )) if use_kpos or use_qpos else None
         self.refinement_gate = nn.Parameter(torch.tensor([1.0]))
         self.refinement_runtime_scale = 1.0
-        self.paper_coherence_layer = nn.Sequential(
-            nn.Conv2d(
-                self.patch_value_dim,
-                self.patch_value_dim,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                padding_mode='reflect',
-            ),
-            nn.Sigmoid(),
+        self.paper_coherence_layer = nn.Conv2d(
+            self.patch_value_dim, self.patch_value_dim,
+            kernel_size=3, stride=1, padding=1, padding_mode='reflect',
         ) if self.final_conv else None
+        if self.paper_coherence_layer is not None:
+            nn.init.zeros_(self.paper_coherence_layer.weight)
+            nn.init.zeros_(self.paper_coherence_layer.bias)
+        self.hr_patch_descriptor_dim = self.stem_out_channels * self.hr_feature_pool_size * self.hr_feature_pool_size
+        self.hr_query_encoder = nn.Sequential(
+            nn.LayerNorm(self.hr_patch_descriptor_dim),
+            nn.Linear(self.hr_patch_descriptor_dim, self.hr_rescore_dim),
+            nn.GELU(),
+            nn.Linear(self.hr_rescore_dim, self.hr_rescore_dim),
+        )
+        self.hr_key_encoder = nn.Sequential(
+            nn.LayerNorm(self.hr_patch_descriptor_dim),
+            nn.Linear(self.hr_patch_descriptor_dim, self.hr_rescore_dim),
+            nn.GELU(),
+            nn.Linear(self.hr_rescore_dim, self.hr_rescore_dim),
+        )
+        self.hr_pair_rescorer = nn.Sequential(
+            nn.Linear(self.hr_rescore_dim * 4 + 1, self.hr_rescore_hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hr_rescore_hidden_dim, 1),
+        )
+        nn.init.zeros_(self.hr_pair_rescorer[-1].weight)
+        nn.init.zeros_(self.hr_pair_rescorer[-1].bias)
         self.last_base_patches_flat = None
         self.last_pixel_mask_flat = None
         self.last_output_patches_flat = None
@@ -308,13 +336,7 @@ class PatchInpainting(nn.Module):
         B = patches.shape[0]
 
         # patches: (B, n_h*n_w, C*k*k)
-        patch_channels = patches.shape[2]
-        if use_final_conv and self.paper_coherence_layer is not None:
-            patches_2d = patches.transpose(1, 2).contiguous().view(B, patch_channels, n_h, n_w)
-            patches_2d = self.paper_coherence_layer(patches_2d)
-            patches = patches_2d.view(B, patch_channels, n_h * n_w).transpose(1, 2).contiguous()
-
-        C = patch_channels // (kernel_size * kernel_size)
+        C = patches.shape[2] // (kernel_size * kernel_size)
         # -> (B, n_h, n_w, C, k, k) -> (B, C, n_h, k, n_w, k) -> (B, C, H, W)
         patches = patches.view(B, n_h, n_w, C, kernel_size, kernel_size)
         patches = patches.permute(0, 3, 1, 4, 2, 5).contiguous()
@@ -350,7 +372,7 @@ class PatchInpainting(nn.Module):
         n_w = output_size[1] // self.kernel_size
         B = patches.shape[0]
         patches_2d = patches.transpose(1, 2).view(B, -1, n_h, n_w)
-        patches_2d = self.paper_coherence_layer(patches_2d)
+        patches_2d = patches_2d + self.paper_coherence_layer(patches_2d)
         return patches_2d.view(B, -1, n_h * n_w).transpose(1, 2)
 
     def set_refinement_runtime_scale(self, scale: float) -> None:
@@ -413,6 +435,8 @@ class PatchInpainting(nn.Module):
 
         hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
+        blurred_patches_flat = blurred_patches_full.flatten(start_dim=2).transpose(1, 2)
+        base_hf_flat = preserve_patches_flat - blurred_patches_flat
         self.last_base_patches_flat = preserve_patches_flat
 
         pre_softmax_mask = self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
@@ -426,7 +450,7 @@ class PatchInpainting(nn.Module):
             k_mask=None,
             post_softmax_mask=None,
             renorm_post_mask=False,
-            direct_patch_mixing=False,
+            direct_patch_mixing=True,
         )
 
         patch_mask = mask_same_res_as_features_pooled.squeeze(1).squeeze(-1).unsqueeze(-1)
@@ -442,14 +466,16 @@ class PatchInpainting(nn.Module):
             refinement_confidence = patch_mask
 
         refinement_scale = self.refinement_runtime_scale
-        
-        mixed_hf = refinement_scale * out + (1.0 - refinement_scale) * hf_patches_flat
-        out = mixed_hf * refinement_confidence + hf_patches_flat * (1 - refinement_confidence)
+
+        delta = refinement_scale * refinement_confidence * (out - base_hf_flat) * patch_mask
+        delta = self.apply_paper_coherence(delta, sizes)
+        out = preserve_patches_flat + delta
+        out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
         self.last_output_patches_flat = out
         self.last_pixel_mask_flat = pixel_mask_flat
         self.last_refinement_confidence = refinement_confidence
 
-        out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=True)
+        out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
 
         return out, atten_weights, image_to_return
 
@@ -664,6 +690,84 @@ class AttentionUpscaling(nn.Module):
         super().__init__()
         self.patch_inpainting = patch_inpainting_module
 
+    def _reshape_patch_tokens(self, patches: torch.Tensor, patch_size: int) -> torch.Tensor:
+        """Convert unfolded patches into per-patch 2D tensors."""
+        batch_size, channels_times_area, n_h, n_w = patches.shape
+        channels = channels_times_area // (patch_size * patch_size)
+        return (
+            patches.view(batch_size, channels, patch_size, patch_size, n_h, n_w)
+            .permute(0, 4, 5, 1, 2, 3)
+            .contiguous()
+            .view(batch_size, n_h * n_w, channels, patch_size, patch_size)
+        )
+
+    def _encode_patch_descriptors(self, patch_tokens: torch.Tensor, encoder: nn.Module) -> torch.Tensor:
+        """Adaptive-pool arbitrary HR patch sizes to a fixed descriptor size."""
+        batch_size, num_patches, channels, patch_h, patch_w = patch_tokens.shape
+        pooled = F.adaptive_avg_pool2d(
+            patch_tokens.reshape(batch_size * num_patches, channels, patch_h, patch_w),
+            output_size=(
+                self.patch_inpainting.hr_feature_pool_size,
+                self.patch_inpainting.hr_feature_pool_size,
+            ),
+        )
+        pooled = pooled.flatten(start_dim=1).view(batch_size, num_patches, -1)
+        return encoder(pooled)
+
+    def _rescore_topk_attention(
+        self,
+        hr_attn: torch.Tensor,
+        hr_hf_patches: torch.Tensor,
+        base_hf_patches: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        """Re-rank LR-proposed candidates using a small HR-specific scorer."""
+        batch_size, num_queries, _ = hr_attn.shape
+        topk_prior, topk_idx = torch.topk(hr_attn, k=topk, dim=-1)
+
+        hr_hf_tokens = self._reshape_patch_tokens(
+            hr_hf_patches,
+            patch_size=int(math.sqrt(hr_hf_patches.shape[1] // self.patch_inpainting.stem_out_channels)),
+        )
+        base_hf_tokens = self._reshape_patch_tokens(
+            base_hf_patches,
+            patch_size=int(math.sqrt(base_hf_patches.shape[1] // self.patch_inpainting.stem_out_channels)),
+        )
+        key_embed_all = self._encode_patch_descriptors(hr_hf_tokens, self.patch_inpainting.hr_key_encoder)
+        query_embed_all = self._encode_patch_descriptors(base_hf_tokens, self.patch_inpainting.hr_query_encoder)
+        hr_hf_flat = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
+
+        batch_idx = torch.arange(batch_size, device=hr_attn.device)
+        rescored_chunks = []
+        chunk_size = self.patch_inpainting.hr_query_chunk_size
+        for start in range(0, num_queries, chunk_size):
+            end = min(start + chunk_size, num_queries)
+            chunk_len = end - start
+            idx_chunk = topk_idx[:, start:end, :]
+            prior_chunk = topk_prior[:, start:end, :]
+            gather_batch = batch_idx.view(batch_size, 1, 1).expand(-1, chunk_len, topk)
+
+            query_chunk = query_embed_all[:, start:end, :].unsqueeze(2).expand(-1, -1, topk, -1)
+            key_chunk = key_embed_all[gather_batch, idx_chunk]
+            pair_features = torch.cat(
+                [
+                    query_chunk,
+                    key_chunk,
+                    query_chunk - key_chunk,
+                    query_chunk * key_chunk,
+                    prior_chunk.unsqueeze(-1),
+                ],
+                dim=-1,
+            )
+            residual_scores = self.patch_inpainting.hr_pair_rescorer(pair_features).squeeze(-1)
+            logits = prior_chunk.clamp_min(1e-8).log().float() + residual_scores.float()
+            weights = F.softmax(logits, dim=-1).to(hr_hf_flat.dtype)
+            key_hf_chunk = hr_hf_flat[gather_batch, idx_chunk]
+            rescored_chunk = (weights.unsqueeze(-1) * key_hf_chunk).sum(dim=2)
+            rescored_chunks.append(rescored_chunk)
+
+        return torch.cat(rescored_chunks, dim=1)
+
     def forward(self, x_hr, x_lr_inpainted, attn_map, mask_hr=None):
         hr_h, hr_w = x_hr.shape[-2:]
         lr_h, lr_w = x_lr_inpainted.shape[-2:]
@@ -687,13 +791,17 @@ class AttentionUpscaling(nn.Module):
         hr_patch_size = self.patch_inpainting.kernel_size * scale_h
 
         hr_patches, _ = self.patch_inpainting.unfold_native(x_hr, hr_patch_size)
+        hr_base_blurred = self.patch_inpainting.final_gaussian_blur(x_hr_base)
+        hr_base_patches, _ = self.patch_inpainting.unfold_native(x_hr_base, hr_patch_size)
+        hr_base_patches_blurred, _ = self.patch_inpainting.unfold_native(hr_base_blurred, hr_patch_size)
 
         # Section 3.4 mixes only HR high frequencies extracted from the HR masked image.
         hr_blurred = self.patch_inpainting.final_gaussian_blur(x_hr)
         hr_patches_blurred, _ = self.patch_inpainting.unfold_native(hr_blurred, hr_patch_size)
 
-        hr_hf_patches = hr_patches - hr_patches_blurred
-        hr_hf_patches = hr_hf_patches.flatten(start_dim=2).transpose(1, 2)
+        hr_hf_patches_full = hr_patches - hr_patches_blurred
+        hr_base_hf_patches_full = hr_base_patches - hr_base_patches_blurred
+        hr_hf_patches = hr_hf_patches_full.flatten(start_dim=2).transpose(1, 2)
 
         hr_attn = attn_map.squeeze(1)
         if mask_hr is not None:
@@ -705,15 +813,23 @@ class AttentionUpscaling(nn.Module):
             normalized_hr_attn = masked_hr_attn / masked_hr_attn_sum.clamp_min(1e-8)
             hr_attn = torch.where(masked_hr_attn_sum > 1e-8, normalized_hr_attn, hr_attn)
 
+        topk = min(self.patch_inpainting.hr_candidate_topk, hr_attn.size(-1))
+        rescored_hr_hf_patches = self._rescore_topk_attention(
+            hr_attn,
+            hr_hf_patches_full,
+            hr_base_hf_patches_full,
+            topk=topk,
+        )
+
         refinement_scale = self.patch_inpainting.refinement_runtime_scale
 
         # Reuse the LR branch confidence so HR transfer is selective rather than
         # copying every attended patch equally.
         confidence = self.patch_inpainting.last_refinement_confidence
         if confidence is not None:
-            reconstructed_hr_hf_patches = refinement_scale * confidence * torch.matmul(hr_attn, hr_hf_patches)
+            reconstructed_hr_hf_patches = refinement_scale * confidence * rescored_hr_hf_patches
         else:
-            reconstructed_hr_hf_patches = refinement_scale * torch.matmul(hr_attn, hr_hf_patches)
+            reconstructed_hr_hf_patches = refinement_scale * rescored_hr_hf_patches
 
         # Reassemble non-overlapping HR patches without an HR coherence layer.
         reconstructed_hr_hf_image = self.patch_inpainting.fold_native(
