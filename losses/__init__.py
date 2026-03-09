@@ -26,6 +26,7 @@ class InpaintingLoss(nn.Module):
         hr_perceptual_weight: float = 0.0,
         hr_style_weight: float = 0.0,
         hr_delta_weight: float = 0.0,
+        hr_aux_image_size: int | None = None,
         gain_ratio_weight: float = 0.0,
         hr_gain_ratio_weight: float = 0.0,
     ):
@@ -40,6 +41,9 @@ class InpaintingLoss(nn.Module):
         self.hr_perceptual_weight = hr_perceptual_weight
         self.hr_style_weight = hr_style_weight
         self.hr_delta_weight = hr_delta_weight
+        self.hr_aux_image_size = (
+            None if hr_aux_image_size is None else max(1, int(hr_aux_image_size))
+        )
         self.gain_ratio_weight = gain_ratio_weight
         self.hr_gain_ratio_weight = hr_gain_ratio_weight
 

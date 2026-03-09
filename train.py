@@ -253,6 +253,22 @@ def masked_l1_per_sample(pred, target, mask):
     return (torch.abs(pred - target) * mask).sum(dim=(1, 2, 3)) / denom
 
 
+def resize_for_aux_loss(pred, target, mask, image_size):
+    """Optionally downsample tensors for auxiliary HR losses to save memory."""
+    if image_size is None:
+        return pred, target, mask
+    target_h, target_w = target.shape[-2:]
+    if target_h <= image_size and target_w <= image_size:
+        return pred, target, mask
+
+    size = (image_size, image_size)
+    pred_small = F.interpolate(pred, size=size, mode="bilinear", align_corners=False)
+    target_small = F.interpolate(target, size=size, mode="bilinear", align_corners=False)
+    mask_small = F.interpolate(mask, size=size, mode="nearest")
+    mask_small = (mask_small > 0.5).to(pred_small.dtype)
+    return pred_small, target_small, mask_small
+
+
 def compute_train_loss(
     criterion,
     coarse_raw,
@@ -312,21 +328,42 @@ def compute_train_loss(
         hr_for_perceptual = (
             hr_refined_composite if hr_refined_composite is not None else hr_refined_raw
         ).clamp(0, 1)
+        hr_aux_image_size = getattr(criterion, "hr_aux_image_size", None)
         if criterion.hr_refined_weight > 0:
             # HR inference restores known pixels after attention transfer, so the
             # HR L1 term should supervise that same composited prediction.
             hr_l1_refined = criterion.masked_l1(hr_for_perceptual, hr_target, hr_mask)
         if criterion.hr_delta_weight > 0 and hr_base_raw is not None:
             hr_base_raw_detached = hr_base_raw.detach()
-            hr_delta = criterion.masked_l1(
-                hr_refined_raw - hr_base_raw_detached,
-                hr_target - hr_base_raw_detached,
+            hr_delta_pred = hr_refined_raw - hr_base_raw_detached
+            hr_delta_target = hr_target - hr_base_raw_detached
+            hr_delta_pred, hr_delta_target, hr_delta_mask = resize_for_aux_loss(
+                hr_delta_pred,
+                hr_delta_target,
                 hr_mask,
+                hr_aux_image_size,
+            )
+            hr_delta = criterion.masked_l1(
+                hr_delta_pred,
+                hr_delta_target,
+                hr_delta_mask,
             )
         if criterion.hr_perceptual_weight > 0:
-            hr_perceptual = criterion.perceptual_loss(hr_for_perceptual, hr_target)
+            hr_perceptual_pred, hr_perceptual_target, _ = resize_for_aux_loss(
+                hr_for_perceptual,
+                hr_target,
+                hr_mask,
+                hr_aux_image_size,
+            )
+            hr_perceptual = criterion.perceptual_loss(hr_perceptual_pred, hr_perceptual_target)
         if criterion.hr_style_weight > 0:
-            hr_style = criterion.style_loss(hr_for_perceptual, hr_target)
+            hr_style_pred, hr_style_target, _ = resize_for_aux_loss(
+                hr_for_perceptual,
+                hr_target,
+                hr_mask,
+                hr_aux_image_size,
+            )
+            hr_style = criterion.style_loss(hr_style_pred, hr_style_target)
         if criterion.hr_gain_ratio_weight > 0 and hr_base_composite is not None:
             hr_base_hole = masked_l1_per_sample(hr_base_composite, hr_target, hr_mask).detach()
             hr_refined_hole = masked_l1_per_sample(hr_for_perceptual, hr_target, hr_mask)
