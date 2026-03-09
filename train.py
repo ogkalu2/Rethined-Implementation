@@ -506,8 +506,10 @@ def evaluate_refinement_health(
     coarse_masked = result["masked_l1_coarse"]
     refined_masked = result["masked_l1_refined"]
     if coarse_masked is not None and refined_masked is not None and coarse_masked > 0:
+        result["refinement_gain_abs"] = float(coarse_masked - refined_masked)
         result["refinement_gain_pct"] = float((coarse_masked - refined_masked) / coarse_masked * 100.0)
     else:
+        result["refinement_gain_abs"] = None
         result["refinement_gain_pct"] = None
 
     better_rate = result["refined_better_flags"]
@@ -520,8 +522,10 @@ def evaluate_refinement_health(
     hr_base_masked = result["hr_masked_l1_base"]
     hr_refined_masked = result["hr_masked_l1_refined"]
     if hr_base_masked is not None and hr_refined_masked is not None and hr_base_masked > 0:
+        result["hr_refinement_gain_abs"] = float(hr_base_masked - hr_refined_masked)
         result["hr_refinement_gain_pct"] = float((hr_base_masked - hr_refined_masked) / hr_base_masked * 100.0)
     else:
+        result["hr_refinement_gain_abs"] = None
         result["hr_refinement_gain_pct"] = None
     result["hr_refined_better_rate"] = result["hr_refined_better_flags"]
     result["hr_refined_tie_rate"] = result["hr_refined_tie_flags"]
@@ -629,6 +633,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     writer.add_scalar("val/valid_l1_refined", health["valid_l1_refined"], step)
     writer.add_scalar("val/raw_valid_l1_coarse", health["raw_valid_l1_coarse"], step)
     writer.add_scalar("val/raw_valid_l1_refined", health["raw_valid_l1_refined"], step)
+    if health.get("refinement_gain_abs") is not None:
+        writer.add_scalar("val/refinement_gain_abs", health["refinement_gain_abs"], step)
     writer.add_scalar("val/refinement_gain_pct", health["refinement_gain_pct"], step)
     writer.add_scalar("val/refined_better_rate", health["refined_better_rate"], step)
     writer.add_scalar("val/refined_tie_rate", health["refined_tie_rate"], step)
@@ -647,6 +653,8 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         writer.add_scalar("val/hr_masked_l1_base", health["hr_masked_l1_base"], step)
     if health.get("hr_masked_l1_refined") is not None:
         writer.add_scalar("val/hr_masked_l1_refined", health["hr_masked_l1_refined"], step)
+    if health.get("hr_refinement_gain_abs") is not None:
+        writer.add_scalar("val/hr_refinement_gain_abs", health["hr_refinement_gain_abs"], step)
     if health.get("hr_refinement_gain_pct") is not None:
         writer.add_scalar("val/hr_refinement_gain_pct", health["hr_refinement_gain_pct"], step)
     if health.get("hr_refined_better_rate") is not None:
@@ -674,6 +682,9 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
     hr_suffix = ""
     if health.get("hr_refinement_gain_pct") is not None:
         hr_suffix = (
+            f", hr_base={health['hr_masked_l1_base']:.4f}"
+            f", hr_refined={health['hr_masked_l1_refined']:.4f}"
+            f", hr_gain_abs={health['hr_refinement_gain_abs']:.4f}"
             f", hr_gain={health['hr_refinement_gain_pct']:.2f}%"
             f", hr_better={health['hr_refined_better_rate']:.2f}"
         )
@@ -683,6 +694,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         f"scale={health['runtime_refinement_scale']:.2f}, "
         f"masked L1 coarse={health['masked_l1_coarse']:.4f}, "
         f"refined={health['masked_l1_refined']:.4f}, "
+        f"gain_abs={health['refinement_gain_abs']:.4f}, "
         f"gain={health['refinement_gain_pct']:.2f}%, "
         f"better_rate={health['refined_better_rate']:.2f}, "
         f"tie_rate={health['refined_tie_rate']:.2f}, "
