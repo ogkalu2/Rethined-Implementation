@@ -84,6 +84,7 @@ loss:
   hr_delta_weight: 1.0
   hr_perceptual_weight: 0.1
   hr_style_weight: 0.0
+  hr_aux_image_size: 512
   gain_ratio_weight: 0.25
   hr_gain_ratio_weight: 1.0
 
