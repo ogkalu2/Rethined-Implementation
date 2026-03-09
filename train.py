@@ -369,18 +369,20 @@ def compute_train_loss(
             hr_refined_hole = masked_l1_per_sample(hr_for_perceptual, hr_target, hr_mask)
             hr_gain_ratio = (hr_refined_hole / hr_base_hole.clamp_min(1e-4)).mean()
 
-    total = (
-        criterion.coarse_weight * l1_coarse
-        + refinement_loss_scale * criterion.refined_weight * l1_refined
-        + refinement_loss_scale * criterion.perceptual_weight * perceptual
-        + refinement_loss_scale * criterion.style_weight * style
-        + refinement_loss_scale * criterion.hr_refined_weight * hr_l1_refined
-        + refinement_loss_scale * criterion.hr_delta_weight * hr_delta
-        + refinement_loss_scale * criterion.hr_perceptual_weight * hr_perceptual
-        + refinement_loss_scale * criterion.hr_style_weight * hr_style
-        + refinement_loss_scale * criterion.gain_ratio_weight * gain_ratio
-        + refinement_loss_scale * criterion.hr_gain_ratio_weight * hr_gain_ratio
+    coarse_term = criterion.coarse_weight * l1_coarse
+    refinement_term = (
+        criterion.refined_weight * l1_refined
+        + criterion.perceptual_weight * perceptual
+        + criterion.style_weight * style
+        + criterion.hr_refined_weight * hr_l1_refined
+        + criterion.hr_delta_weight * hr_delta
+        + criterion.hr_perceptual_weight * hr_perceptual
+        + criterion.hr_style_weight * hr_style
+        + criterion.gain_ratio_weight * gain_ratio
+        + criterion.hr_gain_ratio_weight * hr_gain_ratio
     )
+    total = coarse_term + refinement_loss_scale * refinement_term
+    total_normalized = coarse_term + refinement_term
 
     loss_dict = {
         "l1_coarse": l1_coarse.item(),
@@ -393,12 +395,25 @@ def compute_train_loss(
         "hr_style": hr_style.item(),
         "gain_ratio": gain_ratio.item(),
         "hr_gain_ratio": hr_gain_ratio.item(),
+        "coarse_term": coarse_term.item(),
+        "refinement_term": refinement_term.item(),
         "total": total.item(),
+        "total_normalized": total_normalized.item(),
     }
     return total, loss_dict
 
 
-def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, extra=None):
+def write_status(
+    log_dir,
+    step,
+    total_steps,
+    loss_dict,
+    running_loss,
+    running_normalized_loss,
+    lr,
+    start_time,
+    extra=None,
+):
     """Write training status to JSON file for remote monitoring."""
     elapsed = time.time() - start_time
     steps_done = max(step, 1)
@@ -410,6 +425,7 @@ def write_status(log_dir, step, total_steps, loss_dict, running_loss, lr, start_
         "total_steps": total_steps,
         "progress_pct": round(step / total_steps * 100, 2),
         "running_loss": round(running_loss, 4),
+        "running_normalized_loss": round(running_normalized_loss, 4),
         "loss": {k: round(v, 4) for k, v in loss_dict.items()},
         "lr": lr,
         "it_per_sec": round(it_per_sec, 2),
@@ -728,7 +744,18 @@ def run_eval_only(cfg, args):
     print(f"Saved eval summary: {eval_path}")
 
 
-def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, lr, start_time, health):
+def log_validation(
+    writer,
+    log_dir,
+    step,
+    total_steps,
+    loss_dict,
+    running_loss,
+    running_normalized_loss,
+    lr,
+    start_time,
+    health,
+):
     """Persist validation metrics and print a compact summary."""
     writer.add_scalar("val/masked_l1_coarse", health["masked_l1_coarse"], step)
     writer.add_scalar("val/masked_l1_refined", health["masked_l1_refined"], step)
@@ -752,6 +779,7 @@ def log_validation(writer, log_dir, step, total_steps, loss_dict, running_loss, 
         total_steps,
         loss_dict,
         running_loss,
+        running_normalized_loss,
         lr,
         start_time,
         extra={"validation": health},
@@ -928,6 +956,7 @@ def train(cfg, args):
 
     pbar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
     running_loss = 0.0
+    running_normalized_loss = 0.0
     train_start_time = time.time()
     loss_dict = {
         "l1_coarse": 0.0,
@@ -940,7 +969,10 @@ def train(cfg, args):
         "hr_style": 0.0,
         "gain_ratio": 0.0,
         "hr_gain_ratio": 0.0,
+        "coarse_term": 0.0,
+        "refinement_term": 0.0,
         "total": 0.0,
+        "total_normalized": 0.0,
     }
     coarse = None
     refined = None
@@ -1042,7 +1074,12 @@ def train(cfg, args):
         optimizer.zero_grad()
 
         running_loss = 0.9 * running_loss + 0.1 * loss_dict["total"]
-        pbar.set_postfix(loss=f"{running_loss:.4f}", l1r=f"{loss_dict['l1_refined']:.4f}")
+        running_normalized_loss = 0.9 * running_normalized_loss + 0.1 * loss_dict["total_normalized"]
+        pbar.set_postfix(
+            loss=f"{running_loss:.4f}",
+            nloss=f"{running_normalized_loss:.4f}",
+            l1r=f"{loss_dict['l1_refined']:.4f}",
+        )
 
         # Logging
         if step == 1 or step % log_cfg["log_interval"] == 0:
@@ -1057,6 +1094,11 @@ def train(cfg, args):
             writer.add_scalar("loss/hr_style", loss_dict["hr_style"], step)
             writer.add_scalar("loss/gain_ratio", loss_dict["gain_ratio"], step)
             writer.add_scalar("loss/hr_gain_ratio", loss_dict["hr_gain_ratio"], step)
+            writer.add_scalar("loss/coarse_term", loss_dict["coarse_term"], step)
+            writer.add_scalar("loss/refinement_term", loss_dict["refinement_term"], step)
+            writer.add_scalar("loss/total_normalized", loss_dict["total_normalized"], step)
+            writer.add_scalar("loss/running_total", running_loss, step)
+            writer.add_scalar("loss/running_total_normalized", running_normalized_loss, step)
             writer.add_scalar("lr", lr, step)
             writer.add_scalar("refinement_scale", refinement_scale, step)
             writer.add_scalar("refinement_lr", refinement_lr, step)
@@ -1071,7 +1113,16 @@ def train(cfg, args):
                     writer.add_scalar("xpu_mem_gb", peak_memory_gb, step)
 
             # Write status file for remote monitoring
-            write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr, train_start_time)
+            write_status(
+                log_cfg["log_dir"],
+                step,
+                total_steps,
+                loss_dict,
+                running_loss,
+                running_normalized_loss,
+                lr,
+                train_start_time,
+            )
 
         if eval_loader is not None and step % eval_interval == 0:
             health = evaluate_refinement_health(
@@ -1092,6 +1143,7 @@ def train(cfg, args):
                 total_steps,
                 loss_dict,
                 running_loss,
+                running_normalized_loss,
                 lr,
                 train_start_time,
                 health,
@@ -1114,8 +1166,17 @@ def train(cfg, args):
             ckpt_path = ckpt_dir / f"step_{step}.pth"
             if save_checkpoint(model, optimizer, scaler, step, loss_dict, cfg, ckpt_path):
                 print(f"\nSaved checkpoint: {ckpt_path}")
-                write_status(log_cfg["log_dir"], step, total_steps, loss_dict, running_loss, lr, train_start_time,
-                             extra={"event": "checkpoint", "checkpoint_path": str(ckpt_path)})
+                write_status(
+                    log_cfg["log_dir"],
+                    step,
+                    total_steps,
+                    loss_dict,
+                    running_loss,
+                    running_normalized_loss,
+                    lr,
+                    train_start_time,
+                    extra={"event": "checkpoint", "checkpoint_path": str(ckpt_path)},
+                )
 
             # Clean old checkpoints (keep all if using checkpoint_steps)
             if not checkpoint_steps:
@@ -1149,6 +1210,7 @@ def train(cfg, args):
             total_steps,
             loss_dict,
             running_loss,
+            running_normalized_loss,
             final_lr,
             train_start_time,
             final_health,
