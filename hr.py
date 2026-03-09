@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from blocks import DepthwiseSeparableBlock, fuse_conv_bn_pair, make_norm2d
+from blocks import DepthwiseSeparableBlock, NativeGaussianBlur2d, fuse_conv_bn_pair, make_norm2d
 
 if TYPE_CHECKING:
     from patchmatch import PatchInpainting
@@ -56,6 +56,7 @@ class HRResidualRefiner(nn.Module):
         )
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
+        self.residual_smoother = NativeGaussianBlur2d((5, 5), sigma=(1.0, 1.0))
 
     def _pool_flat_patches(
         self,
@@ -66,6 +67,37 @@ class HRResidualRefiner(nn.Module):
         batch_size, num_patches, _ = patches_flat.shape
         patches = patches_flat.reshape(batch_size * num_patches, channels, patch_size, patch_size)
         return F.adaptive_avg_pool2d(patches, output_size=(self.template_size, self.template_size))
+
+    def _flat_to_image(
+        self,
+        patches_flat: torch.Tensor,
+        channels: int,
+        patch_size: int,
+        grid_size: tuple[int, int],
+    ) -> torch.Tensor:
+        batch_size, num_patches, _ = patches_flat.shape
+        grid_h, grid_w = grid_size
+        if num_patches != grid_h * grid_w:
+            raise ValueError(
+                f"HRResidualRefiner expected {grid_h * grid_w} patches, got {num_patches}"
+            )
+        patches = patches_flat.view(batch_size, grid_h, grid_w, channels, patch_size, patch_size)
+        return (
+            patches.permute(0, 3, 1, 4, 2, 5)
+            .contiguous()
+            .view(batch_size, channels, grid_h * patch_size, grid_w * patch_size)
+        )
+
+    def _image_to_flat(self, image: torch.Tensor, patch_size: int) -> torch.Tensor:
+        batch_size, channels, height, width = image.shape
+        grid_h = height // patch_size
+        grid_w = width // patch_size
+        return (
+            image.view(batch_size, channels, grid_h, patch_size, grid_w, patch_size)
+            .permute(0, 2, 4, 1, 3, 5)
+            .contiguous()
+            .view(batch_size, grid_h * grid_w, channels * patch_size * patch_size)
+        )
 
     def forward(
         self,
@@ -118,7 +150,12 @@ class HRResidualRefiner(nn.Module):
         )
         mask = mask_patches_flat.reshape(batch_size * num_patches, 1, patch_size, patch_size)
         residual = residual * mask
-        return residual.reshape(batch_size, num_patches, 3 * patch_size * patch_size)
+        residual = residual.reshape(batch_size, num_patches, 3 * patch_size * patch_size)
+        residual_image = self._flat_to_image(residual, channels=3, patch_size=patch_size, grid_size=grid_size)
+        mask_image = self._flat_to_image(mask_patches_flat, channels=1, patch_size=patch_size, grid_size=grid_size)
+        residual_image = 0.5 * residual_image + 0.5 * self.residual_smoother(residual_image)
+        residual_image = residual_image * mask_image
+        return self._image_to_flat(residual_image, patch_size)
 
     def reparameterize(self):
         if isinstance(self.patch_encoder, nn.Sequential) and len(self.patch_encoder) >= 5:
