@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from blocks import DepthwiseSeparableBlock, fuse_conv_bn_pair
+from blocks import DepthwiseSeparableBlock, fuse_conv_bn_pair, make_norm2d
 
 if TYPE_CHECKING:
     from patchmatch import PatchInpainting
@@ -28,10 +28,10 @@ class HRResidualRefiner(nn.Module):
         patch_hidden = max(8, hidden_channels // 2)
         self.patch_encoder = nn.Sequential(
             nn.Conv2d(in_channels, patch_hidden, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(patch_hidden),
+            make_norm2d(patch_hidden),
             nn.ReLU(inplace=True),
             nn.Conv2d(patch_hidden, patch_hidden, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(patch_hidden),
+            make_norm2d(patch_hidden),
             nn.ReLU(inplace=True),
         )
         blocks = []

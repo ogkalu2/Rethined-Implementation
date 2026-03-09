@@ -37,6 +37,14 @@ def fuse_conv_bn_pair(conv: nn.Module, bn: nn.Module) -> tuple[nn.Module, nn.Mod
     return fuse_conv_bn_eval(conv.eval(), bn.eval()), nn.Identity()
 
 
+def make_norm2d(num_channels: int, max_groups: int = 32) -> nn.Module:
+    """Batch-size-independent normalization for stable small-batch training."""
+    groups = min(max_groups, num_channels)
+    while groups > 1 and num_channels % groups != 0:
+        groups -= 1
+    return nn.GroupNorm(groups, num_channels)
+
+
 def fuse_conv_bn_to_weight_bias(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> tuple[torch.Tensor, torch.Tensor]:
     """Return the fused kernel and bias tensors for a Conv2d+BN branch."""
     fused = fuse_conv_bn_eval(conv.eval(), bn.eval())
@@ -99,15 +107,15 @@ class DepthwiseSeparableBlock(nn.Module):
             groups=in_channels,
             bias=False,
         )
-        self.depthwise_bn = nn.BatchNorm2d(in_channels)
+        self.depthwise_bn = make_norm2d(in_channels)
         self.pointwise = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.pointwise_bn = nn.BatchNorm2d(out_channels)
+        self.pointwise_bn = make_norm2d(out_channels)
         self.activation = nn.ReLU(inplace=True)
         self.proj = None
         if use_residual and (stride != 1 or in_channels != out_channels):
             self.proj = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
+                make_norm2d(out_channels),
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -153,7 +161,7 @@ class RepDepthwiseSeparableBlock(nn.Module):
             groups=self.in_channels,
             bias=False,
         )
-        self.depthwise_bn = nn.BatchNorm2d(self.in_channels)
+        self.depthwise_bn = make_norm2d(self.in_channels)
 
         self.depthwise_scale = nn.Conv2d(
             self.in_channels,
@@ -164,24 +172,24 @@ class RepDepthwiseSeparableBlock(nn.Module):
             groups=self.in_channels,
             bias=False,
         )
-        self.depthwise_scale_bn = nn.BatchNorm2d(self.in_channels)
+        self.depthwise_scale_bn = make_norm2d(self.in_channels)
         nn.init.zeros_(self.depthwise_scale_bn.weight)
         nn.init.zeros_(self.depthwise_scale_bn.bias)
 
         self.depthwise_identity_bn = None
         if self.stride == 1:
-            self.depthwise_identity_bn = nn.BatchNorm2d(self.in_channels)
+            self.depthwise_identity_bn = make_norm2d(self.in_channels)
             nn.init.zeros_(self.depthwise_identity_bn.weight)
             nn.init.zeros_(self.depthwise_identity_bn.bias)
 
         self.pointwise = nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, bias=False)
-        self.pointwise_bn = nn.BatchNorm2d(self.out_channels)
+        self.pointwise_bn = make_norm2d(self.out_channels)
 
         self.proj = None
         if self.use_residual and (self.stride != 1 or self.in_channels != self.out_channels):
             self.proj = nn.Sequential(
                 nn.Conv2d(self.in_channels, self.out_channels, kernel_size=1, stride=self.stride, bias=False),
-                nn.BatchNorm2d(self.out_channels),
+                make_norm2d(self.out_channels),
             )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -201,6 +209,8 @@ class RepDepthwiseSeparableBlock(nn.Module):
         return self.activation(out)
 
     def reparameterize(self):
+        if not isinstance(self.depthwise_bn, nn.BatchNorm2d):
+            return self
         dw_kernel, dw_bias = fuse_conv_bn_to_weight_bias(self.depthwise, self.depthwise_bn)
         scale_kernel, scale_bias = fuse_conv_bn_to_weight_bias(self.depthwise_scale, self.depthwise_scale_bn)
         dw_kernel = dw_kernel + pad_kernel_to_size(scale_kernel, target_size=3)
