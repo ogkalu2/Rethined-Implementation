@@ -125,8 +125,8 @@ class PatchInpainting(nn.Module):
         )
         self.paper_coherence_layer = (
             nn.Conv2d(
-                self.patch_value_dim,
-                self.patch_value_dim,
+                3, # Changed from self.patch_value_dim to 3 (RGB channels)
+                3, # Changed from self.patch_value_dim to 3 (RGB channels)
                 kernel_size=3,
                 stride=1,
                 padding=1,
@@ -270,13 +270,19 @@ class PatchInpainting(nn.Module):
         )
 
         mixed_patch_map = mixed_patches_flat.transpose(1, 2).contiguous().view_as(patch_map)
-        if self.paper_coherence_layer is not None:
-            mixed_patch_map = mixed_patch_map + self.paper_coherence_layer(mixed_patch_map)
+                
+        # 1. Fold the patches back into a standard RGB image FIRST
         refined = self.fold_native(
             mixed_patch_map,
             output_size,
             kernel_size=self.kernel_size,
         )
+        
+        # 2. Apply the coherence layer to smooth the seams on the folded 3-channel image
+        if self.paper_coherence_layer is not None:
+            refined = refined + self.paper_coherence_layer(refined)
+            
+        # 3. Paste the uncorrupted original pixels back over the known regions
         refined = refined * mask + image * (1 - mask)
 
         return refined, masked_attention, coarse_raw
