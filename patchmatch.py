@@ -82,70 +82,30 @@ class PatchInpainting(nn.Module):
         nheads: int,
         stem_out_stride: int = 1,
         stem_out_channels: int = 3,
-        cross_attention: bool = False,
-        mask_query_with_segmentation_mask: bool = False,
-        merge_mode: str = "all",
-        use_kpos: bool = True,
+        use_positional_encoding: bool = True,
         image_size: int = 512,
         embed_dim: int = 2048,
-        use_qpos: bool = True,
         dropout: float = 0.1,
-        attention_type: str = "MultiHeadAttention",
-        compute_v: float = 0.1,
         feature_i: int = 2,
         feature_dim: int = 128,
         concat_features: bool = True,
         attention_masking: bool = True,
         final_conv: bool = False,
         mask_inpainting: bool = True,
-        use_argmax: bool = False,
         attn_topk: int | None = None,
-        attn_add_residual: bool = False,
         attn_temperature: float = 1.0,
         token_use_mask_ratio: bool = False,
         paper_mask_renormalize: bool = False,
-        mask_patch_ratio_threshold: float = 0.0,
-        min_valid_patches: int = 1,
-        use_entropy_confidence: bool = False,
-        hr_candidate_topk: int | None = None,
-        hr_feature_pool_size: int = 4,
-        hr_rescore_dim: int = 64,
-        hr_rescore_hidden_dim: int = 128,
-        hr_query_chunk_size: int = 128,
-        use_hr_residual_refiner: bool = False,
-        hr_refiner_channels: int = 32,
-        hr_refiner_blocks: int = 4,
-        hr_refiner_template_size: int = 4,
         positional_grid_size: int = 32,
         model,
     ):
         super().__init__()
-        del cross_attention
-        del mask_query_with_segmentation_mask
-        del merge_mode
-        del attention_type
-        del compute_v
-        del use_argmax
-        del attn_add_residual
-        del mask_patch_ratio_threshold
-        del min_valid_patches
-        del use_entropy_confidence
-        del hr_candidate_topk
-        del hr_feature_pool_size
-        del hr_rescore_dim
-        del hr_rescore_hidden_dim
-        del hr_query_chunk_size
-        del use_hr_residual_refiner
-        del hr_refiner_channels
-        del hr_refiner_blocks
-        del hr_refiner_template_size
 
         self.kernel_size = int(kernel_size)
         self.nheads = int(nheads)
         self.stem_out_stride = int(stem_out_stride)
         self.stem_out_channels = int(stem_out_channels)
-        self.use_kpos = bool(use_kpos)
-        self.use_qpos = bool(use_qpos)
+        self.use_positional_encoding = bool(use_positional_encoding)
         self.feature_i = int(feature_i)
         self.feature_dim = int(feature_dim)
         self.concat_features = bool(concat_features)
@@ -182,7 +142,7 @@ class PatchInpainting(nn.Module):
                     self.positional_grid_size,
                 )
             )
-            if self.use_kpos or self.use_qpos
+            if self.use_positional_encoding
             else None
         )
         self.paper_coherence_layer = (

@@ -13,37 +13,19 @@ model:
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
-    merge_mode: "all"
     image_size: 512
     embed_dim: 576
-    use_qpos: true
-    use_kpos: true
+    use_positional_encoding: true
     dropout: 0.1
     feature_i: 2
     feature_dim: null
     concat_features: true
     final_conv: true
-    attention_type: "MultiHeadAttention"
-    compute_v: false
-    use_argmax: false
     attn_topk: 32
-    attn_add_residual: false
     attn_temperature: 0.7
     token_use_mask_ratio: false
     attention_masking: true
     paper_mask_renormalize: true
-    mask_patch_ratio_threshold: 0.05
-    min_valid_patches: 8
-    use_entropy_confidence: false
-    hr_candidate_topk: 32
-    hr_feature_pool_size: 4
-    hr_rescore_dim: 64
-    hr_rescore_hidden_dim: 128
-    hr_query_chunk_size: 128
-    use_hr_residual_refiner: true
-    hr_refiner_channels: 32
-    hr_refiner_blocks: 4
-    hr_refiner_template_size: 4
 
 data:
   root_dir: "."
@@ -60,36 +42,28 @@ training:
   total_steps: 2000
   grad_accum_steps: 1
   lr: 0.001
+  discriminator_lr: 0.001
   warmup_steps: 100
-  refinement_start_step: 0
-  refinement_warmup_steps: 500
-  refinement_lr_scale: 1.0
-  coarse_freeze_step: null
   min_lr: 0.000001
+  discriminator_min_lr: 0.000001
   grad_clip: 1.0
+  discriminator_grad_clip: 1.0
   mixed_precision: true
   seed: 42
-  joint_hr_pipeline: true
-  freeze_coarse: false
-  auto_freeze_coarse: true
+  betas: [0.9, 0.999]
 
 loss:
-  coarse_weight: 1.0
-  refined_weight: 1.0
-  l1_hole_weight: 6.0
-  l1_valid_weight: 1.0
+  coarse_l2_weight: 1.0
+  frequency_weight: 1.0
   perceptual_weight: 0.1
-  perceptual_crop_size: 256
-  hr_perceptual_crop_size: 384
-  perceptual_crop_pad_frac: 0.35
-  style_weight: 0.0
-  hr_refined_weight: 2.0
-  hr_delta_weight: 1.0
-  hr_perceptual_weight: 0.1
-  hr_style_weight: 0.0
-  hr_aux_image_size: 512
-  gain_ratio_weight: 0.25
-  hr_gain_ratio_weight: 1.0
+  adversarial_weight: 0.01
+  focal_alpha: 1.0
+  focal_log_matrix: false
+
+discriminator:
+  in_channels: 3
+  base_channels: 64
+  n_layers: 3
 
 logging:
   log_dir: "logs/overfit_supercaf_1024_from_512"

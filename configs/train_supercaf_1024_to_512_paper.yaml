@@ -15,8 +15,7 @@ model:
     stem_out_channels: 3
     image_size: 512
     embed_dim: 2048
-    use_qpos: true
-    use_kpos: true
+    use_positional_encoding: true
     dropout: 0.1
     feature_i: 2
     feature_dim: null

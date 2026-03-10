@@ -49,4 +49,8 @@ class AttentionUpscaling(nn.Module):
             kernel_size=hr_patch_size,
             use_final_conv=False,
         )
-        return hr_base + reconstructed_hf
+        output = hr_base + reconstructed_hf
+        if mask_hr is None:
+            return output
+        known = x_hr * (1 - mask_hr)
+        return output * mask_hr + known
