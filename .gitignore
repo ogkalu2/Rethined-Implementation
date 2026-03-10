@@ -18,6 +18,7 @@ test_*.py
 demo_*.py
 
 # Misc Folders
+dataset/manifests/
 datasets/
 logs/
 results/
