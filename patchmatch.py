@@ -83,10 +83,11 @@ class PatchInpainting(nn.Module):
         attention_masking: bool = True,
         final_conv: bool = False,
         positional_grid_size: int = 32,
+        use_conv_unfold: bool = False,
         model,
     ):
         super().__init__()
-
+        self.use_conv_unfold = use_conv_unfold
         self.kernel_size = int(kernel_size)
         self.nheads = int(nheads)
         self.stem_out_stride = int(stem_out_stride)
@@ -184,16 +185,22 @@ class PatchInpainting(nn.Module):
 
     def unfold_native(self, feature_map: torch.Tensor, kernel_size: int) -> tuple[torch.Tensor, tuple[int, int]]:
         batch_size, channels, height, width = feature_map.shape
-        weights = self._get_unfolding_weights(
-            kernel_size,
-            channels,
-            dtype=feature_map.dtype,
-            device=feature_map.device,
-        )
-        patches = F.conv2d(feature_map, weights, stride=kernel_size, groups=channels)
         n_h = height // kernel_size
         n_w = width // kernel_size
-        patches = patches.view(batch_size, channels * kernel_size * kernel_size, n_h, n_w)
+
+        if self.use_conv_unfold:
+            # THE Mobile Export Path (Uses NPU-friendly Conv2D)
+            weights = self._get_unfolding_weights(
+                kernel_size, channels, dtype=feature_map.dtype, device=feature_map.device
+            )
+            patches = F.conv2d(feature_map, weights, stride=kernel_size, groups=channels)
+            patches = patches.view(batch_size, channels * kernel_size * kernel_size, n_h, n_w)
+        else:
+            # THE Desktop/Training Path (0-FLOP memory reshape)
+            x = feature_map.view(batch_size, channels, n_h, kernel_size, n_w, kernel_size)
+            x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+            patches = x.view(batch_size, channels * kernel_size * kernel_size, n_h, n_w)
+
         return patches, (height, width)
 
     def fold_native(
