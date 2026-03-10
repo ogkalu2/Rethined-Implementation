@@ -13,7 +13,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
-from torch.utils.tensorboard import SummaryWriter
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
@@ -30,6 +29,48 @@ from discriminator import PatchDiscriminator
 from hr import AttentionUpscaling
 from losses import InpaintingLoss
 from model import InpaintingModel
+
+
+class NullSummaryWriter:
+    """Fallback writer used when TensorBoard is unavailable."""
+
+    def add_scalar(self, *args, **kwargs):
+        pass
+
+    def add_image(self, *args, **kwargs):
+        pass
+
+    def close(self):
+        pass
+
+
+def _is_tensorboard_compatible() -> bool:
+    """Check TensorBoard's protobuf compatibility before importing it."""
+    try:
+        from google.protobuf.message_factory import MessageFactory
+    except Exception:
+        return False
+    return hasattr(MessageFactory, "GetPrototype")
+
+
+def create_summary_writer(log_dir: Path):
+    if not _is_tensorboard_compatible():
+        print(
+            "TensorBoard logging disabled: installed protobuf is incompatible "
+            "with torch.utils.tensorboard. Pin protobuf<6 to re-enable it."
+        )
+        return NullSummaryWriter()
+
+    try:
+        from torch.utils.tensorboard import SummaryWriter
+    except Exception as exc:
+        print(
+            "TensorBoard logging disabled because SummaryWriter could not be "
+            f"imported: {exc.__class__.__name__}: {exc}"
+        )
+        return NullSummaryWriter()
+
+    return SummaryWriter(log_dir)
 
 
 def build_model_config(cfg):
@@ -427,7 +468,7 @@ def train(cfg, args):
     log_dir = Path(log_cfg["log_dir"])
     ckpt_dir = log_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir / "tb")
+    writer = create_summary_writer(log_dir / "tb")
 
     start_step = 0
     if args.resume:
