@@ -21,7 +21,6 @@ model:
     final_conv: true
     attention_masking: true
     paper_mask_renormalize: false
-    token_use_mask_ratio: false
     attn_topk: null
     attn_temperature: 1.0
 

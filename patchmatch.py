@@ -91,10 +91,8 @@ class PatchInpainting(nn.Module):
         concat_features: bool = True,
         attention_masking: bool = True,
         final_conv: bool = False,
-        mask_inpainting: bool = True,
         attn_topk: int | None = None,
         attn_temperature: float = 1.0,
-        token_use_mask_ratio: bool = False,
         paper_mask_renormalize: bool = False,
         positional_grid_size: int = 32,
         model,
@@ -111,15 +109,11 @@ class PatchInpainting(nn.Module):
         self.concat_features = bool(concat_features)
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
-        self.mask_inpainting = bool(mask_inpainting)
-        self.token_use_mask_ratio = bool(token_use_mask_ratio)
         self.paper_mask_renormalize = bool(paper_mask_renormalize)
         self.image_size = int(image_size)
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.patch_value_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.patch_token_dim = self.patch_value_dim + (self.feature_dim if self.concat_features else 0)
-        if self.token_use_mask_ratio:
-            self.patch_token_dim += 1
         self.positional_grid_size = max(1, min(int(positional_grid_size), self.token_grid_size))
 
         self.encoder_decoder = model
@@ -161,7 +155,6 @@ class PatchInpainting(nn.Module):
             nn.init.zeros_(self.paper_coherence_layer.weight)
             nn.init.zeros_(self.paper_coherence_layer.bias)
 
-        self.refinement_runtime_scale = 1.0
         self.register_buffer(
             "unfolding_weights",
             self._compute_unfolding_weights(self.kernel_size, self.stem_out_channels),
@@ -224,14 +217,11 @@ class PatchInpainting(nn.Module):
         output_size: tuple[int, int],
         *,
         kernel_size: int,
-        use_final_conv: bool,
     ) -> torch.Tensor:
         n_h = output_size[0] // kernel_size
         n_w = output_size[1] // kernel_size
         if patches.dim() == 3:
             patches = patches.transpose(1, 2).contiguous().view(patches.shape[0], -1, n_h, n_w)
-        if use_final_conv and self.paper_coherence_layer is not None:
-            patches = self.paper_coherence_layer(patches)
         return F.pixel_shuffle(patches, upscale_factor=kernel_size)
 
     def build_paper_attention_mask(self, patch_mask_flat: torch.Tensor) -> torch.Tensor:
@@ -256,19 +246,13 @@ class PatchInpainting(nn.Module):
             pos = self.positionalencoding
         return pos.flatten(start_dim=2).transpose(1, 2)
 
-    def set_refinement_runtime_scale(self, scale: float) -> None:
-        self.refinement_runtime_scale = float(scale)
-
     def reparameterize(self):
         return self
 
     def forward(self, image: torch.Tensor, mask: torch.Tensor):
         coarse_raw, features = self.encoder_decoder(image)
-        coarse_composite = coarse_raw
-        if self.mask_inpainting:
-            coarse_composite = coarse_raw * mask + image * (1 - mask)
 
-        patch_map, output_size = self.unfold_native(coarse_composite, self.kernel_size)
+        patch_map, output_size = self.unfold_native(coarse_raw, self.kernel_size)
         mask_patch_map, _ = self.unfold_native(mask, self.kernel_size)
         patch_mask_flat = (mask_patch_map.amax(dim=1) > 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
 
@@ -281,8 +265,6 @@ class PatchInpainting(nn.Module):
                 align_corners=False,
             )
             token_map = torch.cat([token_map, coarse_features], dim=1)
-        if self.token_use_mask_ratio:
-            token_map = torch.cat([token_map, mask_patch_map.mean(dim=1, keepdim=True)], dim=1)
 
         input_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
         positional_encoding = self.get_positional_encoding()
@@ -309,10 +291,7 @@ class PatchInpainting(nn.Module):
             mixed_patch_map,
             output_size,
             kernel_size=self.kernel_size,
-            use_final_conv=False,
         )
-        refined = coarse_composite + self.refinement_runtime_scale * (refined - coarse_composite)
-        if self.mask_inpainting:
-            refined = refined * mask + coarse_composite * (1 - mask)
+        refined = refined * mask + image * (1 - mask)
 
         return refined, masked_attention, coarse_raw
