@@ -42,14 +42,23 @@ class AttentionUpscaling(nn.Module):
         source_patches, _ = self.patch_inpainting.unfold_native(source, hr_patch_size)
         source_blurred_patches, _ = self.patch_inpainting.unfold_native(source_blurred, hr_patch_size)
         source_hf_flat = (source_patches - source_blurred_patches).flatten(start_dim=2).transpose(1, 2)
-        reconstructed_hf_flat = torch.matmul(attn_map.squeeze(1), source_hf_flat)
+        attn_weights = attn_map.squeeze(1)
+        compute_dtype = torch.promote_types(attn_weights.dtype, source_hf_flat.dtype)
+        if attn_weights.dtype != compute_dtype:
+            attn_weights = attn_weights.to(dtype=compute_dtype)
+        if source_hf_flat.dtype != compute_dtype:
+            source_hf_flat = source_hf_flat.to(dtype=compute_dtype)
+        reconstructed_hf_flat = torch.matmul(attn_weights, source_hf_flat)
         reconstructed_hf = self.patch_inpainting.fold_native(
             reconstructed_hf_flat,
             (hr_h, hr_w),
             kernel_size=hr_patch_size,
         )
+        if hr_base.dtype != reconstructed_hf.dtype:
+            hr_base = hr_base.to(dtype=reconstructed_hf.dtype)
         output = hr_base + reconstructed_hf
         if mask_hr is None:
             return output
-        known = x_hr * (1 - mask_hr)
+        mask_hr = mask_hr.to(dtype=output.dtype)
+        known = x_hr.to(dtype=output.dtype) * (1 - mask_hr)
         return output * mask_hr + known

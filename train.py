@@ -238,12 +238,13 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
                 target,
                 eval_mask,
             )
-            refined_hr = attn_upscaler(
-                batch_views["masked_image_hr"],
-                refined_lr,
-                attn_map,
-                mask_hr=batch_views["mask_hr"],
-            ).clamp(0, 1)
+            with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
+                refined_hr = attn_upscaler(
+                    batch_views["masked_image_hr"],
+                    refined_lr,
+                    attn_map,
+                    mask_hr=batch_views["mask_hr"],
+                ).clamp(0, 1)
             refined_eval = composite_with_known(refined_hr, target, eval_mask)
         else:
             target = image
