@@ -234,6 +234,7 @@ class PatchInpainting(nn.Module):
         coarse_raw, features = self.encoder_decoder(image)
 
         patch_map, output_size = self.unfold_native(coarse_raw, self.kernel_size)
+        source_patch_map, _ = self.unfold_native(image, self.kernel_size)
         mask_patch_map, _ = self.unfold_native(mask, self.kernel_size)
         patch_mask_flat = (mask_patch_map.amax(dim=1) > 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
 
@@ -252,7 +253,8 @@ class PatchInpainting(nn.Module):
         if positional_encoding is not None:
             input_tokens = input_tokens + positional_encoding
 
-        patch_values = patch_map.flatten(start_dim=2).transpose(1, 2)
+        # The paper mixes source LR patches with attention learned from coarse tokens.
+        patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         attention_mask = (
             self.build_paper_attention_mask(patch_mask_flat) if self.attention_masking else None
         )
