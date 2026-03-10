@@ -1140,9 +1140,8 @@ def train(cfg, args):
         running_loss = 0.9 * running_loss + 0.1 * loss_dict["total"]
         running_normalized_loss = 0.9 * running_normalized_loss + 0.1 * loss_dict["total_normalized"]
         pbar.set_postfix(
-            loss=f"{running_loss:.4f}",
-            nl=f"{running_normalized_loss:.4f}",
-            l1r=f"{loss_dict['l1_refined']:.4f}",
+            nl=f"{running_normalized_loss:.3f}",
+            loss=f"{running_loss:.3f}",
         )
 
         # Logging
@@ -1186,6 +1185,11 @@ def train(cfg, args):
                 running_normalized_loss,
                 lr,
                 train_start_time,
+            )
+            print(
+                f"\nTrain step {step}: "
+                f"loss={running_loss:.4f}, nl={running_normalized_loss:.4f}, "
+                f"l1r={loss_dict['l1_refined']:.4f}, scale={refinement_scale:.3f}"
             )
 
         if eval_loader is not None and step % eval_interval == 0:
