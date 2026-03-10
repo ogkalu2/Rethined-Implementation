@@ -764,6 +764,9 @@ def run_eval_only(cfg, args):
         mask_max_coverage=cfg["data"]["mask_max_coverage"],
         val_dir=val_dir,
         manifest_path=manifest_path,
+        deterministic=args.force_random_masks,
+        fixed_mask_seed=cfg["training"]["seed"],
+        force_random_masks=args.force_random_masks,
     )
     print(f"Validation images: {len(eval_loader.dataset)}")
 
@@ -934,9 +937,15 @@ def train(cfg, args):
         manifest_path=manifest_path,
         deterministic=deterministic_overfit,
         fixed_mask_seed=cfg["training"]["seed"],
+        force_random_masks=args.force_random_masks,
         shuffle_override=(False if deterministic_overfit else None),
     )
     print(f"Training images: {len(train_loader.dataset)}")
+    if args.force_random_masks:
+        print(
+            "Mask mode: generated freeform masks (manifest masks ignored). "
+            f"Coverage target: {cfg['data']['mask_min_coverage']:.2f}-{cfg['data']['mask_max_coverage']:.2f}"
+        )
 
     eval_loader = None
     eval_batches = cfg["logging"].get("eval_batches", 8)
@@ -957,8 +966,9 @@ def train(cfg, args):
             mask_max_coverage=cfg["data"]["mask_max_coverage"],
             val_dir=val_dir,
             manifest_path=manifest_path,
-            deterministic=deterministic_overfit,
+            deterministic=(deterministic_overfit or args.force_random_masks),
             fixed_mask_seed=cfg["training"]["seed"],
+            force_random_masks=args.force_random_masks,
             shuffle_override=False,
         )
         print(f"Validation images: {len(eval_loader.dataset)}")
@@ -1285,6 +1295,11 @@ def main():
     parser.add_argument("--steps", type=int, default=None, help="Override total training steps")
     parser.add_argument("--eval-only", action="store_true", help="Run validation only on a checkpoint")
     parser.add_argument("--eval-batches", type=int, default=None, help="Override eval batches; use 0 for full validation set")
+    parser.add_argument(
+        "--force-random-masks",
+        action="store_true",
+        help="Ignore manifest masks and generate new freeform masks from the configured coverage range.",
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:

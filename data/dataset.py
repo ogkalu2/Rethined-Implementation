@@ -95,12 +95,14 @@ class InpaintingDataset(Dataset):
         manifest_path: Optional[str] = None,
         deterministic: bool = False,
         fixed_mask_seed: int = 0,
+        force_random_masks: bool = False,
     ):
         self.image_size = image_size
         self.split = split
         self.manifest_path = Path(manifest_path) if manifest_path else None
         self.deterministic = deterministic
         self.fixed_mask_seed = int(fixed_mask_seed)
+        self.force_random_masks = bool(force_random_masks)
 
         if self.manifest_path is not None:
             self.samples = _load_manifest(self.manifest_path, split)
@@ -203,7 +205,7 @@ class InpaintingDataset(Dataset):
         image = Image.open(sample["image_path"]).convert("RGB")
 
         mask_img = None
-        if sample["mask_path"] is not None:
+        if sample["mask_path"] is not None and not self.force_random_masks:
             mask_img = Image.open(sample["mask_path"]).convert("L")
             if mask_img.size != image.size:
                 mask_img = mask_img.resize(image.size, Image.NEAREST)
@@ -247,6 +249,7 @@ def get_dataloader(
     manifest_path: Optional[str] = None,
     deterministic: bool = False,
     fixed_mask_seed: int = 0,
+    force_random_masks: bool = False,
     shuffle_override: Optional[bool] = None,
 ):
     """Create a DataLoader for inpainting training/evaluation."""
@@ -261,6 +264,7 @@ def get_dataloader(
         manifest_path=manifest_path,
         deterministic=deterministic,
         fixed_mask_seed=fixed_mask_seed,
+        force_random_masks=force_random_masks,
     )
     loader_kwargs = {
         "dataset": dataset,
