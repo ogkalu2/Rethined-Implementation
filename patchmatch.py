@@ -17,15 +17,11 @@ class MultiHeadAttention(nn.Module):
         n_head: int,
         dropout: float,
         d_qk: int,
-        topk_patches: int | None = None,
-        softmax_temperature: float = 1.0,
     ):
         super().__init__()
         self.d_v = int(d_v)
         self.n_head = int(n_head)
         self.d_k = int(d_qk)
-        self.topk_patches = int(topk_patches) if topk_patches is not None else None
-        self.softmax_temperature = float(softmax_temperature)
         self.dropout = nn.Dropout(float(dropout))
         self.w_qs = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_ks = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
@@ -39,7 +35,6 @@ class MultiHeadAttention(nn.Module):
         v: torch.Tensor,
         *,
         post_softmax_mask: torch.Tensor | None = None,
-        renorm_post_mask: bool = False,
         direct_patch_mixing: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
@@ -54,17 +49,9 @@ class MultiHeadAttention(nn.Module):
             v_proj = self.w_vs(v).view(batch_size, len_v, self.n_head, self.d_v).transpose(1, 2)
 
         attn = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3))
-        if self.topk_patches is not None and self.topk_patches < attn.size(-1):
-            topk_vals, topk_idx = torch.topk(attn, k=self.topk_patches, dim=-1)
-            sparse_attn = torch.full_like(attn, -1e4)
-            attn = sparse_attn.scatter(-1, topk_idx, topk_vals)
-
-        attn = attn / max(self.softmax_temperature, 1e-6)
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
         if post_softmax_mask is not None:
             attn = attn * post_softmax_mask.to(dtype=attn.dtype)
-            if renorm_post_mask:
-                attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         attn = self.dropout(attn)
 
         mixed = torch.matmul(attn, v_proj)
@@ -91,9 +78,6 @@ class PatchInpainting(nn.Module):
         concat_features: bool = True,
         attention_masking: bool = True,
         final_conv: bool = False,
-        attn_topk: int | None = None,
-        attn_temperature: float = 1.0,
-        paper_mask_renormalize: bool = False,
         positional_grid_size: int = 32,
         model,
     ):
@@ -109,7 +93,6 @@ class PatchInpainting(nn.Module):
         self.concat_features = bool(concat_features)
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
-        self.paper_mask_renormalize = bool(paper_mask_renormalize)
         self.image_size = int(image_size)
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.patch_value_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
@@ -124,8 +107,6 @@ class PatchInpainting(nn.Module):
             n_head=self.nheads,
             dropout=float(dropout),
             d_qk=int(embed_dim),
-            topk_patches=attn_topk,
-            softmax_temperature=float(attn_temperature),
         )
         self.positionalencoding = (
             nn.Parameter(
@@ -280,7 +261,6 @@ class PatchInpainting(nn.Module):
             input_tokens,
             patch_values,
             post_softmax_mask=attention_mask,
-            renorm_post_mask=self.paper_mask_renormalize,
             direct_patch_mixing=True,
         )
 

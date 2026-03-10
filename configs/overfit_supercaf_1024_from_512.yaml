@@ -21,10 +21,7 @@ model:
     feature_dim: null
     concat_features: true
     final_conv: true
-    attn_topk: 32
-    attn_temperature: 0.7
     attention_masking: true
-    paper_mask_renormalize: true
 
 data:
   root_dir: "."

@@ -20,9 +20,6 @@ model:
     concat_features: true
     final_conv: true
     attention_masking: true
-    paper_mask_renormalize: false
-    attn_topk: null
-    attn_temperature: 1.0
 
 data:
   root_dir: "."
