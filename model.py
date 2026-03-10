@@ -3,7 +3,6 @@
 from torch import nn
 
 from coarse import COARSE_MODEL_REGISTRY
-from hr import AttentionUpscaling
 from patchmatch import PatchInpainting
 
 
@@ -49,4 +48,4 @@ class InpaintingModel(nn.Module):
             self.generator.reparameterize()
         return self
 
-__all__ = ["AttentionUpscaling", "InpaintingModel"]
+__all__ = ["InpaintingModel"]

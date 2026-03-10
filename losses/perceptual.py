@@ -1,4 +1,4 @@
-"""VGG-based perceptual and style losses for image inpainting.
+"""VGG-based perceptual losses for image inpainting.
 
 V6 keeps VGG frozen while preserving gradient flow through the prediction path.
 """
@@ -8,13 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models
 
-from device_utils import get_autocast_device_type
-
 
 class VGGFeatureExtractor(nn.Module):
     """Extract features from VGG19 at specified layers."""
 
-    def __init__(self, layer_indices=(3, 8, 15, 22), device=None):
+    def __init__(self, layer_indices=(3, 8, 15, 22)):
         super().__init__()
         vgg = models.vgg19(weights=models.VGG19_Weights.DEFAULT).features
         self.slices = nn.ModuleList()
@@ -44,15 +42,6 @@ class VGGFeatureExtractor(nn.Module):
         return features
 
 
-def gram_matrix(x):
-    """Compute Gram matrix for style loss."""
-    with torch.amp.autocast(get_autocast_device_type(x.device), enabled=False):
-        b, c, h, w = x.shape
-        f = x.float().view(b, c, h * w)
-        gram = torch.bmm(f, f.transpose(1, 2))
-        return gram / (c * h * w)
-
-
 class PerceptualLoss(nn.Module):
     """Perceptual loss: L1 between VGG features of prediction and target."""
 
@@ -69,23 +58,4 @@ class PerceptualLoss(nn.Module):
         loss = 0
         for w, pf, tf in zip(self.weights, pred_features, target_features):
             loss += w * F.l1_loss(pf, tf)
-        return loss
-
-
-class StyleLoss(nn.Module):
-    """Style loss: L1 between Gram matrices of VGG features."""
-
-    def __init__(self, weights=(1.0, 1.0, 1.0, 1.0)):
-        super().__init__()
-        self.vgg = VGGFeatureExtractor()
-        self.weights = weights
-
-    def forward(self, pred, target):
-        pred_features = self.vgg(pred)
-        with torch.no_grad():
-            target_features = self.vgg(target)
-
-        loss = 0
-        for w, pf, tf in zip(self.weights, pred_features, target_features):
-            loss += w * F.l1_loss(gram_matrix(pf), gram_matrix(tf))
         return loss

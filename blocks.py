@@ -37,9 +37,8 @@ def fuse_conv_bn_pair(conv: nn.Module, bn: nn.Module) -> tuple[nn.Module, nn.Mod
     return fuse_conv_bn_eval(conv.eval(), bn.eval()), nn.Identity()
 
 
-def make_norm2d(num_channels: int, max_groups: int = 32) -> nn.Module:
+def make_norm2d(num_channels: int) -> nn.Module:
     """Return the BatchNorm2d layer described by the paper."""
-    del max_groups
     return nn.BatchNorm2d(num_channels)
 
 
