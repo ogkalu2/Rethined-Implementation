@@ -1,25 +1,10 @@
-"""RETHINED Phase 005: Claim Verification.
+"""Paper-aligned RETHINED evaluation."""
 
-Evaluates quality metrics, speed benchmarks, coarse vs refined comparison,
-and multi-resolution AttentionUpscaling.
-
-Usage:
-    # Full evaluation
-    python evaluate.py --checkpoint logs/train_256/checkpoints/step_10000.pth \
-        --config configs/train_celeba_256.yaml --num_images 200
-
-    # Speed benchmark only
-    python evaluate.py --checkpoint logs/train_256/checkpoints/step_10000.pth \
-        --config configs/train_celeba_256.yaml --speed_only
-
-    # Multi-resolution test
-    python evaluate.py --checkpoint logs/train_256/checkpoints/step_10000.pth \
-        --config configs/train_celeba_256.yaml --upscale_test
-"""
+from __future__ import annotations
 
 import argparse
 import json
-import time
+import tempfile
 from pathlib import Path
 
 import lpips
@@ -27,244 +12,235 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from cleanfid import fid
 from skimage.metrics import structural_similarity as ssim
+from torchvision.utils import save_image
 from tqdm import tqdm
 
 from data.dataset import get_dataloader
-from device_utils import (
-    empty_device_cache,
-    get_device_name,
-    is_amp_enabled,
-    resolve_device,
-    time_device_call,
-)
-from model import InpaintingModel, AttentionUpscaling
-from train import load_model_checkpoint
-
-
-def build_model_config(cfg):
-    coarse_cfg = cfg["model"]["coarse_model"]
-    return {
-        "coarse_model": {
-            "class": coarse_cfg.get("class", "CoarseModel"),
-            "parameters": {k: v for k, v in coarse_cfg.items() if k != "class"},
-        },
-        "generator": {
-            "generator_class": "PatchInpainting",
-            "params": {k: v for k, v in cfg["model"]["generator"].items()},
-        },
-    }
+from device_utils import empty_device_cache, get_device_name, is_amp_enabled, resolve_device, time_device_call
+from hr import AttentionUpscaling
+from model import InpaintingModel
+from train import build_model_config, composite_with_known, load_model_checkpoint, prepare_multiscale_batch
 
 
 def load_model(checkpoint_path, cfg, device, random_init=False):
-    model_config = build_model_config(cfg)
-    model = InpaintingModel(model_config).to(device)
+    model = InpaintingModel(build_model_config(cfg)).to(device)
     if not random_init:
         if not checkpoint_path:
             raise ValueError("checkpoint_path is required unless random_init=True")
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        load_model_checkpoint(model, ckpt["model_state_dict"])
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+        load_model_checkpoint(model, state_dict)
     model.eval()
     return model
 
 
 @torch.no_grad()
-def evaluate_quality(model, dataloader, device, num_images=200):
-    """Compute L1, SSIM, LPIPS on validation set."""
+def run_inference(model, attn_upscaler, batch_views, device, amp_enabled):
+    with torch.amp.autocast(device.type, enabled=amp_enabled):
+        refined_lr, attn_map, coarse_raw = model(batch_views["masked_image"], batch_views["mask"])
+
+    refined_lr = refined_lr.clamp(0, 1)
+    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), batch_views["image"], batch_views["mask"])
+
+    if batch_views["has_hr_target"]:
+        target = batch_views["image_hr"]
+        eval_mask = batch_views["mask_hr"]
+        coarse_eval = composite_with_known(
+            F.interpolate(coarse_lr, size=target.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),
+            target,
+            eval_mask,
+        )
+        with torch.amp.autocast(device.type, enabled=amp_enabled):
+            refined_hr = attn_upscaler(
+                batch_views["masked_image_hr"],
+                refined_lr,
+                attn_map,
+                mask_hr=batch_views["mask_hr"],
+            ).clamp(0, 1)
+        refined_eval = composite_with_known(refined_hr, target, eval_mask)
+    else:
+        target = batch_views["image"]
+        eval_mask = batch_views["mask"]
+        coarse_eval = coarse_lr
+        refined_eval = refined_lr
+
+    return coarse_eval, refined_eval, target, eval_mask
+
+
+def save_eval_image(tensor, path):
+    save_image(tensor.clamp(0, 1), path)
+
+
+@torch.no_grad()
+def evaluate_quality(model, dataloader, device, model_image_size, num_images=200):
     lpips_fn = lpips.LPIPS(net="alex").to(device)
+    attn_upscaler = AttentionUpscaling(model.generator)
     amp_enabled = is_amp_enabled(device, True)
 
     metrics = {
-        "l1_coarse": [], "l1_refined": [],
-        "ssim_coarse": [], "ssim_refined": [],
-        "lpips_coarse": [], "lpips_refined": [],
+        "l1_coarse": [],
+        "l1_refined": [],
+        "ssim_coarse": [],
+        "ssim_refined": [],
+        "lpips_coarse": [],
+        "lpips_refined": [],
     }
 
-    count = 0
-    for batch in tqdm(dataloader, desc="Quality eval"):
-        if count >= num_images:
-            break
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        coarse_dir = tmp_root / "coarse"
+        refined_dir = tmp_root / "refined"
+        target_dir = tmp_root / "target"
+        coarse_dir.mkdir(parents=True, exist_ok=True)
+        refined_dir.mkdir(parents=True, exist_ok=True)
+        target_dir.mkdir(parents=True, exist_ok=True)
 
-        image = batch["image"].to(device)
-        mask = batch["mask"].to(device)
-        masked_image = batch["masked_image"].to(device)
-        bs = image.shape[0]
-
-        with torch.amp.autocast(device.type, enabled=amp_enabled):
-            refined, attn, coarse = model(masked_image, mask)
-
-        refined = refined.clamp(0, 1) * mask + image * (1 - mask)
-        coarse = coarse.clamp(0, 1) * mask + image * (1 - mask)
-
-        for i in range(bs):
+        count = 0
+        for batch in tqdm(dataloader, desc="Quality eval"):
             if count >= num_images:
                 break
 
-            gt = image[i]
-            ref = refined[i]
-            crs = coarse[i]
+            batch_views = prepare_multiscale_batch(
+                batch,
+                device,
+                model_image_size,
+                blur_layer=model.generator.final_gaussian_blur,
+            )
+            coarse_eval, refined_eval, target, eval_mask = run_inference(
+                model,
+                attn_upscaler,
+                batch_views,
+                device,
+                amp_enabled,
+            )
 
-            # L1 (masked region only)
-            m = mask[i]  # (1, H, W)
-            if m.sum() > 0:
-                metrics["l1_refined"].append(F.l1_loss(ref * m, gt * m).item() / m.mean().item())
-                metrics["l1_coarse"].append(F.l1_loss(crs * m, gt * m).item() / m.mean().item())
-            else:
-                metrics["l1_refined"].append(0.0)
-                metrics["l1_coarse"].append(0.0)
+            for sample_idx in range(target.shape[0]):
+                if count >= num_images:
+                    break
 
-            # SSIM (full image)
-            gt_np = gt.cpu().permute(1, 2, 0).numpy()
-            ref_np = ref.cpu().permute(1, 2, 0).numpy()
-            crs_np = crs.cpu().permute(1, 2, 0).numpy()
-            metrics["ssim_refined"].append(ssim(gt_np, ref_np, channel_axis=2, data_range=1.0))
-            metrics["ssim_coarse"].append(ssim(gt_np, crs_np, channel_axis=2, data_range=1.0))
+                gt = target[sample_idx]
+                coarse = coarse_eval[sample_idx]
+                refined = refined_eval[sample_idx]
+                mask = eval_mask[sample_idx]
 
-            # LPIPS (full image)
-            gt_lpips = gt.unsqueeze(0) * 2 - 1  # [0,1] -> [-1,1]
-            ref_lpips = ref.unsqueeze(0) * 2 - 1
-            crs_lpips = crs.unsqueeze(0) * 2 - 1
-            metrics["lpips_refined"].append(lpips_fn(ref_lpips, gt_lpips).item())
-            metrics["lpips_coarse"].append(lpips_fn(crs_lpips, gt_lpips).item())
+                if mask.sum() > 0:
+                    metrics["l1_coarse"].append(F.l1_loss(coarse * mask, gt * mask).item() / mask.mean().item())
+                    metrics["l1_refined"].append(F.l1_loss(refined * mask, gt * mask).item() / mask.mean().item())
+                else:
+                    metrics["l1_coarse"].append(0.0)
+                    metrics["l1_refined"].append(0.0)
 
-            count += 1
+                gt_np = gt.cpu().permute(1, 2, 0).numpy()
+                coarse_np = coarse.cpu().permute(1, 2, 0).numpy()
+                refined_np = refined.cpu().permute(1, 2, 0).numpy()
+                metrics["ssim_coarse"].append(ssim(gt_np, coarse_np, channel_axis=2, data_range=1.0))
+                metrics["ssim_refined"].append(ssim(gt_np, refined_np, channel_axis=2, data_range=1.0))
 
-    results = {}
-    for k, v in metrics.items():
-        results[k] = {"mean": float(np.mean(v)), "std": float(np.std(v))}
+                gt_lpips = gt.unsqueeze(0) * 2 - 1
+                coarse_lpips = coarse.unsqueeze(0) * 2 - 1
+                refined_lpips = refined.unsqueeze(0) * 2 - 1
+                metrics["lpips_coarse"].append(lpips_fn(coarse_lpips, gt_lpips).item())
+                metrics["lpips_refined"].append(lpips_fn(refined_lpips, gt_lpips).item())
 
-    return results
+                save_eval_image(coarse, coarse_dir / f"{count:06d}.png")
+                save_eval_image(refined, refined_dir / f"{count:06d}.png")
+                save_eval_image(gt, target_dir / f"{count:06d}.png")
+                count += 1
+
+        results = {}
+        for key, values in metrics.items():
+            results[key] = {"mean": float(np.mean(values)), "std": float(np.std(values))}
+
+        results["fid_coarse"] = float(fid.compute_fid(str(coarse_dir), str(target_dir), device=device, num_workers=0))
+        results["fid_refined"] = float(fid.compute_fid(str(refined_dir), str(target_dir), device=device, num_workers=0))
+        return results
 
 
 @torch.no_grad()
-def benchmark_speed(model, device, resolutions=(256, 512), num_runs=50, warmup=10):
-    """Benchmark inference speed at different resolutions."""
-    results = {}
+def benchmark_speed(model, device, num_runs=50, warmup=10):
+    resolution = model.generator.image_size
     amp_enabled = is_amp_enabled(device, True)
+    dummy_img = torch.randn(1, 3, resolution, resolution, device=device)
+    dummy_mask = torch.zeros(1, 1, resolution, resolution, device=device)
+    dummy_mask[:, :, resolution // 4:3 * resolution // 4, resolution // 4:3 * resolution // 4] = 1.0
+    dummy_masked = dummy_img * (1 - dummy_mask)
 
-    for res in resolutions:
-        # Check if resolution fits in VRAM
-        try:
-            dummy_img = torch.randn(1, 3, res, res, device=device)
-            dummy_mask = torch.zeros(1, 1, res, res, device=device)
-            dummy_mask[:, :, res//4:3*res//4, res//4:3*res//4] = 1.0
-        except RuntimeError:
-            results[str(res)] = {"error": "OOM"}
-            continue
+    for _ in range(warmup):
+        with torch.amp.autocast(device.type, enabled=amp_enabled):
+            _ = model(dummy_masked, dummy_mask)
 
-        # Need a model that works at this resolution
-        if res != model.generator.image_size:
-            # Skip non-native resolutions for base model — test those with upscaling
-            results[str(res)] = {"note": "non-native, use AttentionUpscaling"}
-            del dummy_img, dummy_mask
-            empty_device_cache(device)
-            continue
+    latencies = []
+    for _ in range(num_runs):
+        latencies.append(time_device_call(lambda: model(dummy_masked, dummy_mask), device))
 
-        # Warmup
-        for _ in range(warmup):
-            with torch.amp.autocast(device.type, enabled=amp_enabled):
-                _ = model(dummy_img, dummy_mask)
-
-        # Benchmark
-        latencies = []
-        for _ in range(num_runs):
-            latencies.append(time_device_call(lambda: model(dummy_img, dummy_mask), device))
-
-        latencies = np.array(latencies)
-        results[str(res)] = {
+    latencies = np.array(latencies)
+    return {
+        str(resolution): {
             "mean_ms": float(np.mean(latencies)),
             "p50_ms": float(np.percentile(latencies, 50)),
             "p95_ms": float(np.percentile(latencies, 95)),
-            "p99_ms": float(np.percentile(latencies, 99)),
             "throughput_fps": float(1000.0 / np.mean(latencies)),
         }
-
-        del dummy_img, dummy_mask
-        empty_device_cache(device)
-
-    return results
+    }
 
 
 @torch.no_grad()
-def benchmark_upscaling(
-    model,
-    device,
-    lr_res=256,
-    hr_resolutions=(512, 1024),
-    disable_hr_residual_refiner=False,
-    num_runs=30,
-    warmup=5,
-):
-    """Benchmark AttentionUpscaling speed at higher resolutions."""
+def benchmark_upscaling(model, device, hr_resolutions, num_runs=30, warmup=5):
+    lr_res = model.generator.image_size
     attn_upscaler = AttentionUpscaling(model.generator)
+    amp_enabled = is_amp_enabled(device, True)
+
+    dummy_lr = torch.randn(1, 3, lr_res, lr_res, device=device)
+    dummy_mask = torch.zeros(1, 1, lr_res, lr_res, device=device)
+    dummy_mask[:, :, lr_res // 4:3 * lr_res // 4, lr_res // 4:3 * lr_res // 4] = 1.0
+    dummy_masked = dummy_lr * (1 - dummy_mask)
+    with torch.amp.autocast(device.type, enabled=amp_enabled):
+        refined_lr, attn_map, _ = model(dummy_masked, dummy_mask)
+    refined_lr = refined_lr.clamp(0, 1)
+
     results = {}
-    amp_enabled = is_amp_enabled(device, True)
-    original_hr_refiner = model.generator.hr_residual_refiner
-    if disable_hr_residual_refiner:
-        model.generator.hr_residual_refiner = None
+    for hr_res in hr_resolutions:
+        try:
+            dummy_hr = torch.randn(1, 3, hr_res, hr_res, device=device)
+            dummy_hr_mask = torch.zeros(1, 1, hr_res, hr_res, device=device)
+            dummy_hr_mask[:, :, hr_res // 4:3 * hr_res // 4, hr_res // 4:3 * hr_res // 4] = 1.0
+            dummy_hr_masked = dummy_hr * (1 - dummy_hr_mask)
 
-    try:
-        # Generate LR input + attention map
-        dummy_lr = torch.randn(1, 3, lr_res, lr_res, device=device)
-        dummy_mask = torch.zeros(1, 1, lr_res, lr_res, device=device)
-        dummy_mask[:, :, lr_res//4:3*lr_res//4, lr_res//4:3*lr_res//4] = 1.0
+            for _ in range(warmup):
+                with torch.amp.autocast(device.type, enabled=amp_enabled):
+                    _ = attn_upscaler(dummy_hr_masked, refined_lr, attn_map, mask_hr=dummy_hr_mask)
 
-        # Run LR inference to get attention map
-        with torch.amp.autocast(device.type, enabled=amp_enabled):
-            refined, attn_map, coarse = model(dummy_lr, dummy_mask)
-
-        for hr_res in hr_resolutions:
-            try:
-                dummy_hr = torch.randn(1, 3, hr_res, hr_res, device=device)
-                dummy_hr_mask = torch.zeros(1, 1, hr_res, hr_res, device=device)
-                dummy_hr_mask[:, :, hr_res // 4:3 * hr_res // 4, hr_res // 4:3 * hr_res // 4] = 1.0
-
-                # Warmup
-                for _ in range(warmup):
+            latencies = []
+            output = None
+            for _ in range(num_runs):
+                def run():
+                    nonlocal output
                     with torch.amp.autocast(device.type, enabled=amp_enabled):
-                        _ = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
+                        output = attn_upscaler(dummy_hr_masked, refined_lr, attn_map, mask_hr=dummy_hr_mask)
 
-                # Benchmark
-                latencies = []
-                for _ in range(num_runs):
-                    hr_out = None
+                latencies.append(time_device_call(run, device))
 
-                    def run_upscaler():
-                        nonlocal hr_out
-                        with torch.amp.autocast(device.type, enabled=amp_enabled):
-                            hr_out = attn_upscaler(dummy_hr, refined, attn_map, mask_hr=dummy_hr_mask)
-
-                    latencies.append(time_device_call(run_upscaler, device))
-
-                latencies = np.array(latencies)
-                results[str(hr_res)] = {
-                    "mean_ms": float(np.mean(latencies)),
-                    "p50_ms": float(np.percentile(latencies, 50)),
-                    "p95_ms": float(np.percentile(latencies, 95)),
-                    "output_shape": list(hr_out.shape),
-                }
-
-                del dummy_hr, dummy_hr_mask, hr_out
-                empty_device_cache(device)
-
-            except RuntimeError as e:
-                results[str(hr_res)] = {"error": str(e)}
-                empty_device_cache(device)
-
-        del dummy_lr, dummy_mask, refined, attn_map, coarse
-        empty_device_cache(device)
-    finally:
-        model.generator.hr_residual_refiner = original_hr_refiner
+            latencies = np.array(latencies)
+            results[str(hr_res)] = {
+                "mean_ms": float(np.mean(latencies)),
+                "p50_ms": float(np.percentile(latencies, 50)),
+                "p95_ms": float(np.percentile(latencies, 95)),
+                "output_shape": list(output.shape),
+            }
+            empty_device_cache(device)
+        except RuntimeError as exc:
+            results[str(hr_res)] = {"error": str(exc)}
+            empty_device_cache(device)
 
     return results
 
 
 @torch.no_grad()
-def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50):
-    """Test if AttentionUpscaling maintains quality at higher resolution."""
+def test_upscaling_quality(model, dataloader, device, hr_res=2048, num_images=50):
     attn_upscaler = AttentionUpscaling(model.generator)
     amp_enabled = is_amp_enabled(device, True)
-
     l1_values = []
     count = 0
 
@@ -272,38 +248,32 @@ def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50)
         if count >= num_images:
             break
 
-        image = batch["image"].to(device)
-        mask = batch["mask"].to(device)
-        masked_image = batch["masked_image"].to(device)
-
+        batch_views = prepare_multiscale_batch(
+            batch,
+            device,
+            model.generator.image_size,
+            blur_layer=model.generator.final_gaussian_blur,
+        )
         with torch.amp.autocast(device.type, enabled=amp_enabled):
-            refined, attn_map, coarse = model(masked_image, mask)
+            refined_lr, attn_map, _ = model(batch_views["masked_image"], batch_views["mask"])
+        refined_lr = refined_lr.clamp(0, 1)
 
-        # Upscale original image to HR for comparison
-        image_hr = F.interpolate(image, size=(hr_res, hr_res), mode="bicubic", align_corners=False)
-        mask_hr = F.interpolate(mask, size=(hr_res, hr_res), mode="nearest")
-
-        # Create HR masked input (bicubic upsample of original)
+        image_hr = F.interpolate(batch_views["image_hr"], size=(hr_res, hr_res), mode="bicubic", align_corners=False)
+        mask_hr = F.interpolate(batch_views["mask_hr"], size=(hr_res, hr_res), mode="nearest")
         masked_hr = image_hr * (1 - mask_hr)
+        with torch.amp.autocast(device.type, enabled=amp_enabled):
+            refined_hr = attn_upscaler(masked_hr, refined_lr, attn_map, mask_hr=mask_hr).clamp(0, 1)
+        refined_hr = composite_with_known(refined_hr, image_hr, mask_hr)
 
-        try:
-            with torch.amp.autocast(device.type, enabled=amp_enabled):
-                hr_output = attn_upscaler(masked_hr, refined.clamp(0, 1), attn_map, mask_hr=mask_hr)
-            hr_output = hr_output.clamp(0, 1)
-
-            # L1 in masked region
-            for i in range(image.shape[0]):
-                if count >= num_images:
-                    break
-                m = mask_hr[i]
-                if m.sum() > 0:
-                    l1_values.append(
-                        F.l1_loss(hr_output[i] * m, image_hr[i] * m).item() / m.mean().item()
-                    )
-                count += 1
-
-        except RuntimeError:
-            break
+        for sample_idx in range(image_hr.shape[0]):
+            if count >= num_images:
+                break
+            mask = mask_hr[sample_idx]
+            if mask.sum() > 0:
+                l1_values.append(
+                    F.l1_loss(refined_hr[sample_idx] * mask, image_hr[sample_idx] * mask).item() / mask.mean().item()
+                )
+            count += 1
 
     return {
         "hr_resolution": hr_res,
@@ -314,29 +284,25 @@ def test_upscaling_quality(model, dataloader, device, hr_res=512, num_images=50)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RETHINED Evaluation")
+    parser = argparse.ArgumentParser(description="Paper-aligned RETHINED evaluation")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--num_images", type=int, default=200)
     parser.add_argument("--speed_only", action="store_true")
-    parser.add_argument("--compare_hr_refiner", action="store_true")
-    parser.add_argument("--reparameterize", action="store_true",
-                        help="Apply inference-time Conv-BN fusion before evaluation/benchmarking.")
-    parser.add_argument("--random_init", action="store_true",
-                        help="Build the model with random weights instead of loading a checkpoint. Useful for speed-only benchmarking.")
+    parser.add_argument("--random_init", action="store_true")
+    parser.add_argument("--reparameterize", action="store_true")
     parser.add_argument("--upscale_test", action="store_true")
     parser.add_argument("--speed_runs", type=int, default=50)
     parser.add_argument("--speed_warmup", type=int, default=10)
     parser.add_argument("--upscale_runs", type=int, default=30)
     parser.add_argument("--upscale_warmup", type=int, default=5)
-    parser.add_argument("--hr_resolutions", type=str, default=None,
-                        help="Comma-separated HR resolutions for upscaling benchmark, e.g. 512,1024")
+    parser.add_argument("--hr_resolutions", type=str, default=None)
     parser.add_argument("--output", type=str, default="results/eval_results.json")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    with open(args.config, "r", encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
 
     if not args.random_init and not args.checkpoint:
         parser.error("--checkpoint is required unless --random_init is set")
@@ -351,88 +317,46 @@ def main():
         model.reparameterize()
         model.eval()
         print("Applied inference reparameterization.")
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,}")
 
     results = {
         "checkpoint": args.checkpoint,
         "random_init": args.random_init,
         "reparameterized": args.reparameterize,
-        "params": total_params,
+        "params": sum(p.numel() for p in model.parameters()),
     }
 
-    # Speed benchmark (always run)
-    native_lr_res = model.generator.image_size
     print("\n--- Speed Benchmark (base model) ---")
-    speed = benchmark_speed(
-        model,
-        device,
-        resolutions=(native_lr_res,),
-        num_runs=args.speed_runs,
-        warmup=args.speed_warmup,
-    )
+    speed = benchmark_speed(model, device, num_runs=args.speed_runs, warmup=args.speed_warmup)
     results["speed"] = speed
-    for res, data in speed.items():
-        if "mean_ms" in data:
-            print(f"  {res}x{res}: {data['mean_ms']:.2f}ms mean, {data['throughput_fps']:.1f} FPS")
-        else:
-            print(f"  {res}x{res}: {data}")
+    for res, info in speed.items():
+        print(f"  {res}x{res}: {info['mean_ms']:.2f}ms mean, {info['throughput_fps']:.1f} FPS")
 
-    # Upscaling speed benchmark
     print("\n--- AttentionUpscaling Speed ---")
-    data_hr_res = cfg["data"]["image_size"]
     if args.hr_resolutions:
-        hr_resolutions = tuple(int(x.strip()) for x in args.hr_resolutions.split(",") if x.strip())
+        hr_resolutions = tuple(int(item.strip()) for item in args.hr_resolutions.split(",") if item.strip())
     else:
-        hr_resolutions = tuple(dict.fromkeys([data_hr_res, 1024, 2048]))
-    upscale_speed = benchmark_upscaling(
+        hr_resolutions = tuple(dict.fromkeys([cfg["data"]["image_size"], 2048, 4096]))
+    up_speed = benchmark_upscaling(
         model,
         device,
-        lr_res=native_lr_res,
         hr_resolutions=hr_resolutions,
         num_runs=args.upscale_runs,
         warmup=args.upscale_warmup,
     )
-    results["upscaling_speed"] = upscale_speed
-    for res, data in upscale_speed.items():
-        if "mean_ms" in data:
-            print(f"  LR={native_lr_res} -> HR={res}: {data['mean_ms']:.2f}ms (upscale only)")
+    results["upscaling_speed"] = up_speed
+    for res, info in up_speed.items():
+        if "mean_ms" in info:
+            print(f"  LR={model.generator.image_size} -> HR={res}: {info['mean_ms']:.2f}ms")
         else:
-            print(f"  LR={native_lr_res} -> HR={res}: {data}")
-
-    if args.compare_hr_refiner and model.generator.hr_residual_refiner is not None:
-        print("\n--- AttentionUpscaling Speed (HRResidualRefiner disabled) ---")
-        upscale_speed_no_hr = benchmark_upscaling(
-            model,
-            device,
-            lr_res=native_lr_res,
-            hr_resolutions=hr_resolutions,
-            disable_hr_residual_refiner=True,
-            num_runs=args.upscale_runs,
-            warmup=args.upscale_warmup,
-        )
-        results["upscaling_speed_no_hr_refiner"] = upscale_speed_no_hr
-        for res, data in upscale_speed_no_hr.items():
-            if "mean_ms" in data:
-                full_ms = upscale_speed.get(res, {}).get("mean_ms")
-                delta_suffix = ""
-                if full_ms is not None:
-                    delta_suffix = f", delta={full_ms - data['mean_ms']:.2f}ms"
-                print(
-                    f"  LR={native_lr_res} -> HR={res}: {data['mean_ms']:.2f}ms "
-                    f"(upscale only, no HR refiner){delta_suffix}"
-                )
-            else:
-                print(f"  LR={native_lr_res} -> HR={res}: {data}")
+            print(f"  LR={model.generator.image_size} -> HR={res}: {info}")
 
     if args.speed_only:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.output, "w") as f:
-            json.dump(results, f, indent=2)
+        with open(args.output, "w", encoding="utf-8") as handle:
+            json.dump(results, handle, indent=2)
         print(f"\nResults saved to {args.output}")
         return
 
-    # Quality metrics
     print("\n--- Quality Metrics ---")
     val_loader = get_dataloader(
         root_dir=cfg["data"]["root_dir"],
@@ -445,37 +369,42 @@ def main():
         mask_min_coverage=cfg["data"]["mask_min_coverage"],
         mask_max_coverage=cfg["data"]["mask_max_coverage"],
         val_dir=cfg["data"].get("val_dir"),
+        manifest_path=cfg["data"].get("manifest_path"),
+        deterministic=cfg["data"].get("force_random_masks_eval", False),
+        fixed_mask_seed=cfg["training"]["seed"],
+        force_random_masks=cfg["data"].get("force_random_masks_eval", False),
+        shuffle_override=False,
     )
-    quality = evaluate_quality(model, val_loader, device, num_images=args.num_images)
+    quality = evaluate_quality(model, val_loader, device, model.generator.image_size, num_images=args.num_images)
     results["quality"] = quality
     print(f"  {'Metric':<20} {'Coarse':>10} {'Refined':>10} {'Improvement':>12}")
-    print(f"  {'-'*52}")
-    for base in ["l1", "ssim", "lpips"]:
-        c = quality[f"{base}_coarse"]["mean"]
-        r = quality[f"{base}_refined"]["mean"]
+    print(f"  {'-' * 58}")
+    for base in ["l1", "ssim", "lpips", "fid"]:
+        coarse_key = f"{base}_coarse"
+        refined_key = f"{base}_refined"
+        coarse_value = quality[coarse_key]["mean"] if isinstance(quality[coarse_key], dict) else quality[coarse_key]
+        refined_value = quality[refined_key]["mean"] if isinstance(quality[refined_key], dict) else quality[refined_key]
         if base == "ssim":
-            imp = f"+{(r-c)*100:.1f}%"
-        elif base in ("l1", "lpips"):
-            imp = f"-{(c-r)/c*100:.1f}%" if c > 0 else "N/A"
+            improvement = f"+{(refined_value - coarse_value) * 100:.1f}%"
         else:
-            imp = ""
-        print(f"  {base.upper():<20} {c:>10.4f} {r:>10.4f} {imp:>12}")
+            improvement = f"-{(coarse_value - refined_value) / coarse_value * 100:.1f}%" if coarse_value > 0 else "N/A"
+        print(f"  {base.upper():<20} {coarse_value:>10.4f} {refined_value:>10.4f} {improvement:>12}")
 
-    # Upscaling quality test
     if args.upscale_test or not args.speed_only:
         print("\n--- AttentionUpscaling Quality ---")
-        for hr_res in (512, 1024):
-            uq = test_upscaling_quality(model, val_loader, device, hr_res=hr_res, num_images=50)
-            results[f"upscaling_quality_{hr_res}"] = uq
-            if uq["l1_mean"] is not None:
-                print(f"  HR={hr_res}: L1={uq['l1_mean']:.4f} (n={uq['num_images']})")
+        for hr_res in hr_resolutions:
+            if hr_res <= model.generator.image_size:
+                continue
+            up_quality = test_upscaling_quality(model, val_loader, device, hr_res=hr_res, num_images=min(args.num_images, 50))
+            results[f"upscaling_quality_{hr_res}"] = up_quality
+            if up_quality["l1_mean"] is not None:
+                print(f"  HR={hr_res}: L1={up_quality['l1_mean']:.4f} (n={up_quality['num_images']})")
             else:
                 print(f"  HR={hr_res}: Failed")
 
-    # Save results
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w") as f:
-        json.dump(results, f, indent=2)
+    with open(args.output, "w", encoding="utf-8") as handle:
+        json.dump(results, handle, indent=2)
     print(f"\nResults saved to {args.output}")
 
 

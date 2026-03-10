@@ -1,0 +1,82 @@
+# Paper-aligned RETHINED training config.
+# Note: the paper does not publish exact loss lambdas beyond the loss components,
+# so the weights below are explicit engineering assumptions around the stated recipe.
+
+model:
+  coarse_model:
+    class: "CoarseModel"
+    channels: [64, 128, 280, 400, 528]
+    head_channels: 32
+    use_rep_blocks: true
+  generator:
+    kernel_size: 8
+    nheads: 1
+    stem_out_stride: 1
+    stem_out_channels: 3
+    image_size: 512
+    embed_dim: 2048
+    use_qpos: true
+    use_kpos: true
+    dropout: 0.1
+    feature_i: 2
+    feature_dim: null
+    concat_features: true
+    final_conv: true
+    attention_masking: true
+    paper_mask_renormalize: false
+    token_use_mask_ratio: false
+    attn_topk: null
+    attn_temperature: 1.0
+
+data:
+  root_dir: "."
+  manifest_path: "dataset/manifests/supercaf_manifest.csv"
+  val_dir: null
+  image_size: 1024
+  batch_size: 8
+  eval_batch_size: 4
+  num_workers: 4
+  mask_min_coverage: 0.30
+  mask_max_coverage: 0.50
+  force_random_masks_train: true
+  force_random_masks_eval: false
+
+training:
+  total_steps: 600000
+  grad_accum_steps: 16
+  lr: 0.001
+  discriminator_lr: 0.001
+  warmup_steps: 1000
+  min_lr: 0.000001
+  discriminator_min_lr: 0.000001
+  grad_clip: 1.0
+  discriminator_grad_clip: 1.0
+  mixed_precision: true
+  seed: 42
+  betas: [0.9, 0.999]
+
+loss:
+  coarse_l2_weight: 1.0
+  frequency_weight: 1.0
+  perceptual_weight: 0.1
+  adversarial_weight: 0.01
+  focal_alpha: 1.0
+  focal_log_matrix: false
+
+discriminator:
+  in_channels: 3
+  base_channels: 64
+  n_layers: 3
+
+logging:
+  log_dir: "logs/train_supercaf_1024_to_512_paper"
+  log_interval: 50
+  vis_interval: 1000
+  eval_interval: 1000
+  eval_batches: 16
+  save_interval: 10000
+  save_checkpoints: true
+  save_final_checkpoint: true
+  checkpoint_steps: [100000, 300000, 600000]
+  keep_last_checkpoints: 3
+  print_train_metrics: false

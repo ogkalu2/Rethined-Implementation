@@ -1,121 +1,98 @@
-"""Combined inpainting loss for RETHINED training."""
+"""Paper-aligned losses for RETHINED training."""
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from losses.perceptual import PerceptualLoss, StyleLoss
+from losses.perceptual import PerceptualLoss
+
+
+class FocalFrequencyLoss(nn.Module):
+    """Compact Focal Frequency Loss implementation for image restoration."""
+
+    def __init__(self, alpha: float = 1.0, log_matrix: bool = False, eps: float = 1e-8):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.log_matrix = bool(log_matrix)
+        self.eps = float(eps)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        pred_freq = torch.fft.fft2(pred.float(), norm="ortho")
+        target_freq = torch.fft.fft2(target.float(), norm="ortho")
+        distance = (pred_freq.real - target_freq.real).pow(2) + (pred_freq.imag - target_freq.imag).pow(2)
+
+        weight = distance.detach().clamp_min(self.eps)
+        if self.log_matrix:
+            weight = torch.log1p(weight)
+        weight = weight.pow(self.alpha)
+        weight = weight / weight.mean(dim=(1, 2, 3), keepdim=True).clamp_min(self.eps)
+        return (weight * distance).mean()
 
 
 class InpaintingLoss(nn.Module):
-    """Combined loss for RETHINED: masked L1 + perceptual.
-
-    Style loss stays configurable, but defaults to off because its weighting is
-    unspecified by the paper.
-    """
+    """Paper-aligned generator and discriminator losses."""
 
     def __init__(
         self,
-        coarse_weight: float = 1.0,
-        refined_weight: float = 1.0,
-        l1_hole_weight: float = 6.0,
-        l1_valid_weight: float = 1.0,
+        coarse_l2_weight: float = 1.0,
+        frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
-        style_weight: float = 0.0,
-        perceptual_crop_size: int | None = None,
-        hr_perceptual_crop_size: int | None = None,
-        perceptual_crop_pad_frac: float = 0.25,
-        hr_refined_weight: float = 0.0,
-        hr_perceptual_weight: float = 0.0,
-        hr_style_weight: float = 0.0,
-        hr_delta_weight: float = 0.0,
-        hr_aux_image_size: int | None = None,
-        gain_ratio_weight: float = 0.0,
-        hr_gain_ratio_weight: float = 0.0,
+        adversarial_weight: float = 0.01,
+        focal_alpha: float = 1.0,
+        focal_log_matrix: bool = False,
     ):
         super().__init__()
-        self.coarse_weight = coarse_weight
-        self.refined_weight = refined_weight
-        self.l1_hole_weight = l1_hole_weight
-        self.l1_valid_weight = l1_valid_weight
-        self.perceptual_weight = perceptual_weight
-        self.style_weight = style_weight
-        self.perceptual_crop_size = (
-            None if perceptual_crop_size is None else max(1, int(perceptual_crop_size))
-        )
-        self.hr_perceptual_crop_size = (
-            None if hr_perceptual_crop_size is None else max(1, int(hr_perceptual_crop_size))
-        )
-        self.perceptual_crop_pad_frac = max(0.0, float(perceptual_crop_pad_frac))
-        self.hr_refined_weight = hr_refined_weight
-        self.hr_perceptual_weight = hr_perceptual_weight
-        self.hr_style_weight = hr_style_weight
-        self.hr_delta_weight = hr_delta_weight
-        self.hr_aux_image_size = (
-            None if hr_aux_image_size is None else max(1, int(hr_aux_image_size))
-        )
-        self.gain_ratio_weight = gain_ratio_weight
-        self.hr_gain_ratio_weight = hr_gain_ratio_weight
+        self.coarse_l2_weight = float(coarse_l2_weight)
+        self.frequency_weight = float(frequency_weight)
+        self.perceptual_weight = float(perceptual_weight)
+        self.adversarial_weight = float(adversarial_weight)
 
+        self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
-        self.style_loss = StyleLoss()
 
-        # Share VGG extractor between perceptual and style loss
-        self.style_loss.vgg = self.perceptual_loss.vgg
+    def generator_loss(
+        self,
+        coarse_raw: torch.Tensor,
+        refined: torch.Tensor,
+        target: torch.Tensor,
+        fake_logits: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        coarse_l2 = F.mse_loss(coarse_raw, target)
+        frequency = self.frequency_loss(refined, target)
+        perceptual = self.perceptual_loss(refined, target)
 
-    def masked_l1(self, pred, target, mask):
-        """Compute L1 loss separately for hole and valid regions.
-
-        Args:
-            pred: (B, 3, H, W) predicted image
-            target: (B, 3, H, W) ground truth
-            mask: (B, 1, H, W) binary mask, 1=hole, 0=valid
-        """
-        hole_loss = F.l1_loss(pred * mask, target * mask, reduction="sum")
-        hole_loss = hole_loss / (mask.sum() * pred.shape[1] + 1e-8)
-
-        valid_mask = 1 - mask
-        valid_loss = F.l1_loss(pred * valid_mask, target * valid_mask, reduction="sum")
-        valid_loss = valid_loss / (valid_mask.sum() * pred.shape[1] + 1e-8)
-
-        return self.l1_hole_weight * hole_loss + self.l1_valid_weight * valid_loss
-
-    def forward(self, coarse, refined, target, mask):
-        """Compute total loss.
-
-        Args:
-            coarse: (B, 3, H, W) coarse model output
-            refined: (B, 3, H, W) refined model output
-            target: (B, 3, H, W) ground truth
-            mask: (B, 1, H, W) binary mask, 1=hole
-
-        Returns:
-            total_loss, loss_dict
-        """
-        # L1 on both outputs
-        l1_coarse = self.masked_l1(coarse, target, mask)
-        l1_refined = self.masked_l1(refined, target, mask)
-
-        # Perceptual + style on refined output only
-        loss_perceptual = self.perceptual_loss(refined, target)
-        if self.style_weight > 0:
-            loss_style = self.style_loss(refined, target)
-        else:
-            loss_style = refined.new_zeros(())
+        adversarial = refined.new_zeros(())
+        if fake_logits is not None:
+            adversarial = F.binary_cross_entropy_with_logits(fake_logits, torch.ones_like(fake_logits))
 
         total = (
-            l1_coarse
-            + l1_refined
-            + self.perceptual_weight * loss_perceptual
-            + self.style_weight * loss_style
+            self.coarse_l2_weight * coarse_l2
+            + self.frequency_weight * frequency
+            + self.perceptual_weight * perceptual
+            + self.adversarial_weight * adversarial
         )
-
         loss_dict = {
-            "l1_coarse": l1_coarse.item(),
-            "l1_refined": l1_refined.item(),
-            "perceptual": loss_perceptual.item(),
-            "style": loss_style.item(),
-            "total": total.item(),
+            "coarse_l2": coarse_l2.item(),
+            "frequency": frequency.item(),
+            "perceptual": perceptual.item(),
+            "adversarial_g": adversarial.item(),
+            "generator_total": total.item(),
         }
+        return total, loss_dict
 
+    def discriminator_loss(
+        self,
+        real_logits: torch.Tensor,
+        fake_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        real_loss = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
+        fake_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+        total = 0.5 * (real_loss + fake_loss)
+        loss_dict = {
+            "adversarial_d_real": real_loss.item(),
+            "adversarial_d_fake": fake_loss.item(),
+            "discriminator_total": total.item(),
+        }
         return total, loss_dict

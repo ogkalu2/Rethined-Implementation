@@ -38,11 +38,9 @@ def fuse_conv_bn_pair(conv: nn.Module, bn: nn.Module) -> tuple[nn.Module, nn.Mod
 
 
 def make_norm2d(num_channels: int, max_groups: int = 32) -> nn.Module:
-    """Batch-size-independent normalization for stable small-batch training."""
-    groups = min(max_groups, num_channels)
-    while groups > 1 and num_channels % groups != 0:
-        groups -= 1
-    return nn.GroupNorm(groups, num_channels)
+    """Return the BatchNorm2d layer described by the paper."""
+    del max_groups
+    return nn.BatchNorm2d(num_channels)
 
 
 def fuse_conv_bn_to_weight_bias(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> tuple[torch.Tensor, torch.Tensor]:
