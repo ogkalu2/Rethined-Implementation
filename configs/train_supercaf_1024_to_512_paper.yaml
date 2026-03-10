@@ -5,7 +5,7 @@
 model:
   coarse_model:
     class: "CoarseModel"
-    channels: [64, 128, 280, 400, 528]
+    channels: [64, 128, 256, 384, 512]
     head_channels: 32
     use_rep_blocks: true
   generator:
@@ -14,7 +14,7 @@ model:
     stem_out_stride: 1
     stem_out_channels: 3
     image_size: 512
-    embed_dim: 2048
+    embed_dim: 1024
     use_positional_encoding: true
     dropout: 0.1
     feature_i: 2
