@@ -121,7 +121,7 @@ class PatchInpainting(nn.Module):
             if self.use_positional_encoding
             else None
         )
-        self.paper_coherence_layer = (
+        self.coherence_layer = (
             nn.Conv2d(
                 self.patch_value_dim,
                 self.patch_value_dim,
@@ -277,8 +277,8 @@ class PatchInpainting(nn.Module):
             mixed_patches_flat = mixed_patches_flat + residual_mass.to(dtype=mixed_patches_flat.dtype) * fallback_patches
 
         mixed_patch_map = mixed_patches_flat.transpose(1, 2).contiguous().view_as(patch_map)
-        if self.paper_coherence_layer is not None:
-            mixed_patch_map = self.paper_coherence_layer(mixed_patch_map)
+        if self.coherence_layer is not None:
+            mixed_patch_map = self.coherence_layer(mixed_patch_map)
 
         refined = self.fold_native(
             mixed_patch_map,
