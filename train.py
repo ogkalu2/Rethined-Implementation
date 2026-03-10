@@ -622,6 +622,7 @@ def train(cfg, args):
         if should_save:
             ckpt_path = ckpt_dir / f"step_{step}.pth"
             save_checkpoint(model, discriminator, optimizer_g, optimizer_d, scaler, step, metrics, cfg, ckpt_path)
+            progress_bar.write(f"Saved checkpoint: {ckpt_path}")
 
     final_path = ckpt_dir / f"step_{total_steps}.pth"
     if log_cfg.get("save_final_checkpoint", True):
