@@ -49,9 +49,12 @@ class MultiHeadAttention(nn.Module):
             v_proj = self.w_vs(v).view(batch_size, len_v, self.n_head, self.d_v).transpose(1, 2)
 
         attn = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3))
-        attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
+        
         if post_softmax_mask is not None:
-            attn = attn * post_softmax_mask.to(dtype=attn.dtype)
+            # Where the mask is 0 (disallowed), fill with -inf before softmax
+            attn = attn.masked_fill(post_softmax_mask == 0, float('-inf'))
+
+        attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
         attn = self.dropout(attn)
 
         mixed = torch.matmul(attn, v_proj)
