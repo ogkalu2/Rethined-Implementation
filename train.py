@@ -138,6 +138,14 @@ def load_model_checkpoint(model, state_dict):
     model.load_state_dict(state_dict, strict=True)
 
 
+def load_eval_checkpoint(path, model, device):
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    if "model_state_dict" not in ckpt:
+        raise KeyError("Expected a training checkpoint containing 'model_state_dict'.")
+    load_model_checkpoint(model, ckpt["model_state_dict"])
+    return int(ckpt.get("step", 0))
+
+
 def load_training_checkpoint(
     path,
     model,
@@ -148,16 +156,23 @@ def load_training_checkpoint(
     device,
 ):
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    required_keys = (
+        "step",
+        "model_state_dict",
+        "discriminator_state_dict",
+        "optimizer_g_state_dict",
+        "optimizer_d_state_dict",
+        "scaler_state_dict",
+    )
+    missing_keys = [key for key in required_keys if key not in ckpt]
+    if missing_keys:
+        raise KeyError(f"Expected a full training checkpoint, missing keys: {', '.join(missing_keys)}")
     load_model_checkpoint(model, ckpt["model_state_dict"])
-    if "discriminator_state_dict" in ckpt:
-        discriminator.load_state_dict(ckpt["discriminator_state_dict"], strict=True)
-    if "optimizer_g_state_dict" in ckpt:
-        optimizer_g.load_state_dict(ckpt["optimizer_g_state_dict"])
-    if "optimizer_d_state_dict" in ckpt:
-        optimizer_d.load_state_dict(ckpt["optimizer_d_state_dict"])
-    if "scaler_state_dict" in ckpt:
-        scaler.load_state_dict(ckpt["scaler_state_dict"])
-    return int(ckpt.get("step", 0))
+    discriminator.load_state_dict(ckpt["discriminator_state_dict"], strict=True)
+    optimizer_g.load_state_dict(ckpt["optimizer_g_state_dict"])
+    optimizer_d.load_state_dict(ckpt["optimizer_d_state_dict"])
+    scaler.load_state_dict(ckpt["scaler_state_dict"])
+    return int(ckpt["step"])
 
 
 def masked_l1(pred, target, mask):
@@ -326,14 +341,9 @@ def run_eval_only(cfg, args):
     seed_everything(cfg["training"]["seed"])
 
     model = InpaintingModel(build_model_config(cfg)).to(device)
-    discriminator = PatchDiscriminator(**cfg["discriminator"]).to(device)
-    optimizer_g = torch.optim.Adam(model.parameters(), lr=cfg["training"]["lr"])
-    optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=cfg["training"].get("discriminator_lr", cfg["training"]["lr"]))
-    scaler = torch.amp.GradScaler(device.type, enabled=is_amp_enabled(device, cfg["training"]["mixed_precision"]))
-
     if not args.resume:
         raise ValueError("--eval-only requires --resume CHECKPOINT")
-    load_training_checkpoint(args.resume, model, discriminator, optimizer_g, optimizer_d, scaler, device)
+    load_eval_checkpoint(args.resume, model, device)
     eval_loader = build_eval_loader(cfg, args)
     if eval_loader is None:
         raise ValueError("No evaluation loader configured.")
