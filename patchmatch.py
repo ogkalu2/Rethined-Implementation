@@ -51,7 +51,8 @@ class MultiHeadAttention(nn.Module):
         attn = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3))
         
         if post_softmax_mask is not None:
-            # Where the mask is 0 (disallowed), fill with -inf before softmax
+            # Mask out disallowed connections with -inf BEFORE softmax.
+            # (post_softmax_mask contains 1 for allowed, 0 for disallowed)
             attn = attn.masked_fill(post_softmax_mask == 0, float('-inf'))
 
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
