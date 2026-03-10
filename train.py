@@ -425,7 +425,8 @@ def train(cfg, args):
     last_coarse = None
     last_refined = None
 
-    for step_idx in tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True):
+    progress_bar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
+    for step_idx in progress_bar:
         step = step_idx + 1
         lr_g = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         lr_d = get_lr(
@@ -511,7 +512,7 @@ def train(cfg, args):
         if step_has_nonfinite:
             optimizer_g.zero_grad(set_to_none=True)
             optimizer_d.zero_grad(set_to_none=True)
-            print(f"\nSkipping non-finite step {step}")
+            progress_bar.write(f"Skipping non-finite step {step}")
             continue
 
         scaler.unscale_(optimizer_d)
@@ -546,10 +547,13 @@ def train(cfg, args):
                 writer.add_scalar("accelerator_mem_gb", peak_memory_gb, step)
             write_status(log_cfg["log_dir"], step, total_steps, metrics, lr_g)
             if log_cfg.get("print_train_metrics", False):
-                print(
-                    f"\nTrain step {step}: "
-                    f"g={metrics['generator_total']:.4f}, d={metrics['discriminator_total']:.4f}, "
-                    f"ff={metrics['frequency']:.4f}, perc={metrics['perceptual']:.4f}"
+                progress_bar.set_postfix(
+                    step=step,
+                    g=f"{metrics['generator_total']:.4f}",
+                    d=f"{metrics['discriminator_total']:.4f}",
+                    ff=f"{metrics['frequency']:.4f}",
+                    perc=f"{metrics['perceptual']:.4f}",
+                    refresh=False,
                 )
 
         eval_interval = log_cfg.get("eval_interval", 0)
@@ -567,8 +571,8 @@ def train(cfg, args):
             writer.add_scalar("val/masked_l1_refined", val_metrics["masked_l1_refined"], step)
             if val_metrics["gain_pct"] is not None:
                 writer.add_scalar("val/gain_pct", val_metrics["gain_pct"], step)
-            print(
-                f"\nValidation step {step}: "
+            progress_bar.write(
+                f"Validation step {step}: "
                 f"{val_metrics['masked_l1_coarse']:.4f} -> {val_metrics['masked_l1_refined']:.4f} "
                 f"(gain {val_metrics['gain_pct']:.2f}% if positive)"
             )
@@ -587,14 +591,14 @@ def train(cfg, args):
         if should_save:
             ckpt_path = ckpt_dir / f"step_{step}.pth"
             save_checkpoint(model, discriminator, optimizer_g, optimizer_d, scaler, step, metrics, cfg, ckpt_path)
-            print(f"\nSaved checkpoint: {ckpt_path}")
 
     final_path = ckpt_dir / f"step_{total_steps}.pth"
     if log_cfg.get("save_final_checkpoint", True):
         save_checkpoint(model, discriminator, optimizer_g, optimizer_d, scaler, total_steps, metrics, cfg, final_path)
-        print(f"\nTraining complete. Final checkpoint: {final_path}")
+        progress_bar.write(f"Training complete. Final checkpoint: {final_path}")
     else:
-        print("\nTraining complete. Final checkpoint saving disabled.")
+        progress_bar.write("Training complete. Final checkpoint saving disabled.")
+    progress_bar.close()
     writer.close()
 
 
