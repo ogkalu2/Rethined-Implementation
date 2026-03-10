@@ -206,9 +206,12 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
     amp_device_type = get_autocast_device_type(device)
     amp_enabled = is_amp_enabled(device, use_amp)
 
-    coarse_values = []
-    refined_values = []
-    gain_values = []
+    lr_coarse_values = []
+    lr_refined_values = []
+    lr_gain_values = []
+    hr_coarse_values = []
+    hr_refined_values = []
+    hr_gain_values = []
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
@@ -229,6 +232,11 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
 
         refined_lr = refined_lr.clamp(0, 1)
         coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
+        lr_coarse_err = masked_l1(coarse_lr, image, mask)
+        lr_refined_err = masked_l1(refined_lr, image, mask)
+        lr_coarse_values.extend(lr_coarse_err.tolist())
+        lr_refined_values.extend(lr_refined_err.tolist())
+        lr_gain_values.extend((lr_coarse_err - lr_refined_err).tolist())
 
         if batch_views["has_hr_target"]:
             target = batch_views["image_hr"]
@@ -246,26 +254,32 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
                     mask_hr=batch_views["mask_hr"],
                 ).clamp(0, 1)
             refined_eval = composite_with_known(refined_hr, target, eval_mask)
+            hr_coarse_err = masked_l1(coarse_eval, target, eval_mask)
+            hr_refined_err = masked_l1(refined_eval, target, eval_mask)
+            hr_coarse_values.extend(hr_coarse_err.tolist())
+            hr_refined_values.extend(hr_refined_err.tolist())
+            hr_gain_values.extend((hr_coarse_err - hr_refined_err).tolist())
         else:
-            target = image
-            eval_mask = mask
-            coarse_eval = coarse_lr
-            refined_eval = refined_lr
-
-        coarse_err = masked_l1(coarse_eval, target, eval_mask)
-        refined_err = masked_l1(refined_eval, target, eval_mask)
-        coarse_values.extend(coarse_err.tolist())
-        refined_values.extend(refined_err.tolist())
-        gain_values.extend((coarse_err - refined_err).tolist())
+            hr_coarse_values.extend(lr_coarse_err.tolist())
+            hr_refined_values.extend(lr_refined_err.tolist())
+            hr_gain_values.extend((lr_coarse_err - lr_refined_err).tolist())
 
     model.train()
     return {
-        "masked_l1_coarse": mean_metric(coarse_values),
-        "masked_l1_refined": mean_metric(refined_values),
-        "gain_abs": mean_metric(gain_values),
-        "gain_pct": (
-            100.0 * (mean_metric(gain_values) / max(mean_metric(coarse_values), 1e-8))
-            if coarse_values
+        "masked_l1_lr_coarse": mean_metric(lr_coarse_values),
+        "masked_l1_lr_refined": mean_metric(lr_refined_values),
+        "lr_gain_abs": mean_metric(lr_gain_values),
+        "lr_gain_pct": (
+            100.0 * (mean_metric(lr_gain_values) / max(mean_metric(lr_coarse_values), 1e-8))
+            if lr_coarse_values
+            else None
+        ),
+        "masked_l1_hr_coarse_baseline": mean_metric(hr_coarse_values),
+        "masked_l1_hr_refined": mean_metric(hr_refined_values),
+        "hr_gain_abs": mean_metric(hr_gain_values),
+        "hr_gain_pct": (
+            100.0 * (mean_metric(hr_gain_values) / max(mean_metric(hr_coarse_values), 1e-8))
+            if hr_coarse_values
             else None
         ),
     }
@@ -578,14 +592,20 @@ def train(cfg, args):
                 model_image_size,
                 max_batches=log_cfg.get("eval_batches", 8),
             )
-            writer.add_scalar("val/masked_l1_coarse", val_metrics["masked_l1_coarse"], step)
-            writer.add_scalar("val/masked_l1_refined", val_metrics["masked_l1_refined"], step)
-            if val_metrics["gain_pct"] is not None:
-                writer.add_scalar("val/gain_pct", val_metrics["gain_pct"], step)
+            writer.add_scalar("val/lr_masked_l1_coarse", val_metrics["masked_l1_lr_coarse"], step)
+            writer.add_scalar("val/lr_masked_l1_refined", val_metrics["masked_l1_lr_refined"], step)
+            if val_metrics["lr_gain_pct"] is not None:
+                writer.add_scalar("val/lr_gain_pct", val_metrics["lr_gain_pct"], step)
+            writer.add_scalar("val/hr_masked_l1_coarse_baseline", val_metrics["masked_l1_hr_coarse_baseline"], step)
+            writer.add_scalar("val/hr_masked_l1_refined", val_metrics["masked_l1_hr_refined"], step)
+            if val_metrics["hr_gain_pct"] is not None:
+                writer.add_scalar("val/hr_gain_pct", val_metrics["hr_gain_pct"], step)
             progress_bar.write(
                 f"Validation step {step}: "
-                f"{val_metrics['masked_l1_coarse']:.4f} -> {val_metrics['masked_l1_refined']:.4f} "
-                f"(gain {val_metrics['gain_pct']:.2f}% if positive)"
+                f"LR {val_metrics['masked_l1_lr_coarse']:.4f} -> {val_metrics['masked_l1_lr_refined']:.4f} "
+                f"(gain {val_metrics['lr_gain_pct']:.2f}%) | "
+                f"HR {val_metrics['masked_l1_hr_coarse_baseline']:.4f} -> {val_metrics['masked_l1_hr_refined']:.4f} "
+                f"(gain {val_metrics['hr_gain_pct']:.2f}%)"
             )
             empty_device_cache(device)
 
