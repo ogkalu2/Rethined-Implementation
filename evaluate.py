@@ -30,8 +30,9 @@ def load_model(checkpoint_path, cfg, device, random_init=False):
         if not checkpoint_path:
             raise ValueError("checkpoint_path is required unless random_init=True")
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-        load_model_checkpoint(model, state_dict)
+        if "model_state_dict" not in ckpt:
+            raise KeyError("Expected a training checkpoint containing 'model_state_dict'.")
+        load_model_checkpoint(model, ckpt["model_state_dict"])
     model.eval()
     return model
 
@@ -292,7 +293,6 @@ def main():
     parser.add_argument("--speed_only", action="store_true")
     parser.add_argument("--random_init", action="store_true")
     parser.add_argument("--reparameterize", action="store_true")
-    parser.add_argument("--upscale_test", action="store_true")
     parser.add_argument("--speed_runs", type=int, default=50)
     parser.add_argument("--speed_warmup", type=int, default=10)
     parser.add_argument("--upscale_runs", type=int, default=30)
@@ -390,17 +390,16 @@ def main():
             improvement = f"-{(coarse_value - refined_value) / coarse_value * 100:.1f}%" if coarse_value > 0 else "N/A"
         print(f"  {base.upper():<20} {coarse_value:>10.4f} {refined_value:>10.4f} {improvement:>12}")
 
-    if args.upscale_test or not args.speed_only:
-        print("\n--- AttentionUpscaling Quality ---")
-        for hr_res in hr_resolutions:
-            if hr_res <= model.generator.image_size:
-                continue
-            up_quality = test_upscaling_quality(model, val_loader, device, hr_res=hr_res, num_images=min(args.num_images, 50))
-            results[f"upscaling_quality_{hr_res}"] = up_quality
-            if up_quality["l1_mean"] is not None:
-                print(f"  HR={hr_res}: L1={up_quality['l1_mean']:.4f} (n={up_quality['num_images']})")
-            else:
-                print(f"  HR={hr_res}: Failed")
+    print("\n--- AttentionUpscaling Quality ---")
+    for hr_res in hr_resolutions:
+        if hr_res <= model.generator.image_size:
+            continue
+        up_quality = test_upscaling_quality(model, val_loader, device, hr_res=hr_res, num_images=min(args.num_images, 50))
+        results[f"upscaling_quality_{hr_res}"] = up_quality
+        if up_quality["l1_mean"] is not None:
+            print(f"  HR={hr_res}: L1={up_quality['l1_mean']:.4f} (n={up_quality['num_images']})")
+        else:
+            print(f"  HR={hr_res}: Failed")
 
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output, "w", encoding="utf-8") as handle:
