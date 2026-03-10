@@ -48,7 +48,7 @@ data:
   val_dir: null
   image_size: 1024
   batch_size: 4
-  eval_batch_size: 4
+  eval_batch_size: 2
   num_workers: 4
   mask_min_coverage: 0.30
   mask_max_coverage: 0.50
@@ -68,7 +68,7 @@ training:
   seed: 42
   joint_hr_pipeline: true
   freeze_coarse: false
-  auto_freeze_coarse: true
+  auto_freeze_coarse: false
 
 loss:
   coarse_weight: 1.0

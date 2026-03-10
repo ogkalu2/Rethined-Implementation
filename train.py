@@ -181,6 +181,14 @@ def print_device_banner(device: torch.device):
         print(f"Accelerator: {get_device_name(device)}")
 
 
+def clear_device_cache(device: torch.device) -> None:
+    """Release cached accelerator memory between large eval phases."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "empty_cache"):
+        torch.xpu.empty_cache()
+
+
 def validate_joint_hr_pipeline(cfg, model):
     """Validate the config needed to train the LR+HR pipeline jointly."""
     joint_hr_pipeline = cfg["training"].get("joint_hr_pipeline", False)
@@ -789,6 +797,7 @@ def run_eval_only(cfg, args):
         joint_hr_pipeline=joint_hr_pipeline,
         refinement_eval_scale=eval_refinement_scale,
     )
+    clear_device_cache(device)
 
     print("\nFull validation results:")
     print(json.dumps(health, indent=2))
@@ -1193,6 +1202,7 @@ def train(cfg, args):
             )
 
         if eval_loader is not None and step % eval_interval == 0:
+            clear_device_cache(device)
             health = evaluate_refinement_health(
                 model,
                 eval_loader,
@@ -1216,6 +1226,7 @@ def train(cfg, args):
                 train_start_time,
                 health,
             )
+            clear_device_cache(device)
 
         # Visualization
         if step % log_cfg["vis_interval"] == 0:
@@ -1260,6 +1271,7 @@ def train(cfg, args):
         save_checkpoint(model, optimizer, scaler, total_steps, loss_dict, cfg, final_path)
     final_lr = get_lr(total_steps, warmup_steps, total_steps, max_lr, min_lr)
     if eval_loader is not None:
+        clear_device_cache(device)
         final_health = evaluate_refinement_health(
             model,
             eval_loader,
@@ -1283,6 +1295,7 @@ def train(cfg, args):
             train_start_time,
             final_health,
         )
+        clear_device_cache(device)
     if save_final_checkpoint:
         print(f"\nTraining complete. Final checkpoint: {final_path}")
     else:
