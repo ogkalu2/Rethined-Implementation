@@ -1141,7 +1141,7 @@ def train(cfg, args):
         running_normalized_loss = 0.9 * running_normalized_loss + 0.1 * loss_dict["total_normalized"]
         pbar.set_postfix(
             loss=f"{running_loss:.4f}",
-            nloss=f"{running_normalized_loss:.4f}",
+            nl=f"{running_normalized_loss:.4f}",
             l1r=f"{loss_dict['l1_refined']:.4f}",
         )
 
