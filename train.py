@@ -94,7 +94,7 @@ def load_model_checkpoint(model, state_dict):
     model_state = model.state_dict()
     filtered_state = {}
     dropped_shape_mismatches = []
-    allowed_prefixes = ("generator.hr_", "generator.post_assembly_")
+    allowed_prefixes = ("generator.hr_",)
     allowed_missing_substrings = (
         ".depthwise_scale.",
         ".depthwise_scale_bn.",

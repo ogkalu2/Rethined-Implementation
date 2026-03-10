@@ -68,7 +68,7 @@ class CoarseModel(nn.Module):
         self.use_rep_blocks = bool(use_rep_blocks)
         block_cls = RepDepthwiseSeparableBlock if self.use_rep_blocks else DepthwiseSeparableBlock
 
-        self.stage0 = CoarseEncoderStage(4, c0, block_cls=block_cls)  # 3 RGB + 1 mask
+        self.stage0 = CoarseEncoderStage(3, c0, block_cls=block_cls)
         self.stage1 = CoarseEncoderStage(c0, c1, block_cls=block_cls)
         self.stage2 = CoarseEncoderStage(c1, c2, block_cls=block_cls)
         self.stage3 = CoarseEncoderStage(c2, c3, block_cls=block_cls)
@@ -83,11 +83,7 @@ class CoarseModel(nn.Module):
         self.out_conv = nn.Conv2d(self.head_channels, 3, kernel_size=1)
         self.sigmoid = nn.Sigmoid()
 
-    def forward(self, x, mask=None):
-        rgb_input = x  # save 3-channel RGB for the head skip connection
-        if mask is not None:
-            x = torch.cat([x, mask], dim=1)  # (B, 4, H, W)
-
+    def forward(self, x):
         features = []
         x0 = self.stage0(x)
         features.append(x0)
@@ -105,7 +101,7 @@ class CoarseModel(nn.Module):
         out = self.up2(out, x1)
         out = self.up1(out, x0)
         out = F.interpolate(out, scale_factor=2, mode="bilinear", align_corners=False)
-        out = torch.cat([out, rgb_input], dim=1)  # skip uses RGB only (c0 + 3)
+        out = torch.cat([out, x], dim=1)
         out = self.head_block(out)
         out = self.sigmoid(self.out_conv(out))
         return out, features

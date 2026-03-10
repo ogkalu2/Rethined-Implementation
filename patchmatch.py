@@ -290,16 +290,6 @@ class PatchInpainting(nn.Module):
             if self.use_hr_residual_refiner
             else None
         )
-        # Pixel-space post-assembly refinement: fixes patch seams and colour shifts
-        self.post_assembly_refine = nn.Sequential(
-            nn.Conv2d(7, 32, 3, padding=1, padding_mode="reflect"),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 32, 3, padding=1, padding_mode="reflect"),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 3, 3, padding=1, padding_mode="reflect"),
-        )
-        nn.init.zeros_(self.post_assembly_refine[-1].weight)
-        nn.init.zeros_(self.post_assembly_refine[-1].bias)
         self.last_base_patches_flat = None
         self.last_pixel_mask_flat = None
         self.last_output_patches_flat = None
@@ -390,7 +380,7 @@ class PatchInpainting(nn.Module):
 
     def forward(self, image, mask):
         masked_input = image
-        image_coarse_inpainting, features = self.encoder_decoder(masked_input, mask)
+        image_coarse_inpainting, features = self.encoder_decoder(masked_input)
         if self.mask_inpainting:
             coarse_composite = image_coarse_inpainting * mask + masked_input * (1 - mask)
         else:
@@ -400,6 +390,7 @@ class PatchInpainting(nn.Module):
         composite_blurred = self.final_gaussian_blur(coarse_composite)
         composite_patches_full, sizes = self.unfold_native(coarse_composite, self.kernel_size)
         blurred_patches_full, _ = self.unfold_native(composite_blurred, self.kernel_size)
+        hf_patches = composite_patches_full - blurred_patches_full
 
         mask_as_patches, _ = self.unfold_native(mask, self.kernel_size)
         mask_ratio = mask_as_patches.mean(dim=1, keepdim=True)
@@ -419,7 +410,9 @@ class PatchInpainting(nn.Module):
         pixel_mask_flat = mask_as_patches.flatten(start_dim=2).transpose(1, 2)
         pixel_mask_flat = pixel_mask_flat.repeat(1, 1, self.stem_out_channels)
 
-        # Full coarse-composite patches for both affinity estimation and value transfer
+        # Use full coarse-composite patches for affinity estimation so attention
+        # can follow semantics/structure, but keep LR values in the HF domain to
+        # preserve the coarse branch as the low-frequency base.
         match_patches = composite_patches_full
         preserve_patches_full = composite_patches_full
         if self.concat_features:
@@ -443,18 +436,20 @@ class PatchInpainting(nn.Module):
         if positional_encoding is not None:
             input_attn = input_attn + positional_encoding
 
+        match_patches_flat = match_patches.flatten(start_dim=2).transpose(1, 2)
         preserve_patches_flat = preserve_patches_full.flatten(start_dim=2).transpose(1, 2)
+        blurred_patches_flat = blurred_patches_full.flatten(start_dim=2).transpose(1, 2)
+        hf_patches_flat = hf_patches.flatten(start_dim=2).transpose(1, 2)
+        base_hf_flat = preserve_patches_flat - blurred_patches_flat
         self.last_base_patches_flat = preserve_patches_flat
 
         pre_softmax_mask = (
             self.build_paper_attention_mask(mask_same_res_as_features_pooled) if self.attention_masking else None
         )
-        # Full-patch transfer: attention copies whole patches (LF+HF) from valid
-        # regions into masked regions, allowing both structural and textural fix.
         out, atten_weights = self.multihead_attention(
             input_attn,
             input_attn,
-            preserve_patches_flat,
+            hf_patches_flat,
             None,
             None,
             qk_mask=pre_softmax_mask,
@@ -474,7 +469,7 @@ class PatchInpainting(nn.Module):
             refinement_confidence = patch_mask
 
         refinement_scale = self.refinement_runtime_scale
-        delta = refinement_scale * refinement_confidence * (out - preserve_patches_flat) * patch_mask
+        delta = refinement_scale * refinement_confidence * (out - base_hf_flat) * patch_mask
         delta = self.apply_paper_coherence(delta, sizes)
         out = preserve_patches_flat + delta
         out = out * patch_mask + preserve_patches_flat * (1 - patch_mask)
@@ -482,10 +477,6 @@ class PatchInpainting(nn.Module):
         self.last_pixel_mask_flat = pixel_mask_flat
         self.last_refinement_confidence = refinement_confidence
         out = self.fold_native(out, sizes, self.kernel_size, use_final_conv=False)
-
-        # Pixel-space post-assembly refinement (seam fix + colour adjustment)
-        refine_input = torch.cat([out, coarse_composite, mask], dim=1)
-        out = out + self.post_assembly_refine(refine_input) * mask
 
         return out, atten_weights, image_to_return
 
