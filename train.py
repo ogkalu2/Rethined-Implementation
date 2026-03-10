@@ -1195,11 +1195,12 @@ def train(cfg, args):
                 lr,
                 train_start_time,
             )
-            print(
-                f"\nTrain step {step}: "
-                f"loss={running_loss:.4f}, nl={running_normalized_loss:.4f}, "
-                f"l1r={loss_dict['l1_refined']:.4f}, scale={refinement_scale:.3f}"
-            )
+            if log_cfg.get("print_train_metrics", False):
+                print(
+                    f"\nTrain step {step}: "
+                    f"loss={running_loss:.4f}, nl={running_normalized_loss:.4f}, "
+                    f"l1r={loss_dict['l1_refined']:.4f}, scale={refinement_scale:.3f}"
+                )
 
         if eval_loader is not None and step % eval_interval == 0:
             clear_device_cache(device)
