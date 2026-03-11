@@ -29,8 +29,8 @@ data:
   batch_size: 4
   eval_batch_size: 2
   num_workers: 2
-  mask_min_coverage: 0.30
-  mask_max_coverage: 0.50
+  mask_min_coverage: 0.10
+  mask_max_coverage: 0.40
   force_random_masks_train: true
   force_random_masks_eval: false
 
