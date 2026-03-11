@@ -59,7 +59,7 @@ class InpaintingLoss(nn.Module):
         coarse_raw: torch.Tensor,
         refined: torch.Tensor,
         target: torch.Tensor,
-        fake_logits: torch.Tensor | None = None,
+        fake_logits: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         
         # 1. Base L2 on Coarse
@@ -74,7 +74,13 @@ class InpaintingLoss(nn.Module):
 
         adversarial = refined.new_zeros(())
         if fake_logits is not None:
-            adversarial = F.binary_cross_entropy_with_logits(fake_logits, torch.ones_like(fake_logits))
+            # fake_logits is a list of per-scale spatial maps; average the
+            # per-scale losses equally so no scale is implicitly over-weighted.
+            scale_losses = [
+                F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
+                for l in fake_logits
+            ]
+            adversarial = torch.stack(scale_losses).mean()
 
         # 4. Total Loss Calculation
         # We multiply the coarse perceptual by 0.5 so it doesn't overpower the final refinement gradients
@@ -97,11 +103,18 @@ class InpaintingLoss(nn.Module):
 
     def discriminator_loss(
         self,
-        real_logits: torch.Tensor,
-        fake_logits: torch.Tensor,
+        real_logits: list[torch.Tensor],
+        fake_logits: list[torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        real_loss = F.binary_cross_entropy_with_logits(real_logits, torch.ones_like(real_logits))
-        fake_loss = F.binary_cross_entropy_with_logits(fake_logits, torch.zeros_like(fake_logits))
+        # Average per-scale BCE equally so no scale is implicitly over-weighted.
+        real_loss = torch.stack([
+            F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
+            for l in real_logits
+        ]).mean()
+        fake_loss = torch.stack([
+            F.binary_cross_entropy_with_logits(l, torch.zeros_like(l))
+            for l in fake_logits
+        ]).mean()
         total = 0.5 * (real_loss + fake_loss)
         loss_dict = {
             "adversarial_d_real": real_loss.item(),

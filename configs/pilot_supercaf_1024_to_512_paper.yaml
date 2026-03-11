@@ -61,6 +61,7 @@ discriminator:
   in_channels: 3
   base_channels: 64
   n_layers: 3
+  num_scales: 1 
 
 logging:
   log_dir: "logs/pilot_supercaf_1024_to_512_paper"

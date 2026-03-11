@@ -60,7 +60,8 @@ discriminator:
   in_channels: 3
   base_channels: 64
   n_layers: 3
-
+  num_scales: 1 
+  
 logging:
   log_dir: "logs/overfit_supercaf_1024_from_512"
   log_interval: 10

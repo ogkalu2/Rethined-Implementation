@@ -42,13 +42,20 @@ class SinglePatchDiscriminator(nn.Module):
 
 
 class PatchDiscriminator(nn.Module):
-    """Multi-Scale wrapper for global and local realism."""
+    """PatchGAN discriminator, paper-aligned (single scale).
+
+    Set num_scales > 1 only if training at very high resolutions (1024+) where
+    the 70x70 receptive field covers a small fraction of the image and there are
+    no strong non-adversarial losses (L2/perceptual) already covering structure.
+    Note: if using multiple scales, compute the loss per-scale and sum equally
+    rather than flattening all logits together (which over-weights the fine scale).
+    """
     def __init__(
-        self, 
-        in_channels: int = 3, 
-        base_channels: int = 64, 
-        n_layers: int = 3, 
-        num_scales: int = 2
+        self,
+        in_channels: int = 3,
+        base_channels: int = 64,
+        n_layers: int = 3,
+        num_scales: int = 1
     ):
         super().__init__()
         self.num_scales = num_scales
@@ -57,14 +64,18 @@ class PatchDiscriminator(nn.Module):
             for _ in range(num_scales)
         ])
 
-    def forward(self, image):
+    def forward(self, image) -> list[torch.Tensor]:
+        """Return one logit map per scale (coarse-to-fine order).
+
+        Each element is a spatial tensor of shape (B, 1, H', W').  Keeping
+        them separate lets the caller compute per-scale losses and sum them
+        with equal weight, avoiding the implicit fine-scale bias that arises
+        from flattening tensors of different spatial sizes before averaging.
+        """
         logits = []
         x = image
         for i, D in enumerate(self.discriminators):
             logits.append(D(x))
             if i != self.num_scales - 1:
-                # Downsample by 2x for the next discriminator
                 x = F.avg_pool2d(x, kernel_size=3, stride=2, padding=1)
-        
-        # Concatenate all logits into a single 1D tensor for BCE loss
-        return torch.cat([l.flatten() for l in logits])
+        return logits
