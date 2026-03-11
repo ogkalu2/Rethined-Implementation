@@ -50,6 +50,7 @@ training:
 
 loss:
   coarse_l2_weight: 1.0
+  coarse_perceptual_weight: 0.05
   frequency_weight: 1.0
   perceptual_weight: 0.1
   adversarial_weight: 0.01

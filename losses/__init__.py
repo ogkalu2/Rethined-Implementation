@@ -37,6 +37,7 @@ class InpaintingLoss(nn.Module):
     def __init__(
         self,
         coarse_l2_weight: float = 1.0,
+        coarse_perceptual_weight: float = 0.05,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.01,
@@ -45,6 +46,7 @@ class InpaintingLoss(nn.Module):
     ):
         super().__init__()
         self.coarse_l2_weight = float(coarse_l2_weight)
+        self.coarse_perceptual_weight = float(coarse_perceptual_weight)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -78,14 +80,14 @@ class InpaintingLoss(nn.Module):
         # We multiply the coarse perceptual by 0.5 so it doesn't overpower the final refinement gradients
         total = (
             self.coarse_l2_weight * coarse_l2
-            + (self.perceptual_weight * 0.5) * coarse_perceptual 
+            + self.coarse_perceptual_weight * coarse_perceptual
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
-            "coarse_perceptual": coarse_perceptual.item(), # optional logging
+            "coarse_perceptual": coarse_perceptual.item(),
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),
