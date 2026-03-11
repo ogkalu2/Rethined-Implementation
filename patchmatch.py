@@ -121,7 +121,7 @@ class PatchInpainting(nn.Module):
             if self.use_positional_encoding
             else None
         )
-        self.paper_coherence_layer = (
+        self.coherence_layer = (
             nn.Conv2d(
                 3, # Changed from self.patch_value_dim to 3 (RGB channels)
                 3, # Changed from self.patch_value_dim to 3 (RGB channels)
@@ -133,9 +133,9 @@ class PatchInpainting(nn.Module):
             if self.final_conv
             else None
         )
-        if self.paper_coherence_layer is not None:
-            nn.init.zeros_(self.paper_coherence_layer.weight)
-            nn.init.zeros_(self.paper_coherence_layer.bias)
+        if self.coherence_layer is not None:
+            nn.init.zeros_(self.coherence_layer.weight)
+            nn.init.zeros_(self.coherence_layer.bias)
 
         self.register_buffer(
             "unfolding_weights",
@@ -289,8 +289,8 @@ class PatchInpainting(nn.Module):
         )
         
         # 2. Apply the coherence layer to smooth the seams on the folded 3-channel image
-        if self.paper_coherence_layer is not None:
-            refined = refined + self.paper_coherence_layer(refined)
+        if self.coherence_layer is not None:
+            refined = refined + self.coherence_layer(refined)
             
         # 3. Paste the uncorrupted original pixels back over the known regions
         refined = refined * mask + image * (1 - mask)
