@@ -61,7 +61,7 @@ loss:
 
 discriminator:
   in_channels: 3
-  base_channels: 64
+  base_channels: 128
   n_layers: 3
 
 logging:
