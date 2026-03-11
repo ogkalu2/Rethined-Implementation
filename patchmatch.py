@@ -49,16 +49,12 @@ class MultiHeadAttention(nn.Module):
             v_proj = self.w_vs(v).view(batch_size, len_v, self.n_head, self.d_v).transpose(1, 2)
 
         attn = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3))
-        
-        if post_softmax_mask is not None:
-            # Mask out disallowed connections with -inf BEFORE softmax.
-            # (post_softmax_mask contains 1 for allowed, 0 for disallowed)
-            attn = attn.masked_fill(post_softmax_mask == 0, float('-inf'))
-
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
-        attn = self.dropout(attn)
 
-        mixed = torch.matmul(attn, v_proj)
+        if post_softmax_mask is not None:
+            attn = attn * post_softmax_mask.to(dtype=attn.dtype)
+
+        mixed = torch.matmul(self.dropout(attn), v_proj)
         output = mixed.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
         if not direct_patch_mixing:
             output = self.fc(output)
@@ -266,6 +262,7 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
+        coarse_patch_values = patch_map.flatten(start_dim=2).transpose(1, 2)
         attention_mask = (
             self.build_paper_attention_mask(patch_mask_flat) if self.attention_masking else None
         )
@@ -276,6 +273,11 @@ class PatchInpainting(nn.Module):
             post_softmax_mask=attention_mask,
             direct_patch_mixing=True,
         )
+        if attention_mask is not None:
+            residual_mass = (1.0 - masked_attention.sum(dim=-1, keepdim=True)).clamp_(0.0, 1.0).squeeze(1)
+            patch_mask = patch_mask_flat.unsqueeze(-1)
+            fallback_patches = patch_values * (1.0 - patch_mask) + coarse_patch_values * patch_mask
+            mixed_patches_flat = mixed_patches_flat + residual_mass.to(dtype=mixed_patches_flat.dtype) * fallback_patches
 
         mixed_patch_map = mixed_patches_flat.transpose(1, 2).contiguous().view_as(patch_map)
                 
