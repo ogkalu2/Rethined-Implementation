@@ -133,6 +133,9 @@ class PatchInpainting(nn.Module):
             if self.final_conv
             else None
         )
+        if self.paper_coherence_layer is not None:
+            nn.init.zeros_(self.paper_coherence_layer.weight)
+            nn.init.zeros_(self.paper_coherence_layer.bias)
 
         self.register_buffer(
             "unfolding_weights",
@@ -278,7 +281,7 @@ class PatchInpainting(nn.Module):
 
         mixed_patch_map = mixed_patches_flat.transpose(1, 2).contiguous().view_as(patch_map)
         if self.paper_coherence_layer is not None:
-            mixed_patch_map = self.paper_coherence_layer(mixed_patch_map)
+            mixed_patch_map = mixed_patch_map + self.paper_coherence_layer(mixed_patch_map)
 
         refined = self.fold_native(
             mixed_patch_map,
