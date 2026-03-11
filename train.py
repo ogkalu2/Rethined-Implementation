@@ -225,6 +225,15 @@ def mean_metric(values):
     return float(sum(values) / len(values)) if values else None
 
 
+def format_train_metric_snapshot(metrics):
+    return (
+        f"train g={metrics['generator_total']:.4f}, "
+        f"d={metrics['discriminator_total']:.4f}, "
+        f"ff={metrics['frequency']:.4f}, "
+        f"perc={metrics['perceptual']:.4f}"
+    )
+
+
 def save_vis(writer, batch, coarse, refined, step, log_dir=None):
     n = min(4, batch["image"].shape[0])
     gt = batch["image"][:n].cpu()
@@ -648,7 +657,8 @@ def train(cfg, args):
                 f"LR {val_metrics['masked_l1_lr_coarse']:.4f} -> {val_metrics['masked_l1_lr_refined']:.4f} "
                 f"(gain {val_metrics['lr_gain_pct']:.2f}%) | "
                 f"HR {val_metrics['masked_l1_hr_coarse_baseline']:.4f} -> {val_metrics['masked_l1_hr_refined']:.4f} "
-                f"(gain {val_metrics['hr_gain_pct']:.2f}%)"
+                f"(gain {val_metrics['hr_gain_pct']:.2f}%)\n"
+                f"  {format_train_metric_snapshot(metrics)}"
             )
             empty_device_cache(device)
 
