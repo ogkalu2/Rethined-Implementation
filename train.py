@@ -511,6 +511,7 @@ def train(cfg, args):
         optimizer_d.zero_grad(set_to_none=True)
         metric_sums = {
             "coarse_l2": 0.0,
+            "coarse_perceptual": 0.0,
             "frequency": 0.0,
             "perceptual": 0.0,
             "adversarial_g": 0.0,
@@ -597,6 +598,7 @@ def train(cfg, args):
 
         if step == 1 or step % log_cfg["log_interval"] == 0:
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
+            writer.add_scalar("loss/coarse_perceptual", metrics["coarse_perceptual"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
