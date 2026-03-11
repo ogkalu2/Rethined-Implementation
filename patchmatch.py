@@ -133,6 +133,9 @@ class PatchInpainting(nn.Module):
             if self.final_conv
             else None
         )
+        if self.coherence_layer is not None:
+            nn.init.dirac_(self.coherence_layer.weight)
+            nn.init.zeros_(self.coherence_layer.bias)
 
         self.register_buffer(
             "unfolding_weights",
