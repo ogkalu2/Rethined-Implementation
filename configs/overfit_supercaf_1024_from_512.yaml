@@ -38,7 +38,7 @@ training:
   total_steps: 2000
   grad_accum_steps: 1
   lr: 0.001
-  discriminator_lr: 0.0001
+  discriminator_lr: 0.00005
   warmup_steps: 100
   min_lr: 0.000001
   discriminator_min_lr: 0.0000001
