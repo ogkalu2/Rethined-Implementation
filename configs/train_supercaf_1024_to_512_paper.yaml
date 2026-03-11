@@ -40,10 +40,10 @@ training:
   total_steps: 600000
   grad_accum_steps: 16
   lr: 0.001
-  discriminator_lr: 0.001
+  discriminator_lr: 0.0001
   warmup_steps: 10000
   min_lr: 0.000001
-  discriminator_min_lr: 0.000001
+  discriminator_min_lr: 0.0000001
   grad_clip: 1.0
   discriminator_grad_clip: 1.0
   mixed_precision: true

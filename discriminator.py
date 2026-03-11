@@ -42,14 +42,6 @@ class SinglePatchDiscriminator(nn.Module):
 
 
 class PatchDiscriminator(nn.Module):
-    """PatchGAN discriminator, paper-aligned (single scale).
-
-    Set num_scales > 1 only if training at very high resolutions (1024+) where
-    the 70x70 receptive field covers a small fraction of the image and there are
-    no strong non-adversarial losses (L2/perceptual) already covering structure.
-    Note: if using multiple scales, compute the loss per-scale and sum equally
-    rather than flattening all logits together (which over-weights the fine scale).
-    """
     def __init__(
         self,
         in_channels: int = 3,
