@@ -31,8 +31,8 @@ data:
   batch_size: 8
   eval_batch_size: 4
   num_workers: 4
-  mask_min_coverage: 0.30
-  mask_max_coverage: 0.50
+  mask_min_coverage: 0.10
+  mask_max_coverage: 0.40
   force_random_masks_train: true
   force_random_masks_eval: false
 
@@ -41,7 +41,7 @@ training:
   grad_accum_steps: 16
   lr: 0.001
   discriminator_lr: 0.001
-  warmup_steps: 1000
+  warmup_steps: 10000
   min_lr: 0.000001
   discriminator_min_lr: 0.000001
   grad_clip: 1.0
@@ -60,7 +60,7 @@ loss:
 
 discriminator:
   in_channels: 3
-  base_channels: 64
+  base_channels: 128
   n_layers: 3
 
 logging:
