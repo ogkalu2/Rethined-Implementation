@@ -59,7 +59,14 @@ class InpaintingLoss(nn.Module):
         target: torch.Tensor,
         fake_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
+        
+        # 1. Base L2 on Coarse
         coarse_l2 = F.mse_loss(coarse_raw, target)
+        
+        # 2. Add Perceptual guidance DIRECTLY to the Coarse model (The Secret Sauce)
+        coarse_perceptual = self.perceptual_loss(coarse_raw, target)
+        
+        # 3. Standard Refined Losses
         frequency = self.frequency_loss(refined, target)
         perceptual = self.perceptual_loss(refined, target)
 
@@ -67,14 +74,18 @@ class InpaintingLoss(nn.Module):
         if fake_logits is not None:
             adversarial = F.binary_cross_entropy_with_logits(fake_logits, torch.ones_like(fake_logits))
 
+        # 4. Total Loss Calculation
+        # We multiply the coarse perceptual by 0.5 so it doesn't overpower the final refinement gradients
         total = (
             self.coarse_l2_weight * coarse_l2
+            + (self.perceptual_weight * 0.5) * coarse_perceptual 
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
+            "coarse_perceptual": coarse_perceptual.item(), # optional logging
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),
