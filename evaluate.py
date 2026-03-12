@@ -40,10 +40,14 @@ def load_model(checkpoint_path, cfg, device, random_init=False):
 @torch.no_grad()
 def run_inference(model, attn_upscaler, batch_views, device, amp_enabled):
     with torch.amp.autocast(device.type, enabled=amp_enabled):
-        refined_lr, attn_map, coarse_raw = model(batch_views["masked_image"], batch_views["mask"])
+        refined_lr, attn_map, coarse_raw = model(
+            batch_views["masked_image"],
+            batch_views["mask"],
+            value_image=batch_views["refine_target"],
+        )
 
     refined_lr = refined_lr.clamp(0, 1)
-    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), batch_views["image"], batch_views["mask"])
+    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), batch_views["refine_target"], batch_views["mask"])
 
     if batch_views["has_hr_target"]:
         target = batch_views["image_hr"]
@@ -62,7 +66,7 @@ def run_inference(model, attn_upscaler, batch_views, device, amp_enabled):
             ).clamp(0, 1)
         refined_eval = composite_with_known(refined_hr, target, eval_mask)
     else:
-        target = batch_views["image"]
+        target = batch_views["refine_target"]
         eval_mask = batch_views["mask"]
         coarse_eval = coarse_lr
         refined_eval = refined_lr
@@ -256,7 +260,11 @@ def test_upscaling_quality(model, dataloader, device, hr_res=2048, num_images=50
             blur_layer=model.generator.final_gaussian_blur,
         )
         with torch.amp.autocast(device.type, enabled=amp_enabled):
-            refined_lr, attn_map, _ = model(batch_views["masked_image"], batch_views["mask"])
+            refined_lr, attn_map, _ = model(
+                batch_views["masked_image"],
+                batch_views["mask"],
+                value_image=batch_views["refine_target"],
+            )
         refined_lr = refined_lr.clamp(0, 1)
 
         image_hr = F.interpolate(batch_views["image_hr"], size=(hr_res, hr_res), mode="bicubic", align_corners=False)

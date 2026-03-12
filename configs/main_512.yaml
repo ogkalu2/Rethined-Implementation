@@ -7,8 +7,8 @@ model:
     use_rep_blocks: true
   generator:
     kernel_size: 8
-    value_patch_size: 12
-    value_source: "high_freq_residual"
+    value_patch_size: 8
+    value_source: "rgb"
     attention_temperature: 0.5
     attention_top_k: 8
     attention_selection: "gumbel"

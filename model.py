@@ -37,8 +37,8 @@ class InpaintingModel(nn.Module):
 
         self.generator = PatchInpainting(**generator_params, model=self.coarse_model)
 
-    def forward(self, image, mask):
-        return self.generator(image, mask)
+    def forward(self, image, mask, value_image=None):
+        return self.generator(image, mask, value_image=value_image)
 
     def reparameterize(self):
         """Apply any model-specific inference-time reparameterization."""

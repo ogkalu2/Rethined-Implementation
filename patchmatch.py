@@ -152,6 +152,8 @@ class PatchInpainting(nn.Module):
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         value_source: str = "rgb",
+        fusion_mode: str = "replace",
+        fusion_hidden_channels: int = 32,
         nheads: int,
         stem_out_stride: int = 1,
         stem_out_channels: int = 3,
@@ -186,6 +188,12 @@ class PatchInpainting(nn.Module):
         self.value_source = str(value_source).lower()
         if self.value_source not in {"rgb", "high_freq_residual"}:
             raise ValueError("value_source must be either 'rgb' or 'high_freq_residual'.")
+        self.fusion_mode = str(fusion_mode).lower()
+        if self.fusion_mode not in {"replace", "add", "gate"}:
+            raise ValueError("fusion_mode must be one of {'replace', 'add', 'gate'}.")
+        self.fusion_hidden_channels = int(fusion_hidden_channels)
+        if self.fusion_hidden_channels <= 0:
+            raise ValueError("fusion_hidden_channels must be positive.")
         self.concat_features = bool(concat_features)
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
@@ -254,6 +262,29 @@ class PatchInpainting(nn.Module):
             if self.use_positional_encoding
             else None
         )
+        self.fusion_gate = None
+        if self.fusion_mode == "gate":
+            self.fusion_gate = nn.Sequential(
+                nn.Conv2d(
+                    10,
+                    self.fusion_hidden_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    padding_mode="reflect",
+                ),
+                nn.GELU(),
+                nn.Conv2d(
+                    self.fusion_hidden_channels,
+                    1,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    padding_mode="reflect",
+                ),
+            )
+            nn.init.zeros_(self.fusion_gate[-1].weight)
+            nn.init.constant_(self.fusion_gate[-1].bias, -2.0)
         self.coherence_layer = (
             nn.Conv2d(
                 3,
@@ -519,18 +550,25 @@ class PatchInpainting(nn.Module):
     def reparameterize(self):
         return self
 
-    def forward(self, image: torch.Tensor, mask: torch.Tensor):
+    def forward(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+        value_image: torch.Tensor | None = None,
+    ):
         coarse_raw, features = self.encoder_decoder(image)
-        coarse_composite = coarse_raw * mask + image * (1 - mask)
+        known_image = image if value_image is None else value_image
+        coarse_composite = coarse_raw * mask + known_image * (1 - mask)
 
         patch_map, output_size = self.unfold_native(coarse_raw, self.kernel_size)
-        value_image = image
         default_patch_values = None
         if self.value_source == "high_freq_residual":
-            value_image = image - self.final_gaussian_blur(image)
+            value_base = known_image - self.final_gaussian_blur(known_image)
+        else:
+            value_base = known_image
 
         source_patch_map, _ = self.extract_patches(
-            value_image,
+            value_base,
             self.value_patch_size,
             stride=self.kernel_size,
             padding=self.value_patch_padding,
@@ -596,14 +634,21 @@ class PatchInpainting(nn.Module):
             padding=self.value_patch_padding,
             use_window=self.value_patch_padding > 0,
         )
-        if self.value_source == "high_freq_residual":
+        if self.fusion_mode == "add" or self.value_source == "high_freq_residual":
             refined = coarse_composite + mixed_image
+        elif self.fusion_mode == "gate":
+            gate_input = torch.cat(
+                [coarse_composite, mixed_image, (coarse_composite - mixed_image).abs(), mask],
+                dim=1,
+            )
+            gate = torch.sigmoid(self.fusion_gate(gate_input))
+            refined = gate * mixed_image + (1.0 - gate) * coarse_composite
         else:
             refined = mixed_image
 
         if self.coherence_layer is not None:
             refined = refined + self.coherence_layer(refined)
 
-        refined = refined * mask + image * (1 - mask)
+        refined = refined * mask + known_image * (1 - mask)
 
         return refined, masked_attention, coarse_raw

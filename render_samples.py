@@ -64,14 +64,15 @@ def render_sample(model, attn_upscaler, batch, model_image_size: int):
     masked_hr = batch["masked_image"].unsqueeze(0)
 
     blur_layer = model.generator.final_gaussian_blur
+    refine_target_lr = F.interpolate(image_hr, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
     image_lr = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
     mask_lr = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
     mask_lr = (mask_lr > 0.5).to(image_lr.dtype)
     masked_lr = image_lr * (1 - mask_lr)
 
-    refined_raw, attn_map, coarse_raw = model(masked_lr, mask_lr)
-    refined_lr = composite_with_known(refined_raw.clamp(0, 1), image_lr, mask_lr)
-    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), image_lr, mask_lr)
+    refined_raw, attn_map, coarse_raw = model(masked_lr, mask_lr, value_image=refine_target_lr)
+    refined_lr = composite_with_known(refined_raw.clamp(0, 1), refine_target_lr, mask_lr)
+    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), refine_target_lr, mask_lr)
 
     coarse_hr = composite_with_known(
         F.interpolate(coarse_lr, size=image_hr.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),

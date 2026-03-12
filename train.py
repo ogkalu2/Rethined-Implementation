@@ -114,9 +114,16 @@ def prepare_multiscale_batch(batch, device, model_image_size: int, blur_layer=No
 
     if image_hr.shape[-2:] == (model_image_size, model_image_size):
         image = image_hr
+        refine_target = image_hr
         mask = mask_hr
         masked_image = masked_image_hr
     else:
+        refine_target = F.interpolate(
+            image_hr,
+            size=(model_image_size, model_image_size),
+            mode="bicubic",
+            align_corners=False,
+        )
         image = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
         mask = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
         mask = (mask > 0.5).to(image.dtype)
@@ -124,6 +131,7 @@ def prepare_multiscale_batch(batch, device, model_image_size: int, blur_layer=No
 
     return {
         "image": image,
+        "refine_target": refine_target,
         "mask": mask,
         "masked_image": masked_image,
         "image_hr": image_hr,
@@ -269,7 +277,7 @@ def format_train_metric_snapshot(metrics):
 
 def save_vis(writer, batch, coarse, refined, step, log_dir=None):
     n = min(4, batch["image"].shape[0])
-    gt = batch["image"][:n].cpu()
+    gt = batch["refine_target"][:n].cpu()
     masked = batch["masked_image"][:n].cpu()
     mask_vis = batch["mask"][:n].repeat(1, 3, 1, 1).cpu()
     coarse_vis = coarse[:n].detach().clamp(0, 1).cpu()
@@ -306,17 +314,21 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
             model_image_size,
             blur_layer=model.generator.final_gaussian_blur,
         )
-        image = batch_views["image"]
         mask = batch_views["mask"]
         masked_image = batch_views["masked_image"]
+        refine_target = batch_views["refine_target"]
 
         with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
-            refined_lr, attn_map, coarse_raw = model(masked_image, mask)
+            refined_lr, attn_map, coarse_raw = model(
+                masked_image,
+                mask,
+                value_image=refine_target,
+            )
 
         refined_lr = refined_lr.clamp(0, 1)
-        coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
-        lr_coarse_err = masked_l1(coarse_lr, image, mask)
-        lr_refined_err = masked_l1(refined_lr, image, mask)
+        coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
+        lr_coarse_err = masked_l1(coarse_lr, refine_target, mask)
+        lr_refined_err = masked_l1(refined_lr, refine_target, mask)
         lr_coarse_values.extend(lr_coarse_err.tolist())
         lr_refined_values.extend(lr_refined_err.tolist())
         lr_gain_values.extend((lr_coarse_err - lr_refined_err).tolist())
@@ -609,14 +621,19 @@ def train(cfg, args):
             image = batch_views["image"]
             mask = batch_views["mask"]
             masked_image = batch_views["masked_image"]
+            refine_target = batch_views["refine_target"]
 
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
-                refined_raw, attn_map, coarse_raw = model(masked_image, mask)
+                refined_raw, attn_map, coarse_raw = model(
+                    masked_image,
+                    mask,
+                    value_image=refine_target,
+                )
                 refined_vis = refined_raw.clamp(0, 1) 
-                coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
+                coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
 
                 set_discriminator_requires_grad(discriminator, True)
-                real_logits = discriminator(image)
+                real_logits = discriminator(refine_target)
                 fake_logits_d = discriminator(refined_vis.detach()) 
                 d_loss, d_metrics = criterion.discriminator_loss(real_logits, fake_logits_d)
 
@@ -629,7 +646,14 @@ def train(cfg, args):
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
                 set_discriminator_requires_grad(discriminator, False)
                 fake_logits_g = discriminator(refined_vis) 
-                g_loss, g_metrics = criterion.generator_loss(coarse_raw, refined_raw, image, mask, fake_logits_g)
+                g_loss, g_metrics = criterion.generator_loss(
+                    coarse_raw,
+                    refined_raw,
+                    image,
+                    refine_target,
+                    mask,
+                    fake_logits_g,
+                )
 
             if not torch.isfinite(g_loss):
                 step_has_nonfinite = True

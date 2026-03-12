@@ -138,21 +138,22 @@ class InpaintingLoss(nn.Module):
         self,
         coarse_raw: torch.Tensor,
         refined: torch.Tensor,
-        target: torch.Tensor,
+        coarse_target: torch.Tensor,
+        refined_target: torch.Tensor,
         mask: torch.Tensor,
         fake_logits: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        coarse_composite = composite_with_known(coarse_raw, target, mask)
+        coarse_composite = composite_with_known(coarse_raw, coarse_target, mask)
         coarse_blurred = self.coarse_blur(coarse_composite)
-        target_blurred = self.coarse_blur(target)
+        target_blurred = self.coarse_blur(coarse_target)
         coarse_grad_mask = dilate_mask(mask)
-        coarse_l2 = masked_mse_loss(coarse_raw, target, mask)
+        coarse_l2 = masked_mse_loss(coarse_raw, coarse_target, mask)
         coarse_blur_l1 = masked_l1_loss(coarse_blurred, target_blurred, mask)
         coarse_gradient = masked_gradient_l1_loss(coarse_blurred, target_blurred, coarse_grad_mask)
-        coarse_perceptual = self.perceptual_loss(coarse_composite, target)
-        refined_l1 = masked_l1_loss(refined, target, mask)
-        frequency = self.frequency_loss(refined, target)
-        perceptual = self.perceptual_loss(refined, target)
+        coarse_perceptual = self.perceptual_loss(coarse_composite, coarse_target)
+        refined_l1 = masked_l1_loss(refined, refined_target, mask)
+        frequency = self.frequency_loss(refined, refined_target)
+        perceptual = self.perceptual_loss(refined, refined_target)
 
         adversarial = refined.new_zeros(())
         if fake_logits is not None:
