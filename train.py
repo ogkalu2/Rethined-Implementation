@@ -213,7 +213,14 @@ def load_training_checkpoint(
     optimizer_g.load_state_dict(ckpt["optimizer_g_state_dict"])
     optimizer_d.load_state_dict(ckpt["optimizer_d_state_dict"])
     scaler.load_state_dict(ckpt["scaler_state_dict"])
-    return int(ckpt["step"])
+    metrics = ckpt.get("metrics", {}) or {}
+    return {
+        "step": int(ckpt["step"]),
+        "best_metric_name": metrics.get("best_metric_name"),
+        "best_metric_mode": metrics.get("best_metric_mode"),
+        "best_metric_value": metrics.get("best_metric_value"),
+        "best_metric_step": metrics.get("best_metric_step"),
+    }
 
 
 def masked_l1(pred, target, mask):
@@ -223,6 +230,29 @@ def masked_l1(pred, target, mask):
 
 def mean_metric(values):
     return float(sum(values) / len(values)) if values else None
+
+
+def is_better_metric(candidate, best, mode):
+    if candidate is None:
+        return False
+    if best is None:
+        return True
+    if mode == "min":
+        return candidate < best
+    if mode == "max":
+        return candidate > best
+    raise ValueError(f"Unsupported best metric mode: {mode}")
+
+
+def build_checkpoint_metrics(train_metrics, best_metric_name, best_metric_mode, best_metric_value, best_metric_step):
+    checkpoint_metrics = dict(train_metrics)
+    checkpoint_metrics["best_metric_name"] = best_metric_name
+    checkpoint_metrics["best_metric_mode"] = best_metric_mode
+    checkpoint_metrics["best_metric_value"] = best_metric_value
+    checkpoint_metrics["best_metric_step"] = best_metric_step
+    if best_metric_name and best_metric_value is not None:
+        checkpoint_metrics[f"val/{best_metric_name}"] = best_metric_value
+    return checkpoint_metrics
 
 
 def format_train_metric_snapshot(metrics):
@@ -480,8 +510,13 @@ def train(cfg, args):
     writer = create_summary_writer(log_dir / "tb")
 
     start_step = 0
+    best_metric_name = log_cfg.get("save_best_metric", "masked_l1_hr_refined")
+    best_metric_mode = log_cfg.get("save_best_mode", "min")
+    save_best_checkpoint = log_cfg.get("save_best_checkpoint", True)
+    best_metric_value = None
+    best_metric_step = None
     if args.resume:
-        start_step = load_training_checkpoint(
+        resume_state = load_training_checkpoint(
             args.resume,
             model,
             discriminator,
@@ -490,6 +525,10 @@ def train(cfg, args):
             scaler,
             device,
         )
+        start_step = resume_state["step"]
+        if resume_state["best_metric_name"] == best_metric_name and resume_state["best_metric_mode"] == best_metric_mode:
+            best_metric_value = resume_state["best_metric_value"]
+            best_metric_step = resume_state["best_metric_step"]
         print(f"Resumed from step {start_step}")
 
     amp_device_type = get_autocast_device_type(device)
@@ -499,6 +538,7 @@ def train(cfg, args):
     last_batch_views = None
     last_coarse = None
     last_refined = None
+    metrics = {}
 
     progress_bar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
     for step_idx in progress_bar:
@@ -660,6 +700,33 @@ def train(cfg, args):
                 f"(gain {val_metrics['hr_gain_pct']:.2f}%)\n"
                 f"  {format_train_metric_snapshot(metrics)}"
             )
+            current_best_metric = val_metrics.get(best_metric_name)
+            if save_best_checkpoint and is_better_metric(current_best_metric, best_metric_value, best_metric_mode):
+                best_metric_value = float(current_best_metric)
+                best_metric_step = step
+                best_path = ckpt_dir / "best.pth"
+                best_metrics = build_checkpoint_metrics(
+                    metrics,
+                    best_metric_name,
+                    best_metric_mode,
+                    best_metric_value,
+                    best_metric_step,
+                )
+                save_checkpoint(
+                    model,
+                    discriminator,
+                    optimizer_g,
+                    optimizer_d,
+                    scaler,
+                    step,
+                    best_metrics,
+                    cfg,
+                    best_path,
+                )
+                progress_bar.write(
+                    f"Saved best checkpoint: {best_path} "
+                    f"({best_metric_name}={best_metric_value:.6f} at step {best_metric_step})"
+                )
             empty_device_cache(device)
 
         if step % log_cfg["vis_interval"] == 0 and last_batch_views is not None:
@@ -674,12 +741,46 @@ def train(cfg, args):
 
         if should_save:
             ckpt_path = ckpt_dir / f"step_{step}.pth"
-            save_checkpoint(model, discriminator, optimizer_g, optimizer_d, scaler, step, metrics, cfg, ckpt_path)
+            checkpoint_metrics = build_checkpoint_metrics(
+                metrics,
+                best_metric_name,
+                best_metric_mode,
+                best_metric_value,
+                best_metric_step,
+            )
+            save_checkpoint(
+                model,
+                discriminator,
+                optimizer_g,
+                optimizer_d,
+                scaler,
+                step,
+                checkpoint_metrics,
+                cfg,
+                ckpt_path,
+            )
             progress_bar.write(f"Saved checkpoint: {ckpt_path}")
 
     final_path = ckpt_dir / f"step_{total_steps}.pth"
     if log_cfg.get("save_final_checkpoint", True):
-        save_checkpoint(model, discriminator, optimizer_g, optimizer_d, scaler, total_steps, metrics, cfg, final_path)
+        final_metrics = build_checkpoint_metrics(
+            metrics,
+            best_metric_name,
+            best_metric_mode,
+            best_metric_value,
+            best_metric_step,
+        )
+        save_checkpoint(
+            model,
+            discriminator,
+            optimizer_g,
+            optimizer_d,
+            scaler,
+            total_steps,
+            final_metrics,
+            cfg,
+            final_path,
+        )
         progress_bar.write(f"Training complete. Final checkpoint: {final_path}")
     else:
         progress_bar.write("Training complete. Final checkpoint saving disabled.")

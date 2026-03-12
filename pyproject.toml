@@ -27,4 +27,5 @@ dependencies = [
     "pillow",
     "opencv-python-headless",
     "gdown>=5.2.1",
+    "huggingface_hub>=0.32.0",
 ]
