@@ -646,8 +646,6 @@ def train(cfg, args):
                 attn_map.detach(),
                 model.generator.flatten_query_mask(mask).detach(),
             )
-            if "attention_entropy" in attn_metrics:
-                attn_metrics["attention_map_entropy"] = attn_metrics.pop("attention_entropy")
 
             for key, value in g_metrics.items():
                 metric_sums[key] += value
@@ -701,7 +699,7 @@ def train(cfg, args):
             writer.add_scalar("loss/running_discriminator", running_d, step)
             writer.add_scalar("attention/top1", metrics["attention_top1"], step)
             writer.add_scalar("attention/top4", metrics["attention_top4"], step)
-            writer.add_scalar("attention/entropy", metrics["attention_map_entropy"], step)
+            writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
             writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
             writer.add_scalar("lr/generator", lr_g, step)
             writer.add_scalar("lr/discriminator", lr_d, step)
