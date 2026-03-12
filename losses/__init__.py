@@ -9,6 +9,40 @@ import torch.nn.functional as F
 from losses.perceptual import PerceptualLoss
 
 
+def composite_with_known(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    return pred * mask + target * (1 - mask)
+
+
+def _expanded_mask(mask: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
+    if mask.shape[1] == ref.shape[1]:
+        return mask
+    return mask.expand(-1, ref.shape[1], -1, -1)
+
+
+def masked_l1_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    mask = _expanded_mask(mask.to(dtype=pred.dtype), pred)
+    diff = (pred - target).abs() * mask
+    denom = mask.sum(dim=(1, 2, 3)).clamp_min(eps)
+    return (diff.sum(dim=(1, 2, 3)) / denom).mean()
+
+
+def masked_mse_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    mask = _expanded_mask(mask.to(dtype=pred.dtype), pred)
+    diff = (pred - target).pow(2) * mask
+    denom = mask.sum(dim=(1, 2, 3)).clamp_min(eps)
+    return (diff.sum(dim=(1, 2, 3)) / denom).mean()
+
+
 class FocalFrequencyLoss(nn.Module):
     """Compact Focal Frequency Loss implementation for image restoration."""
 
@@ -38,18 +72,26 @@ class InpaintingLoss(nn.Module):
         self,
         coarse_l2_weight: float = 1.0,
         coarse_perceptual_weight: float = 0.05,
+        refined_l1_weight: float = 1.0,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
-        adversarial_weight: float = 0.01,
+        adversarial_weight: float = 0.02,
+        adversarial_mode: str = "hinge",
         focal_alpha: float = 1.0,
         focal_log_matrix: bool = False,
     ):
         super().__init__()
         self.coarse_l2_weight = float(coarse_l2_weight)
         self.coarse_perceptual_weight = float(coarse_perceptual_weight)
+        self.refined_l1_weight = float(refined_l1_weight)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
+        self.adversarial_mode = str(adversarial_mode).lower()
+        if self.adversarial_mode not in {"bce", "hinge"}:
+            raise ValueError(
+                f"Unsupported adversarial_mode: {adversarial_mode}. Expected 'bce' or 'hinge'."
+            )
 
         self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
@@ -59,34 +101,31 @@ class InpaintingLoss(nn.Module):
         coarse_raw: torch.Tensor,
         refined: torch.Tensor,
         target: torch.Tensor,
+        mask: torch.Tensor,
         fake_logits: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        
-        # 1. Base L2 on Coarse
-        coarse_l2 = F.mse_loss(coarse_raw, target)
-        
-        # 2. Add Perceptual guidance DIRECTLY to the Coarse model (The Secret Sauce)
-        coarse_perceptual = self.perceptual_loss(coarse_raw, target)
-        
-        # 3. Standard Refined Losses
+        coarse_composite = composite_with_known(coarse_raw, target, mask)
+        coarse_l2 = masked_mse_loss(coarse_raw, target, mask)
+        coarse_perceptual = self.perceptual_loss(coarse_composite, target)
+        refined_l1 = masked_l1_loss(refined, target, mask)
         frequency = self.frequency_loss(refined, target)
         perceptual = self.perceptual_loss(refined, target)
 
         adversarial = refined.new_zeros(())
         if fake_logits is not None:
-            # fake_logits is a list of per-scale spatial maps; average the
-            # per-scale losses equally so no scale is implicitly over-weighted.
-            scale_losses = [
-                F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
-                for l in fake_logits
-            ]
+            if self.adversarial_mode == "hinge":
+                scale_losses = [(-l).mean() for l in fake_logits]
+            else:
+                scale_losses = [
+                    F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
+                    for l in fake_logits
+                ]
             adversarial = torch.stack(scale_losses).mean()
 
-        # 4. Total Loss Calculation
-        # We multiply the coarse perceptual by 0.5 so it doesn't overpower the final refinement gradients
         total = (
             self.coarse_l2_weight * coarse_l2
             + self.coarse_perceptual_weight * coarse_perceptual
+            + self.refined_l1_weight * refined_l1
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
@@ -94,6 +133,7 @@ class InpaintingLoss(nn.Module):
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
             "coarse_perceptual": coarse_perceptual.item(),
+            "refined_l1": refined_l1.item(),
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),
@@ -106,15 +146,24 @@ class InpaintingLoss(nn.Module):
         real_logits: list[torch.Tensor],
         fake_logits: list[torch.Tensor],
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        # Average per-scale BCE equally so no scale is implicitly over-weighted.
-        real_loss = torch.stack([
-            F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
-            for l in real_logits
-        ]).mean()
-        fake_loss = torch.stack([
-            F.binary_cross_entropy_with_logits(l, torch.zeros_like(l))
-            for l in fake_logits
-        ]).mean()
+        if self.adversarial_mode == "hinge":
+            real_loss = torch.stack([
+                F.relu(1 - l).mean()
+                for l in real_logits
+            ]).mean()
+            fake_loss = torch.stack([
+                F.relu(1 + l).mean()
+                for l in fake_logits
+            ]).mean()
+        else:
+            real_loss = torch.stack([
+                F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
+                for l in real_logits
+            ]).mean()
+            fake_loss = torch.stack([
+                F.binary_cross_entropy_with_logits(l, torch.zeros_like(l))
+                for l in fake_logits
+            ]).mean()
         total = 0.5 * (real_loss + fake_loss)
         loss_dict = {
             "adversarial_d_real": real_loss.item(),

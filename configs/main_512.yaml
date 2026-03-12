@@ -50,9 +50,11 @@ training:
 loss:
   coarse_l2_weight: 1.0
   coarse_perceptual_weight: 0.1
+  refined_l1_weight: 1.0
   frequency_weight: 0.5
   perceptual_weight: 0.1
-  adversarial_weight: 0.01
+  adversarial_weight: 0.02
+  adversarial_mode: "hinge"
   focal_alpha: 1.0
   focal_log_matrix: false
 

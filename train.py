@@ -259,6 +259,7 @@ def format_train_metric_snapshot(metrics):
     return (
         f"train g={metrics['generator_total']:.4f}, "
         f"d={metrics['discriminator_total']:.4f}, "
+        f"l1={metrics['refined_l1']:.4f}, "
         f"ff={metrics['frequency']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
@@ -590,6 +591,7 @@ def train(cfg, args):
         metric_sums = {
             "coarse_l2": 0.0,
             "coarse_perceptual": 0.0,
+            "refined_l1": 0.0,
             "frequency": 0.0,
             "perceptual": 0.0,
             "adversarial_g": 0.0,
@@ -636,7 +638,7 @@ def train(cfg, args):
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
                 set_discriminator_requires_grad(discriminator, False)
                 fake_logits_g = discriminator(refined)
-                g_loss, g_metrics = criterion.generator_loss(coarse_raw, refined, image, fake_logits_g)
+                g_loss, g_metrics = criterion.generator_loss(coarse_raw, refined, image, mask, fake_logits_g)
                 set_discriminator_requires_grad(discriminator, True)
 
             if not torch.isfinite(g_loss):
@@ -677,6 +679,7 @@ def train(cfg, args):
         if step == 1 or step % log_cfg["log_interval"] == 0:
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
             writer.add_scalar("loss/coarse_perceptual", metrics["coarse_perceptual"], step)
+            writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -697,6 +700,7 @@ def train(cfg, args):
                     step=step,
                     g=f"{metrics['generator_total']:.4f}",
                     d=f"{metrics['discriminator_total']:.4f}",
+                    l1=f"{metrics['refined_l1']:.4f}",
                     ff=f"{metrics['frequency']:.4f}",
                     perc=f"{metrics['perceptual']:.4f}",
                     refresh=False,
