@@ -129,12 +129,10 @@ class PatchInpainting(nn.Module):
         final_conv: bool = False,
         positional_grid_size: int = 32,
         use_conv_unfold: bool = False,
-        detach_coarse_patches: bool = False,
         model,
     ):
         super().__init__()
         self.use_conv_unfold = use_conv_unfold
-        self.detach_coarse_patches = bool(detach_coarse_patches)
         self.kernel_size = int(kernel_size)
         self.value_patch_size = self.kernel_size if value_patch_size is None else int(value_patch_size)
         self.nheads = int(nheads)
@@ -498,7 +496,7 @@ class PatchInpainting(nn.Module):
 
         token_inputs = []
         if self.match_coarse_rgb:
-            token_inputs.append(patch_map.detach() if self.detach_coarse_patches else patch_map)
+            token_inputs.append(patch_map.detach())
         if self.concat_features:
             coarse_features = F.interpolate(
                 features[self.feature_i],

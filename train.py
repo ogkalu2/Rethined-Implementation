@@ -629,11 +629,7 @@ def train(cfg, args):
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
                 set_discriminator_requires_grad(discriminator, False)
                 fake_logits_g = discriminator(refined_vis)
-                query_mask_flat = model.generator.flatten_query_mask(mask)
-                g_loss, g_metrics = criterion.generator_loss(
-                    coarse_raw, refined_raw, image, mask, fake_logits_g,
-                    attn_map=attn_map, query_mask_flat=query_mask_flat,
-                )
+                g_loss, g_metrics = criterion.generator_loss(coarse_raw, refined_raw, image, mask, fake_logits_g)
                 set_discriminator_requires_grad(discriminator, True)
 
             if not torch.isfinite(g_loss):
@@ -689,8 +685,6 @@ def train(cfg, args):
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
-            if "attention_entropy" in metrics:
-                writer.add_scalar("loss/attention_entropy", metrics["attention_entropy"], step)
             writer.add_scalar("loss/adversarial_d_real", metrics["adversarial_d_real"], step)
             writer.add_scalar("loss/adversarial_d_fake", metrics["adversarial_d_fake"], step)
             writer.add_scalar("loss/generator_total", metrics["generator_total"], step)

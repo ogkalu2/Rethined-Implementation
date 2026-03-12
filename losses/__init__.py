@@ -98,28 +98,6 @@ class FocalFrequencyLoss(nn.Module):
         return (weight * distance).mean()
 
 
-def attention_entropy_loss(
-    attn_map: torch.Tensor,
-    query_mask_flat: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    """Penalize high entropy in attention for masked queries.
-
-    Encourages peaked/sparse attention so that each masked patch copies from a
-    small number of source patches rather than blending thousands of them into
-    a featureless average.
-    """
-    probs = attn_map
-    if probs.dim() == 4:
-        probs = probs.mean(dim=1)
-    masked = query_mask_flat > 0.5
-    if not masked.any():
-        return attn_map.new_zeros(())
-    masked_probs = probs[masked]
-    entropy = -(masked_probs.clamp_min(eps) * masked_probs.clamp_min(eps).log()).sum(dim=-1)
-    return entropy.mean()
-
-
 class InpaintingLoss(nn.Module):
     """Paper-aligned generator and discriminator losses."""
 
@@ -136,7 +114,6 @@ class InpaintingLoss(nn.Module):
         adversarial_mode: str = "hinge",
         focal_alpha: float = 1.0,
         focal_log_matrix: bool = False,
-        attention_entropy_weight: float = 0.0,
     ):
         super().__init__()
         self.coarse_l2_weight = float(coarse_l2_weight)
@@ -147,7 +124,6 @@ class InpaintingLoss(nn.Module):
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
-        self.attention_entropy_weight = float(attention_entropy_weight)
         self.adversarial_mode = str(adversarial_mode).lower()
         if self.adversarial_mode not in {"bce", "hinge"}:
             raise ValueError(
@@ -165,8 +141,6 @@ class InpaintingLoss(nn.Module):
         target: torch.Tensor,
         mask: torch.Tensor,
         fake_logits: list[torch.Tensor] | None = None,
-        attn_map: torch.Tensor | None = None,
-        query_mask_flat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         coarse_composite = composite_with_known(coarse_raw, target, mask)
         coarse_blurred = self.coarse_blur(coarse_composite)
@@ -191,10 +165,6 @@ class InpaintingLoss(nn.Module):
                 ]
             adversarial = torch.stack(scale_losses).mean()
 
-        attn_entropy = refined.new_zeros(())
-        if self.attention_entropy_weight > 0 and attn_map is not None and query_mask_flat is not None:
-            attn_entropy = attention_entropy_loss(attn_map, query_mask_flat)
-
         total = (
             self.coarse_l2_weight * coarse_l2
             + self.coarse_blur_l1_weight * coarse_blur_l1
@@ -204,7 +174,6 @@ class InpaintingLoss(nn.Module):
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
-            + self.attention_entropy_weight * attn_entropy
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
@@ -215,7 +184,6 @@ class InpaintingLoss(nn.Module):
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),
-            "attention_entropy": attn_entropy.item(),
             "generator_total": total.item(),
         }
         return total, loss_dict

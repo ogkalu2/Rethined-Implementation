@@ -10,7 +10,6 @@ model:
     kernel_size: 8
     value_patch_size: 12
     attention_temperature: 0.5
-    attention_top_k: 4
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
@@ -23,7 +22,6 @@ model:
     concat_features: true
     final_conv: true
     attention_masking: true
-    detach_coarse_patches: false
 
 data:
   root_dir: "."
@@ -64,7 +62,6 @@ loss:
   adversarial_mode: "hinge"
   focal_alpha: 1.0
   focal_log_matrix: false
-  attention_entropy_weight: 0.1
 
 discriminator:
   in_channels: 3
