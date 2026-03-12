@@ -34,11 +34,11 @@ data:
   force_random_masks_eval: true
 
 training:
-  total_steps: 220000
+  total_steps: 178218
   grad_accum_steps: 4
   lr: 0.001
   discriminator_lr: 0.00005
-  warmup_steps: 3666
+  warmup_steps: 3000
   min_lr: 0.000001
   discriminator_min_lr: 0.0000001
   grad_clip: 1.0
@@ -74,6 +74,6 @@ logging:
   save_best_metric: "masked_l1_hr_refined"
   save_best_mode: "min"
   save_final_checkpoint: true
-  checkpoint_steps: [55000, 110000, 220000]
+  checkpoint_steps: [50000, 100000, 178218]
   keep_last_checkpoints: 3
   print_train_metrics: false
