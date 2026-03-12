@@ -19,6 +19,8 @@ class MultiHeadAttention(nn.Module):
         d_qk: int,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
+        attention_selection: str = "softmax",
+        attention_gumbel_tau: float = 1.0,
     ):
         super().__init__()
         self.d_v = int(d_v)
@@ -31,37 +33,68 @@ class MultiHeadAttention(nn.Module):
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
         if self.attention_top_k is not None and self.attention_top_k <= 0:
             self.attention_top_k = None
+        self.attention_selection = str(attention_selection).lower()
+        if self.attention_selection not in {"softmax", "gumbel", "argmax"}:
+            raise ValueError(
+                "attention_selection must be one of {'softmax', 'gumbel', 'argmax'}."
+            )
+        self.attention_gumbel_tau = float(attention_gumbel_tau)
+        if self.attention_gumbel_tau <= 0:
+            raise ValueError("attention_gumbel_tau must be positive.")
         self.w_qs = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_ks = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(self.d_v, self.n_head * self.d_v, bias=False)
         self.fc = nn.Linear(self.n_head * self.d_v, self.d_v, bias=False)
 
-    def _sparsify_attention(
+    def _build_masked_query_selector(
         self,
-        attn: torch.Tensor,
+        attn_logits: torch.Tensor,
         query_mask_flat: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.attention_top_k is None or self.attention_top_k >= attn.shape[-1]:
-            return attn
-
-        top_k = min(self.attention_top_k, attn.shape[-1])
-        topk_values, topk_indices = torch.topk(attn, k=top_k, dim=-1)
-        sparse_attn = torch.zeros_like(attn)
-        sparse_attn.scatter_(-1, topk_indices, topk_values)
-
         if query_mask_flat is None:
-            masked_queries = torch.ones(
-                (attn.shape[0], 1, attn.shape[2], 1),
+            return torch.ones(
+                (attn_logits.shape[0], 1, attn_logits.shape[2], 1),
                 dtype=torch.bool,
-                device=attn.device,
+                device=attn_logits.device,
             )
-        else:
-            masked_queries = (query_mask_flat > 0.5).unsqueeze(1).unsqueeze(-1)
+        return (query_mask_flat > 0.5).unsqueeze(1).unsqueeze(-1)
 
-        sparse_attn = torch.where(masked_queries, sparse_attn, attn)
-        renorm = sparse_attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
-        sparse_attn = torch.where(masked_queries, sparse_attn / renorm, sparse_attn)
-        return sparse_attn
+    def _restrict_attention_logits(
+        self,
+        attn_logits: torch.Tensor,
+        query_mask_flat: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.attention_top_k is None or self.attention_top_k >= attn_logits.shape[-1]:
+            return attn_logits
+
+        top_k = min(self.attention_top_k, attn_logits.shape[-1])
+        _, topk_indices = torch.topk(attn_logits, k=top_k, dim=-1)
+        keep_mask = torch.zeros_like(attn_logits, dtype=torch.bool)
+        keep_mask.scatter_(-1, topk_indices, True)
+
+        masked_queries = self._build_masked_query_selector(attn_logits, query_mask_flat)
+        keep_mask = torch.where(masked_queries, keep_mask, torch.ones_like(keep_mask))
+        return attn_logits.masked_fill(~keep_mask, torch.finfo(attn_logits.dtype).min)
+
+    def _hard_attention_from_logits(self, attn_logits: torch.Tensor) -> torch.Tensor:
+        attn = torch.zeros_like(attn_logits)
+        top_indices = attn_logits.argmax(dim=-1, keepdim=True)
+        attn.scatter_(-1, top_indices, 1.0)
+        return attn
+
+    def _normalize_attention_logits(self, attn_logits: torch.Tensor) -> torch.Tensor:
+        if self.attention_selection == "softmax":
+            return F.softmax(attn_logits, dim=-1)
+        if self.attention_selection == "gumbel":
+            if self.training:
+                return F.gumbel_softmax(
+                    attn_logits,
+                    tau=self.attention_gumbel_tau,
+                    hard=True,
+                    dim=-1,
+                )
+            return self._hard_attention_from_logits(attn_logits)
+        return self._hard_attention_from_logits(attn_logits)
 
     def forward(
         self,
@@ -84,15 +117,15 @@ class MultiHeadAttention(nn.Module):
         else:
             v_proj = self.w_vs(v).view(batch_size, len_v, self.n_head, self.d_v).transpose(1, 2)
 
-        attn = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3))
+        attn = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3)).float()
         if self.attention_temperature != 1.0:
             attn = attn / self.attention_temperature
-        
-        if post_softmax_mask is not None:
-            attn = attn.masked_fill(post_softmax_mask == 0, float('-inf'))
 
-        attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
-        attn = self._sparsify_attention(attn, query_mask_flat)
+        if post_softmax_mask is not None:
+            attn = attn.masked_fill(post_softmax_mask == 0, torch.finfo(attn.dtype).min)
+
+        attn = self._restrict_attention_logits(attn, query_mask_flat)
+        attn = self._normalize_attention_logits(attn).to(v.dtype)
         # Direct patch mixing behaves like weighted image reconstruction, so dropping
         # sparse attention weights introduces random dark artifacts instead of useful regularization.
         if not direct_patch_mixing:
@@ -113,6 +146,8 @@ class PatchInpainting(nn.Module):
         value_patch_size: int | None = None,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
+        attention_selection: str = "softmax",
+        attention_gumbel_tau: float = 1.0,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         nheads: int,
@@ -197,6 +232,8 @@ class PatchInpainting(nn.Module):
             d_qk=int(embed_dim),
             attention_temperature=float(attention_temperature),
             attention_top_k=attention_top_k,
+            attention_selection=attention_selection,
+            attention_gumbel_tau=float(attention_gumbel_tau),
         )
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
