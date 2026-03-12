@@ -9,7 +9,6 @@ model:
   generator:
     kernel_size: 8
     value_patch_size: 12
-    detail_residual_weight: 0.5
     attention_temperature: 0.5
     nheads: 1
     stem_out_stride: 1

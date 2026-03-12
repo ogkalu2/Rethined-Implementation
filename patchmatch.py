@@ -111,7 +111,6 @@ class PatchInpainting(nn.Module):
         *,
         kernel_size: int,
         value_patch_size: int | None = None,
-        detail_residual_weight: float = 1.0,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
         matching_descriptor_dim: int | None = None,
@@ -136,7 +135,6 @@ class PatchInpainting(nn.Module):
         self.use_conv_unfold = use_conv_unfold
         self.kernel_size = int(kernel_size)
         self.value_patch_size = self.kernel_size if value_patch_size is None else int(value_patch_size)
-        self.detail_residual_weight = float(detail_residual_weight)
         self.nheads = int(nheads)
         self.stem_out_stride = int(stem_out_stride)
         self.stem_out_channels = int(stem_out_channels)
@@ -386,7 +384,6 @@ class PatchInpainting(nn.Module):
             if query_indices.numel() == 0:
                 continue
 
-            mixed[batch_idx, query_indices] = 0
             key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
             replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
             if key_indices.numel() > 0:
@@ -480,12 +477,10 @@ class PatchInpainting(nn.Module):
 
     def forward(self, image: torch.Tensor, mask: torch.Tensor):
         coarse_raw, features = self.encoder_decoder(image)
-        coarse_base = coarse_raw * mask + image * (1 - mask)
-        source_detail = image - self.final_gaussian_blur(image)
 
         patch_map, output_size = self.unfold_native(coarse_raw, self.kernel_size)
-        detail_patch_map, _ = self.extract_patches(
-            source_detail,
+        source_patch_map, _ = self.extract_patches(
+            image,
             self.value_patch_size,
             stride=self.kernel_size,
             padding=self.value_patch_padding,
@@ -521,7 +516,8 @@ class PatchInpainting(nn.Module):
             input_tokens = input_tokens + positional_encoding
         input_tokens = self.pre_attention_norm(input_tokens)
 
-        patch_values = detail_patch_map.flatten(start_dim=2).transpose(1, 2)
+        # The paper mixes source LR patches with attention learned from coarse tokens.
+        patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.attention_masking:
             mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
                 input_tokens,
@@ -538,7 +534,7 @@ class PatchInpainting(nn.Module):
                 query_mask_flat=query_mask_flat,
             )
 
-        retrieved_detail = self.fold_native(
+        refined = self.fold_native(
             mixed_patches_flat,
             output_size,
             kernel_size=self.value_patch_size,
@@ -546,7 +542,6 @@ class PatchInpainting(nn.Module):
             padding=self.value_patch_padding,
             use_window=self.value_patch_padding > 0,
         )
-        refined = coarse_base + self.detail_residual_weight * retrieved_detail
 
         if self.coherence_layer is not None:
             refined = refined + self.coherence_layer(refined)
