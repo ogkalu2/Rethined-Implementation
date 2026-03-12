@@ -17,16 +17,51 @@ class MultiHeadAttention(nn.Module):
         n_head: int,
         dropout: float,
         d_qk: int,
+        attention_temperature: float = 1.0,
+        attention_top_k: int | None = None,
     ):
         super().__init__()
         self.d_v = int(d_v)
         self.n_head = int(n_head)
         self.d_k = int(d_qk)
         self.dropout = nn.Dropout(float(dropout))
+        self.attention_temperature = float(attention_temperature)
+        if self.attention_temperature <= 0:
+            raise ValueError("attention_temperature must be positive.")
+        self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
+        if self.attention_top_k is not None and self.attention_top_k <= 0:
+            self.attention_top_k = None
         self.w_qs = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_ks = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(self.d_v, self.n_head * self.d_v, bias=False)
         self.fc = nn.Linear(self.n_head * self.d_v, self.d_v, bias=False)
+
+    def _sparsify_attention(
+        self,
+        attn: torch.Tensor,
+        query_mask_flat: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.attention_top_k is None or self.attention_top_k >= attn.shape[-1]:
+            return attn
+
+        top_k = min(self.attention_top_k, attn.shape[-1])
+        topk_values, topk_indices = torch.topk(attn, k=top_k, dim=-1)
+        sparse_attn = torch.zeros_like(attn)
+        sparse_attn.scatter_(-1, topk_indices, topk_values)
+
+        if query_mask_flat is None:
+            masked_queries = torch.ones(
+                (attn.shape[0], 1, attn.shape[2], 1),
+                dtype=torch.bool,
+                device=attn.device,
+            )
+        else:
+            masked_queries = (query_mask_flat > 0.5).unsqueeze(1).unsqueeze(-1)
+
+        sparse_attn = torch.where(masked_queries, sparse_attn, attn)
+        renorm = sparse_attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        sparse_attn = torch.where(masked_queries, sparse_attn / renorm, sparse_attn)
+        return sparse_attn
 
     def forward(
         self,
@@ -36,6 +71,7 @@ class MultiHeadAttention(nn.Module):
         *,
         post_softmax_mask: torch.Tensor | None = None,
         direct_patch_mixing: bool = False,
+        query_mask_flat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
         q_proj = self.w_qs(q).view(batch_size, len_q, self.n_head, self.d_k).transpose(1, 2)
@@ -49,13 +85,14 @@ class MultiHeadAttention(nn.Module):
             v_proj = self.w_vs(v).view(batch_size, len_v, self.n_head, self.d_v).transpose(1, 2)
 
         attn = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3))
+        if self.attention_temperature != 1.0:
+            attn = attn / self.attention_temperature
         
         if post_softmax_mask is not None:
-            # Mask out disallowed connections with -inf BEFORE softmax.
-            # (post_softmax_mask contains 1 for allowed, 0 for disallowed)
             attn = attn.masked_fill(post_softmax_mask == 0, float('-inf'))
 
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
+        attn = self._sparsify_attention(attn, query_mask_flat)
         attn = self.dropout(attn)
 
         mixed = torch.matmul(attn, v_proj)
@@ -71,6 +108,8 @@ class PatchInpainting(nn.Module):
         *,
         kernel_size: int,
         value_patch_size: int | None = None,
+        attention_temperature: float = 1.0,
+        attention_top_k: int | None = None,
         nheads: int,
         stem_out_stride: int = 1,
         stem_out_channels: int = 3,
@@ -120,6 +159,8 @@ class PatchInpainting(nn.Module):
             n_head=self.nheads,
             dropout=float(dropout),
             d_qk=int(embed_dim),
+            attention_temperature=float(attention_temperature),
+            attention_top_k=attention_top_k,
         )
         self.positionalencoding = (
             nn.Parameter(
@@ -301,6 +342,45 @@ class PatchInpainting(nn.Module):
         allowed = (1.0 - is_masked_q) * eye + is_masked_q * is_valid_k
         return allowed.unsqueeze(1)
 
+    def flatten_query_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        query_mask_patch_map, _ = self.unfold_native(mask, self.kernel_size)
+        return (query_mask_patch_map.amax(dim=1) > 0).to(dtype=mask.dtype).flatten(start_dim=1)
+
+    def summarize_attention(
+        self,
+        attn_map: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+    ) -> dict[str, float]:
+        probs = attn_map.detach()
+        if probs.dim() == 4:
+            probs = probs.mean(dim=1)
+        if probs.dim() != 3:
+            raise ValueError(f"Expected attention map with 3 or 4 dims, got {tuple(attn_map.shape)}")
+
+        masked_queries = query_mask_flat > 0.5
+        masked_query_ratio = masked_queries.float().mean().item()
+        if not masked_queries.any():
+            return {
+                "attention_top1": 1.0,
+                "attention_top4": 1.0,
+                "attention_entropy": 0.0,
+                "attention_masked_ratio": masked_query_ratio,
+            }
+
+        masked_probs = probs[masked_queries]
+        top1 = masked_probs.max(dim=-1).values.mean().item()
+        top4_k = min(4, masked_probs.shape[-1])
+        top4 = masked_probs.topk(k=top4_k, dim=-1).values.sum(dim=-1).mean().item()
+        entropy = (
+            -(masked_probs.clamp_min(1e-8) * masked_probs.clamp_min(1e-8).log()).sum(dim=-1).mean().item()
+        )
+        return {
+            "attention_top1": top1,
+            "attention_top4": top4,
+            "attention_entropy": entropy,
+            "attention_masked_ratio": masked_query_ratio,
+        }
+
     def get_positional_encoding(self) -> torch.Tensor | None:
         if self.positionalencoding is None:
             return None
@@ -328,14 +408,13 @@ class PatchInpainting(nn.Module):
             stride=self.kernel_size,
             padding=self.value_patch_padding,
         )
-        query_mask_patch_map, _ = self.unfold_native(mask, self.kernel_size)
+        query_mask_flat = self.flatten_query_mask(mask)
         key_mask_patch_map, _ = self.extract_patches(
             mask,
             self.value_patch_size,
             stride=self.kernel_size,
             padding=self.value_patch_padding,
         )
-        query_mask_flat = (query_mask_patch_map.amax(dim=1) > 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
 
         token_map = patch_map
@@ -364,6 +443,7 @@ class PatchInpainting(nn.Module):
             patch_values,
             post_softmax_mask=attention_mask,
             direct_patch_mixing=True,
+            query_mask_flat=query_mask_flat,
         )
 
         refined = self.fold_native(

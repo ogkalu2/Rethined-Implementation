@@ -260,6 +260,7 @@ def format_train_metric_snapshot(metrics):
         f"train g={metrics['generator_total']:.4f}, "
         f"d={metrics['discriminator_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
+        f"a1={metrics['attention_top1']:.3f}, "
         f"ff={metrics['frequency']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
@@ -599,6 +600,10 @@ def train(cfg, args):
             "adversarial_d_real": 0.0,
             "adversarial_d_fake": 0.0,
             "discriminator_total": 0.0,
+            "attention_top1": 0.0,
+            "attention_top4": 0.0,
+            "attention_entropy": 0.0,
+            "attention_masked_ratio": 0.0,
         }
         step_has_nonfinite = False
 
@@ -620,7 +625,7 @@ def train(cfg, args):
             masked_image = batch_views["masked_image"]
 
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
-                refined, _, coarse_raw = model(masked_image, mask)
+                refined, attn_map, coarse_raw = model(masked_image, mask)
                 refined = refined.clamp(0, 1)
                 coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
 
@@ -647,9 +652,16 @@ def train(cfg, args):
 
             scaler.scale(g_loss / grad_accum).backward()
 
+            attn_metrics = model.generator.summarize_attention(
+                attn_map.detach(),
+                model.generator.flatten_query_mask(mask).detach(),
+            )
+
             for key, value in g_metrics.items():
                 metric_sums[key] += value
             for key, value in d_metrics.items():
+                metric_sums[key] += value
+            for key, value in attn_metrics.items():
                 metric_sums[key] += value
 
             last_batch_views = batch_views
@@ -689,6 +701,10 @@ def train(cfg, args):
             writer.add_scalar("loss/discriminator_total", metrics["discriminator_total"], step)
             writer.add_scalar("loss/running_generator", running_g, step)
             writer.add_scalar("loss/running_discriminator", running_d, step)
+            writer.add_scalar("attention/top1", metrics["attention_top1"], step)
+            writer.add_scalar("attention/top4", metrics["attention_top4"], step)
+            writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
+            writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
             writer.add_scalar("lr/generator", lr_g, step)
             writer.add_scalar("lr/discriminator", lr_d, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
@@ -701,6 +717,7 @@ def train(cfg, args):
                     g=f"{metrics['generator_total']:.4f}",
                     d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
+                    a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     perc=f"{metrics['perceptual']:.4f}",
                     refresh=False,
