@@ -611,13 +611,13 @@ def train(cfg, args):
             masked_image = batch_views["masked_image"]
 
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
-                refined, attn_map, coarse_raw = model(masked_image, mask)
-                refined = refined.clamp(0, 1)
+                refined_raw, attn_map, coarse_raw = model(masked_image, mask)
+                refined_vis = refined_raw.clamp(0, 1)
                 coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
 
                 set_discriminator_requires_grad(discriminator, True)
                 real_logits = discriminator(image)
-                fake_logits_d = discriminator(refined.detach())
+                fake_logits_d = discriminator(refined_vis.detach())
                 d_loss, d_metrics = criterion.discriminator_loss(real_logits, fake_logits_d)
 
             if not torch.isfinite(d_loss):
@@ -628,8 +628,8 @@ def train(cfg, args):
 
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
                 set_discriminator_requires_grad(discriminator, False)
-                fake_logits_g = discriminator(refined)
-                g_loss, g_metrics = criterion.generator_loss(coarse_raw, refined, image, mask, fake_logits_g)
+                fake_logits_g = discriminator(refined_vis)
+                g_loss, g_metrics = criterion.generator_loss(coarse_raw, refined_raw, image, mask, fake_logits_g)
                 set_discriminator_requires_grad(discriminator, True)
 
             if not torch.isfinite(g_loss):
