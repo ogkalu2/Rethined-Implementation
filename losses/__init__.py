@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from blocks import NativeGaussianBlur2d
 from losses.perceptual import PerceptualLoss
 
 
@@ -43,6 +44,38 @@ def masked_mse_loss(
     return (diff.sum(dim=(1, 2, 3)) / denom).mean()
 
 
+def dilate_mask(mask: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
+    if kernel_size <= 1:
+        return mask
+    return F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+
+def masked_gradient_l1_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    mask = _expanded_mask(mask.to(dtype=pred.dtype), pred)
+
+    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
+    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
+    mask_dx = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+
+    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
+    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
+    mask_dy = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+
+    dx_loss = (pred_dx - target_dx).abs() * mask_dx
+    dy_loss = (pred_dy - target_dy).abs() * mask_dy
+
+    dx_denom = mask_dx.sum(dim=(1, 2, 3)).clamp_min(eps)
+    dy_denom = mask_dy.sum(dim=(1, 2, 3)).clamp_min(eps)
+    dx_mean = dx_loss.sum(dim=(1, 2, 3)) / dx_denom
+    dy_mean = dy_loss.sum(dim=(1, 2, 3)) / dy_denom
+    return 0.5 * (dx_mean.mean() + dy_mean.mean())
+
+
 class FocalFrequencyLoss(nn.Module):
     """Compact Focal Frequency Loss implementation for image restoration."""
 
@@ -71,6 +104,8 @@ class InpaintingLoss(nn.Module):
     def __init__(
         self,
         coarse_l2_weight: float = 1.0,
+        coarse_blur_l1_weight: float = 0.0,
+        coarse_gradient_weight: float = 0.0,
         coarse_perceptual_weight: float = 0.05,
         refined_l1_weight: float = 1.0,
         frequency_weight: float = 1.0,
@@ -82,6 +117,8 @@ class InpaintingLoss(nn.Module):
     ):
         super().__init__()
         self.coarse_l2_weight = float(coarse_l2_weight)
+        self.coarse_blur_l1_weight = float(coarse_blur_l1_weight)
+        self.coarse_gradient_weight = float(coarse_gradient_weight)
         self.coarse_perceptual_weight = float(coarse_perceptual_weight)
         self.refined_l1_weight = float(refined_l1_weight)
         self.frequency_weight = float(frequency_weight)
@@ -95,6 +132,7 @@ class InpaintingLoss(nn.Module):
 
         self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
+        self.coarse_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
 
     def generator_loss(
         self,
@@ -105,7 +143,12 @@ class InpaintingLoss(nn.Module):
         fake_logits: list[torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         coarse_composite = composite_with_known(coarse_raw, target, mask)
+        coarse_blurred = self.coarse_blur(coarse_composite)
+        target_blurred = self.coarse_blur(target)
+        coarse_grad_mask = dilate_mask(mask)
         coarse_l2 = masked_mse_loss(coarse_raw, target, mask)
+        coarse_blur_l1 = masked_l1_loss(coarse_blurred, target_blurred, mask)
+        coarse_gradient = masked_gradient_l1_loss(coarse_blurred, target_blurred, coarse_grad_mask)
         coarse_perceptual = self.perceptual_loss(coarse_composite, target)
         refined_l1 = masked_l1_loss(refined, target, mask)
         frequency = self.frequency_loss(refined, target)
@@ -124,6 +167,8 @@ class InpaintingLoss(nn.Module):
 
         total = (
             self.coarse_l2_weight * coarse_l2
+            + self.coarse_blur_l1_weight * coarse_blur_l1
+            + self.coarse_gradient_weight * coarse_gradient
             + self.coarse_perceptual_weight * coarse_perceptual
             + self.refined_l1_weight * refined_l1
             + self.frequency_weight * frequency
@@ -132,6 +177,8 @@ class InpaintingLoss(nn.Module):
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
+            "coarse_blur_l1": coarse_blur_l1.item(),
+            "coarse_gradient": coarse_gradient.item(),
             "coarse_perceptual": coarse_perceptual.item(),
             "refined_l1": refined_l1.item(),
             "frequency": frequency.item(),
