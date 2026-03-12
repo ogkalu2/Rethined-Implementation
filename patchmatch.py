@@ -113,6 +113,8 @@ class PatchInpainting(nn.Module):
         value_patch_size: int | None = None,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
+        matching_descriptor_dim: int | None = None,
+        match_coarse_rgb: bool = True,
         nheads: int,
         stem_out_stride: int = 1,
         stem_out_channels: int = 3,
@@ -139,6 +141,10 @@ class PatchInpainting(nn.Module):
         self.use_positional_encoding = bool(use_positional_encoding)
         self.feature_i = int(feature_i)
         self.feature_dim = int(feature_dim)
+        self.matching_descriptor_dim = (
+            None if matching_descriptor_dim is None else int(matching_descriptor_dim)
+        )
+        self.match_coarse_rgb = bool(match_coarse_rgb)
         self.concat_features = bool(concat_features)
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
@@ -151,11 +157,38 @@ class PatchInpainting(nn.Module):
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
-        self.patch_token_dim = self.query_patch_dim + (self.feature_dim if self.concat_features else 0)
+        self.matching_input_dim = 0
+        if self.match_coarse_rgb:
+            self.matching_input_dim += self.query_patch_dim
+        if self.concat_features:
+            self.matching_input_dim += self.feature_dim
+        if self.matching_input_dim == 0:
+            raise ValueError("Matching must use coarse RGB patches, coarse features, or both.")
+        self.patch_token_dim = (
+            self.matching_input_dim
+            if self.matching_descriptor_dim is None
+            else self.matching_descriptor_dim
+        )
         self.positional_grid_size = max(1, min(int(positional_grid_size), self.token_grid_size))
 
         self.encoder_decoder = model
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
+        self.matching_descriptor_head = None
+        if self.matching_descriptor_dim is not None:
+            hidden_dim = max(self.matching_input_dim, self.matching_descriptor_dim)
+            self.matching_descriptor_head = nn.Sequential(
+                nn.Conv2d(
+                    self.matching_input_dim,
+                    hidden_dim,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    padding_mode="reflect",
+                    bias=False,
+                ),
+                nn.GELU(),
+                nn.Conv2d(hidden_dim, self.matching_descriptor_dim, kernel_size=1, stride=1, bias=False),
+            )
         self.multihead_attention = MultiHeadAttention(
             embed_dim=self.patch_token_dim,
             d_v=self.value_patch_dim,
@@ -421,7 +454,9 @@ class PatchInpainting(nn.Module):
         )
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
 
-        token_map = patch_map
+        token_inputs = []
+        if self.match_coarse_rgb:
+            token_inputs.append(patch_map.detach())
         if self.concat_features:
             coarse_features = F.interpolate(
                 features[self.feature_i],
@@ -429,7 +464,11 @@ class PatchInpainting(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
-            token_map = torch.cat([token_map, coarse_features], dim=1)
+            token_inputs.append(coarse_features)
+
+        token_map = token_inputs[0] if len(token_inputs) == 1 else torch.cat(token_inputs, dim=1)
+        if self.matching_descriptor_head is not None:
+            token_map = self.matching_descriptor_head(token_map)
 
         input_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
         positional_encoding = self.get_positional_encoding()

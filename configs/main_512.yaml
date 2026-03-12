@@ -10,6 +10,8 @@ model:
     value_patch_size: 12
     attention_temperature: 0.5
     attention_top_k: 8
+    matching_descriptor_dim: 256
+    match_coarse_rgb: false
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
