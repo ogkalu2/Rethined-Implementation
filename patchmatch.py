@@ -162,6 +162,7 @@ class PatchInpainting(nn.Module):
             attention_temperature=float(attention_temperature),
             attention_top_k=attention_top_k,
         )
+        self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
             nn.Parameter(
                 torch.zeros(
@@ -431,6 +432,7 @@ class PatchInpainting(nn.Module):
         positional_encoding = self.get_positional_encoding()
         if positional_encoding is not None:
             input_tokens = input_tokens + positional_encoding
+        input_tokens = self.pre_attention_norm(input_tokens)
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
