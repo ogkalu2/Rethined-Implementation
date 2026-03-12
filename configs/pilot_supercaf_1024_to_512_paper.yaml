@@ -26,17 +26,17 @@ data:
   manifest_path: "dataset/manifests/supercaf_manifest.csv"
   val_dir: null
   image_size: 1024
-  batch_size: 4
+  batch_size: 16
   eval_batch_size: 2
   num_workers: 2
   mask_min_coverage: 0.10
   mask_max_coverage: 0.40
   force_random_masks_train: true
-  force_random_masks_eval: false
+  force_random_masks_eval: true
 
 training:
   total_steps: 3000
-  grad_accum_steps: 4
+  grad_accum_steps: 1
   lr: 0.001
   discriminator_lr: 0.00005
   warmup_steps: 200
@@ -52,10 +52,10 @@ loss:
   coarse_l2_weight: 1.0
   coarse_perceptual_weight: 0.1
   frequency_weight: 0.5
-  perceptual_weight: 0.1
+  perceptual_weight: 0.15
   adversarial_weight: 0.01
-  focal_alpha: 0.5
-  focal_log_matrix: true
+  focal_alpha: 1.0
+  focal_log_matrix: false
 
 discriminator:
   in_channels: 3
