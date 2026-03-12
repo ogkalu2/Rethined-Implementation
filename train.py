@@ -380,6 +380,35 @@ def write_status(log_dir, step, total_steps, metrics, lr):
         json.dump(status, handle, indent=2)
 
 
+def write_validation_history(log_dir, step, metrics):
+    history_path = Path(log_dir) / "validation_history.json"
+    entry = {
+        "step": step,
+        "metrics": metrics,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    history = []
+    if history_path.exists():
+        with open(history_path, "r", encoding="utf-8") as handle:
+            history = json.load(handle)
+        if not isinstance(history, list):
+            raise ValueError(f"Expected validation history list in {history_path}")
+
+    replaced = False
+    for idx, existing in enumerate(history):
+        if isinstance(existing, dict) and existing.get("step") == step:
+            history[idx] = entry
+            replaced = True
+            break
+    if not replaced:
+        history.append(entry)
+
+    history.sort(key=lambda item: item.get("step", 0))
+    with open(history_path, "w", encoding="utf-8") as handle:
+        json.dump(history, handle, indent=2)
+
+
 def build_train_loader(cfg, args):
     max_images = args.overfit if args.overfit else None
     num_workers = 0 if args.overfit else cfg["data"]["num_workers"]
@@ -692,6 +721,7 @@ def train(cfg, args):
             writer.add_scalar("val/hr_masked_l1_refined", val_metrics["masked_l1_hr_refined"], step)
             if val_metrics["hr_gain_pct"] is not None:
                 writer.add_scalar("val/hr_gain_pct", val_metrics["hr_gain_pct"], step)
+            write_validation_history(log_cfg["log_dir"], step, val_metrics)
             progress_bar.write(
                 f"Validation step {step}: "
                 f"LR {val_metrics['masked_l1_lr_coarse']:.4f} -> {val_metrics['masked_l1_lr_refined']:.4f} "
