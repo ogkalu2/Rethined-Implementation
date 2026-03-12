@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import json
 import math
 import random
@@ -589,22 +590,7 @@ def train(cfg, args):
 
         optimizer_g.zero_grad(set_to_none=True)
         optimizer_d.zero_grad(set_to_none=True)
-        metric_sums = {
-            "coarse_l2": 0.0,
-            "coarse_perceptual": 0.0,
-            "refined_l1": 0.0,
-            "frequency": 0.0,
-            "perceptual": 0.0,
-            "adversarial_g": 0.0,
-            "generator_total": 0.0,
-            "adversarial_d_real": 0.0,
-            "adversarial_d_fake": 0.0,
-            "discriminator_total": 0.0,
-            "attention_top1": 0.0,
-            "attention_top4": 0.0,
-            "attention_entropy": 0.0,
-            "attention_masked_ratio": 0.0,
-        }
+        metric_sums = defaultdict(float)
         step_has_nonfinite = False
 
         for _ in range(grad_accum):
@@ -690,6 +676,10 @@ def train(cfg, args):
 
         if step == 1 or step % log_cfg["log_interval"] == 0:
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
+            if "coarse_blur_l1" in metrics:
+                writer.add_scalar("loss/coarse_blur_l1", metrics["coarse_blur_l1"], step)
+            if "coarse_gradient" in metrics:
+                writer.add_scalar("loss/coarse_gradient", metrics["coarse_gradient"], step)
             writer.add_scalar("loss/coarse_perceptual", metrics["coarse_perceptual"], step)
             writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
