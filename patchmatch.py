@@ -150,6 +150,8 @@ class PatchInpainting(nn.Module):
         attention_gumbel_tau: float = 1.0,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
+        detach_coarse_rgb: bool = False,
+        value_source: str = "rgb",
         nheads: int,
         stem_out_stride: int = 1,
         stem_out_channels: int = 3,
@@ -180,6 +182,10 @@ class PatchInpainting(nn.Module):
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
         self.match_coarse_rgb = bool(match_coarse_rgb)
+        self.detach_coarse_rgb = bool(detach_coarse_rgb)
+        self.value_source = str(value_source).lower()
+        if self.value_source not in {"rgb", "high_freq_residual"}:
+            raise ValueError("value_source must be either 'rgb' or 'high_freq_residual'.")
         self.concat_features = bool(concat_features)
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
@@ -408,9 +414,10 @@ class PatchInpainting(nn.Module):
         patch_values: torch.Tensor,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
+        default_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_patches, _ = input_tokens.shape
-        mixed = patch_values.clone()
+        mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
         eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
         dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
@@ -514,10 +521,16 @@ class PatchInpainting(nn.Module):
 
     def forward(self, image: torch.Tensor, mask: torch.Tensor):
         coarse_raw, features = self.encoder_decoder(image)
+        coarse_composite = coarse_raw * mask + image * (1 - mask)
 
         patch_map, output_size = self.unfold_native(coarse_raw, self.kernel_size)
+        value_image = image
+        default_patch_values = None
+        if self.value_source == "high_freq_residual":
+            value_image = image - self.final_gaussian_blur(image)
+
         source_patch_map, _ = self.extract_patches(
-            image,
+            value_image,
             self.value_patch_size,
             stride=self.kernel_size,
             padding=self.value_patch_padding,
@@ -533,7 +546,8 @@ class PatchInpainting(nn.Module):
 
         token_inputs = []
         if self.match_coarse_rgb:
-            token_inputs.append(patch_map.detach())
+            coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
+            token_inputs.append(coarse_match_map)
         if self.concat_features:
             coarse_features = F.interpolate(
                 features[self.feature_i],
@@ -555,12 +569,15 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
+        if self.value_source == "high_freq_residual":
+            default_patch_values = torch.zeros_like(patch_values)
         if self.attention_masking:
             mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
                 input_tokens,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
+                default_tokens=default_patch_values,
             )
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(
@@ -571,7 +588,7 @@ class PatchInpainting(nn.Module):
                 query_mask_flat=query_mask_flat,
             )
 
-        refined = self.fold_native(
+        mixed_image = self.fold_native(
             mixed_patches_flat,
             output_size,
             kernel_size=self.value_patch_size,
@@ -579,6 +596,10 @@ class PatchInpainting(nn.Module):
             padding=self.value_patch_padding,
             use_window=self.value_patch_padding > 0,
         )
+        if self.value_source == "high_freq_residual":
+            refined = coarse_composite + mixed_image
+        else:
+            refined = mixed_image
 
         if self.coherence_layer is not None:
             refined = refined + self.coherence_layer(refined)

@@ -9,6 +9,7 @@ model:
   generator:
     kernel_size: 8
     value_patch_size: 12
+    value_source: "high_freq_residual"
     attention_temperature: 0.5
     attention_top_k: 8
     attention_selection: "gumbel"
@@ -23,6 +24,7 @@ model:
     feature_i: 2
     feature_dim: null
     concat_features: true
+    detach_coarse_rgb: false
     final_conv: true
     attention_masking: true
 
