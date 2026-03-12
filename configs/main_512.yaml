@@ -1,7 +1,4 @@
-# Overfit probe for the current architecture at 512px native -> 1024px HR.
-# Uses small batches and frequent validation/visualization to judge whether the
-# model can memorize a tiny set with large masks before committing to a full run.
-
+# Main Training Run, 512x512 input
 model:
   coarse_model:
     class: "CoarseModel"
@@ -25,21 +22,23 @@ model:
 
 data:
   root_dir: "."
-  manifest_path: "dataset/manifests/supercaf_manifest.csv"
+  manifest_path: "dataset/manifests/main_dataset_manifest.csv"
   val_dir: null
   image_size: 1024
-  batch_size: 1
-  eval_batch_size: 1
+  batch_size: 4
+  eval_batch_size: 2
   num_workers: 2
-  mask_min_coverage: 0.30
-  mask_max_coverage: 0.50
+  mask_min_coverage: 0.10
+  mask_max_coverage: 0.35
+  force_random_masks_train: true
+  force_random_masks_eval: true
 
 training:
-  total_steps: 2000
-  grad_accum_steps: 1
+  total_steps: 220000
+  grad_accum_steps: 4
   lr: 0.001
   discriminator_lr: 0.00005
-  warmup_steps: 100
+  warmup_steps: 3666
   min_lr: 0.000001
   discriminator_min_lr: 0.0000001
   grad_clip: 1.0
@@ -50,7 +49,8 @@ training:
 
 loss:
   coarse_l2_weight: 1.0
-  frequency_weight: 1.0
+  coarse_perceptual_weight: 0.1
+  frequency_weight: 0.5
   perceptual_weight: 0.1
   adversarial_weight: 0.01
   focal_alpha: 1.0
@@ -61,15 +61,16 @@ discriminator:
   base_channels: 64
   n_layers: 3
   num_scales: 1 
-  
+
 logging:
-  log_dir: "logs/overfit_supercaf_1024_from_512"
-  log_interval: 10
-  vis_interval: 100
-  eval_interval: 100
-  eval_batches: 0
-  save_interval: 250
+  log_dir: "logs/train_supercaf_1024_to_512_paper"
+  log_interval: 50
+  vis_interval: 1000
+  eval_interval: 1000
+  eval_batches: 16
+  save_interval: 5000
   save_checkpoints: true
   save_final_checkpoint: true
-  checkpoint_steps: [250, 500, 1000, 2000]
-  keep_last_checkpoints: 4
+  checkpoint_steps: [55000, 110000, 220000]
+  keep_last_checkpoints: 3
+  print_train_metrics: false
