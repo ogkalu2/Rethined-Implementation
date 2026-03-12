@@ -651,7 +651,7 @@ def train(cfg, args):
 
             last_batch_views = batch_views
             last_coarse = coarse_vis.detach()
-            last_refined = refined.detach()
+            last_refined = refined_vis.detach()
 
         if step_has_nonfinite:
             optimizer_g.zero_grad(set_to_none=True)
