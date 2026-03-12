@@ -70,6 +70,7 @@ class PatchInpainting(nn.Module):
         self,
         *,
         kernel_size: int,
+        value_patch_size: int | None = None,
         nheads: int,
         stem_out_stride: int = 1,
         stem_out_channels: int = 3,
@@ -89,6 +90,7 @@ class PatchInpainting(nn.Module):
         super().__init__()
         self.use_conv_unfold = use_conv_unfold
         self.kernel_size = int(kernel_size)
+        self.value_patch_size = self.kernel_size if value_patch_size is None else int(value_patch_size)
         self.nheads = int(nheads)
         self.stem_out_stride = int(stem_out_stride)
         self.stem_out_channels = int(stem_out_channels)
@@ -99,16 +101,22 @@ class PatchInpainting(nn.Module):
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
         self.image_size = int(image_size)
+        if self.value_patch_size < self.kernel_size:
+            raise ValueError("value_patch_size must be greater than or equal to kernel_size.")
+        if (self.value_patch_size - self.kernel_size) % 2 != 0:
+            raise ValueError("value_patch_size - kernel_size must be even for centered overlap-add padding.")
+        self.value_patch_padding = (self.value_patch_size - self.kernel_size) // 2
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
-        self.patch_value_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
-        self.patch_token_dim = self.patch_value_dim + (self.feature_dim if self.concat_features else 0)
+        self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
+        self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
+        self.patch_token_dim = self.query_patch_dim + (self.feature_dim if self.concat_features else 0)
         self.positional_grid_size = max(1, min(int(positional_grid_size), self.token_grid_size))
 
         self.encoder_decoder = model
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.multihead_attention = MultiHeadAttention(
             embed_dim=self.patch_token_dim,
-            d_v=self.patch_value_dim,
+            d_v=self.value_patch_dim,
             n_head=self.nheads,
             dropout=float(dropout),
             d_qk=int(embed_dim),
@@ -127,8 +135,8 @@ class PatchInpainting(nn.Module):
         )
         self.coherence_layer = (
             nn.Conv2d(
-                3, # Changed from self.patch_value_dim to 3 (RGB channels)
-                3, # Changed from self.patch_value_dim to 3 (RGB channels)
+                3,
+                3,
                 kernel_size=3,
                 stride=1,
                 padding=1,
@@ -184,22 +192,47 @@ class PatchInpainting(nn.Module):
         return weights.to(device=device, dtype=dtype)
 
     def unfold_native(self, feature_map: torch.Tensor, kernel_size: int) -> tuple[torch.Tensor, tuple[int, int]]:
-        batch_size, channels, height, width = feature_map.shape
-        n_h = height // kernel_size
-        n_w = width // kernel_size
+        return self.extract_patches(feature_map, kernel_size, stride=kernel_size, padding=0)
 
-        if self.use_conv_unfold:
-            # THE Mobile Export Path (Uses NPU-friendly Conv2D)
-            weights = self._get_unfolding_weights(
-                kernel_size, channels, dtype=feature_map.dtype, device=feature_map.device
+    def extract_patches(
+        self,
+        feature_map: torch.Tensor,
+        patch_size: int,
+        *,
+        stride: int,
+        padding: int = 0,
+        pad_mode: str = "reflect",
+    ) -> tuple[torch.Tensor, tuple[int, int]]:
+        batch_size, channels, height, width = feature_map.shape
+        patch_size = int(patch_size)
+        stride = int(stride)
+        padding = int(padding)
+        if height % stride != 0 or width % stride != 0:
+            raise ValueError(
+                f"Input size {(height, width)} must be divisible by stride {stride} for patch extraction."
             )
-            patches = F.conv2d(feature_map, weights, stride=kernel_size, groups=channels)
-            patches = patches.view(batch_size, channels * kernel_size * kernel_size, n_h, n_w)
-        else:
-            # THE Desktop/Training Path (0-FLOP memory reshape)
-            x = feature_map.view(batch_size, channels, n_h, kernel_size, n_w, kernel_size)
-            x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
-            patches = x.view(batch_size, channels * kernel_size * kernel_size, n_h, n_w)
+
+        n_h = height // stride
+        n_w = width // stride
+
+        if patch_size == stride and padding == 0:
+            if self.use_conv_unfold:
+                weights = self._get_unfolding_weights(
+                    patch_size, channels, dtype=feature_map.dtype, device=feature_map.device
+                )
+                patches = F.conv2d(feature_map, weights, stride=patch_size, groups=channels)
+                patches = patches.view(batch_size, channels * patch_size * patch_size, n_h, n_w)
+            else:
+                x = feature_map.view(batch_size, channels, n_h, patch_size, n_w, patch_size)
+                x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
+                patches = x.view(batch_size, channels * patch_size * patch_size, n_h, n_w)
+            return patches, (height, width)
+
+        if padding > 0:
+            feature_map = F.pad(feature_map, (padding, padding, padding, padding), mode=pad_mode)
+
+        patches = F.unfold(feature_map, kernel_size=patch_size, stride=stride)
+        patches = patches.view(batch_size, channels * patch_size * patch_size, n_h, n_w)
 
         return patches, (height, width)
 
@@ -209,18 +242,62 @@ class PatchInpainting(nn.Module):
         output_size: tuple[int, int],
         *,
         kernel_size: int,
+        stride: int | None = None,
+        padding: int = 0,
+        use_window: bool = False,
     ) -> torch.Tensor:
-        n_h = output_size[0] // kernel_size
-        n_w = output_size[1] // kernel_size
-        if patches.dim() == 3:
-            patches = patches.transpose(1, 2).contiguous().view(patches.shape[0], -1, n_h, n_w)
-        return F.pixel_shuffle(patches, upscale_factor=kernel_size)
+        kernel_size = int(kernel_size)
+        stride = kernel_size if stride is None else int(stride)
+        padding = int(padding)
+        if patches.dim() == 4:
+            batch_size, patch_dim, n_h, n_w = patches.shape
+            cols = patches.view(batch_size, patch_dim, n_h * n_w)
+        elif patches.dim() == 3:
+            batch_size, num_patches, patch_dim = patches.shape
+            cols = patches.transpose(1, 2).contiguous()
+        else:
+            raise ValueError(f"Unsupported patch tensor shape: {tuple(patches.shape)}")
 
-    def build_paper_attention_mask(self, patch_mask_flat: torch.Tensor) -> torch.Tensor:
-        batch_size, num_patches = patch_mask_flat.shape
-        is_masked_q = patch_mask_flat.unsqueeze(-1)
-        is_valid_k = (1.0 - patch_mask_flat).unsqueeze(1)
-        eye = torch.eye(num_patches, device=patch_mask_flat.device, dtype=patch_mask_flat.dtype).unsqueeze(0)
+        channels = patch_dim // (kernel_size * kernel_size)
+        if channels * kernel_size * kernel_size != patch_dim:
+            raise ValueError(
+                f"Patch dimension {patch_dim} is not divisible by kernel footprint {kernel_size * kernel_size}."
+            )
+
+        padded_output = (output_size[0] + 2 * padding, output_size[1] + 2 * padding)
+
+        if use_window and (stride != kernel_size or padding > 0):
+            window = torch.hann_window(kernel_size, periodic=False, device=cols.device, dtype=cols.dtype)
+            window_2d = torch.outer(window, window).clamp_min(1e-3)
+            window_2d = window_2d / window_2d.max().clamp_min(1e-8)
+            weight_cols = window_2d.reshape(1, 1, -1).repeat(1, channels, 1).reshape(1, -1, 1)
+            weighted_cols = cols * weight_cols
+            output = F.fold(weighted_cols, output_size=padded_output, kernel_size=kernel_size, stride=stride)
+            norm = F.fold(
+                cols.new_ones((cols.shape[0], 1, cols.shape[-1])) * weight_cols,
+                output_size=padded_output,
+                kernel_size=kernel_size,
+                stride=stride,
+            )
+            output = output / norm.clamp_min(1e-6)
+        else:
+            output = F.fold(cols, output_size=padded_output, kernel_size=kernel_size, stride=stride)
+
+        if padding > 0:
+            output = output[..., padding:-padding, padding:-padding]
+        return output
+
+    def build_paper_attention_mask(
+        self,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        _, num_patches = query_mask_flat.shape
+        is_masked_q = query_mask_flat.unsqueeze(-1)
+        if key_valid_flat is None:
+            key_valid_flat = 1.0 - query_mask_flat
+        is_valid_k = key_valid_flat.unsqueeze(1)
+        eye = torch.eye(num_patches, device=query_mask_flat.device, dtype=query_mask_flat.dtype).unsqueeze(0)
         allowed = (1.0 - is_masked_q) * eye + is_masked_q * is_valid_k
         return allowed.unsqueeze(1)
 
@@ -245,9 +322,21 @@ class PatchInpainting(nn.Module):
         coarse_raw, features = self.encoder_decoder(image)
 
         patch_map, output_size = self.unfold_native(coarse_raw, self.kernel_size)
-        source_patch_map, _ = self.unfold_native(image, self.kernel_size)
-        mask_patch_map, _ = self.unfold_native(mask, self.kernel_size)
-        patch_mask_flat = (mask_patch_map.amax(dim=1) > 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
+        source_patch_map, _ = self.extract_patches(
+            image,
+            self.value_patch_size,
+            stride=self.kernel_size,
+            padding=self.value_patch_padding,
+        )
+        query_mask_patch_map, _ = self.unfold_native(mask, self.kernel_size)
+        key_mask_patch_map, _ = self.extract_patches(
+            mask,
+            self.value_patch_size,
+            stride=self.kernel_size,
+            padding=self.value_patch_padding,
+        )
+        query_mask_flat = (query_mask_patch_map.amax(dim=1) > 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
+        key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
 
         token_map = patch_map
         if self.concat_features:
@@ -267,7 +356,7 @@ class PatchInpainting(nn.Module):
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         attention_mask = (
-            self.build_paper_attention_mask(patch_mask_flat) if self.attention_masking else None
+            self.build_paper_attention_mask(query_mask_flat, key_valid_flat) if self.attention_masking else None
         )
         mixed_patches_flat, masked_attention = self.multihead_attention(
             input_tokens,
@@ -277,20 +366,18 @@ class PatchInpainting(nn.Module):
             direct_patch_mixing=True,
         )
 
-        mixed_patch_map = mixed_patches_flat.transpose(1, 2).contiguous().view_as(patch_map)
-                
-        # 1. Fold the patches back into a standard RGB image FIRST
         refined = self.fold_native(
-            mixed_patch_map,
+            mixed_patches_flat,
             output_size,
-            kernel_size=self.kernel_size,
+            kernel_size=self.value_patch_size,
+            stride=self.kernel_size,
+            padding=self.value_patch_padding,
+            use_window=self.value_patch_padding > 0,
         )
-        
-        # 2. Apply the coherence layer to smooth the seams on the folded 3-channel image
+
         if self.coherence_layer is not None:
             refined = refined + self.coherence_layer(refined)
-            
-        # 3. Paste the uncorrupted original pixels back over the known regions
+
         refined = refined * mask + image * (1 - mask)
 
         return refined, masked_attention, coarse_raw

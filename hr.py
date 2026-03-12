@@ -34,13 +34,25 @@ class AttentionUpscaling(nn.Module):
                 f"(B, 1, N, N); got {tuple(attn_map.shape)}"
             )
 
-        hr_patch_size = self.patch_inpainting.kernel_size * scale_h
+        hr_stride = self.patch_inpainting.kernel_size * scale_h
+        hr_patch_size = self.patch_inpainting.value_patch_size * scale_h
+        hr_padding = self.patch_inpainting.value_patch_padding * scale_h
         hr_base = F.interpolate(x_lr_inpainted, size=(hr_h, hr_w), mode="bicubic", align_corners=False)
         source = x_hr if mask_hr is None else x_hr * (1 - mask_hr)
         source_blurred = self.patch_inpainting.final_gaussian_blur(source)
 
-        source_patches, _ = self.patch_inpainting.unfold_native(source, hr_patch_size)
-        source_blurred_patches, _ = self.patch_inpainting.unfold_native(source_blurred, hr_patch_size)
+        source_patches, _ = self.patch_inpainting.extract_patches(
+            source,
+            hr_patch_size,
+            stride=hr_stride,
+            padding=hr_padding,
+        )
+        source_blurred_patches, _ = self.patch_inpainting.extract_patches(
+            source_blurred,
+            hr_patch_size,
+            stride=hr_stride,
+            padding=hr_padding,
+        )
         source_hf_flat = (source_patches - source_blurred_patches).flatten(start_dim=2).transpose(1, 2)
         attn_weights = attn_map.squeeze(1)
         compute_dtype = torch.promote_types(attn_weights.dtype, source_hf_flat.dtype)
@@ -53,6 +65,9 @@ class AttentionUpscaling(nn.Module):
             reconstructed_hf_flat,
             (hr_h, hr_w),
             kernel_size=hr_patch_size,
+            stride=hr_stride,
+            padding=hr_padding,
+            use_window=hr_padding > 0,
         )
         if hr_base.dtype != reconstructed_hf.dtype:
             hr_base = hr_base.to(dtype=reconstructed_hf.dtype)
