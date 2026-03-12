@@ -93,7 +93,10 @@ class MultiHeadAttention(nn.Module):
 
         attn = F.softmax(attn.float(), dim=-1).to(v.dtype)
         attn = self._sparsify_attention(attn, query_mask_flat)
-        attn = self.dropout(attn)
+        # Direct patch mixing behaves like weighted image reconstruction, so dropping
+        # sparse attention weights introduces random dark artifacts instead of useful regularization.
+        if not direct_patch_mixing:
+            attn = self.dropout(attn)
 
         mixed = torch.matmul(attn, v_proj)
         output = mixed.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
