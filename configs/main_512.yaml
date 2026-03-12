@@ -63,7 +63,7 @@ discriminator:
   num_scales: 1 
 
 logging:
-  log_dir: "logs/train_supercaf_1024_to_512_paper"
+  log_dir: "logs/train_main"
   log_interval: 50
   vis_interval: 1000
   eval_interval: 1000
