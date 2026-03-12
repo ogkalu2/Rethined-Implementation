@@ -396,8 +396,10 @@ class PatchInpainting(nn.Module):
                     value_tokens,
                     direct_patch_mixing=True,
                 )
-                mixed[batch_idx].index_copy_(0, query_indices, mixed_queries.squeeze(0))
-                replacement_rows[:, key_indices] = masked_attention.squeeze(0).squeeze(0)
+                mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
+                masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
+                mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
+                replacement_rows[:, key_indices] = masked_attention
 
             dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
 
