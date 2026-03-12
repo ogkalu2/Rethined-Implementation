@@ -365,6 +365,44 @@ class PatchInpainting(nn.Module):
             output = output[..., padding:-padding, padding:-padding]
         return output
 
+    def direct_patch_mix_masked_queries(
+        self,
+        input_tokens: torch.Tensor,
+        patch_values: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_patches, _ = input_tokens.shape
+        mixed = patch_values.clone()
+        eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
+        dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        masked_queries = query_mask_flat > 0.5
+        valid_keys = key_valid_flat > 0.5
+
+        for batch_idx in range(batch_size):
+            query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
+            if query_indices.numel() == 0:
+                continue
+
+            key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
+            replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
+            if key_indices.numel() > 0:
+                query_tokens = input_tokens[batch_idx : batch_idx + 1, query_indices]
+                key_tokens = input_tokens[batch_idx : batch_idx + 1, key_indices]
+                value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
+                mixed_queries, masked_attention = self.multihead_attention(
+                    query_tokens,
+                    key_tokens,
+                    value_tokens,
+                    direct_patch_mixing=True,
+                )
+                mixed[batch_idx].index_copy_(0, query_indices, mixed_queries.squeeze(0))
+                replacement_rows[:, key_indices] = masked_attention.squeeze(0).squeeze(0)
+
+            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
+
+        return mixed, dense_attn
+
     def build_paper_attention_mask(
         self,
         query_mask_flat: torch.Tensor,
@@ -478,17 +516,21 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
-        attention_mask = (
-            self.build_paper_attention_mask(query_mask_flat, key_valid_flat) if self.attention_masking else None
-        )
-        mixed_patches_flat, masked_attention = self.multihead_attention(
-            input_tokens,
-            input_tokens,
-            patch_values,
-            post_softmax_mask=attention_mask,
-            direct_patch_mixing=True,
-            query_mask_flat=query_mask_flat,
-        )
+        if self.attention_masking:
+            mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
+                input_tokens,
+                patch_values,
+                query_mask_flat,
+                key_valid_flat,
+            )
+        else:
+            mixed_patches_flat, masked_attention = self.multihead_attention(
+                input_tokens,
+                input_tokens,
+                patch_values,
+                direct_patch_mixing=True,
+                query_mask_flat=query_mask_flat,
+            )
 
         refined = self.fold_native(
             mixed_patches_flat,
