@@ -126,8 +126,20 @@ class MultiHeadAttention(nn.Module):
         if post_softmax_mask is not None:
             attn_logits_raw = attn_logits_raw.masked_fill(post_softmax_mask == 0, torch.finfo(attn_logits_raw.dtype).min)
 
-        attn = self._restrict_attention_logits(attn_logits_raw, query_mask_flat)
-        attn = self._normalize_attention_logits(attn).to(v.dtype)
+        attn_logits = self._restrict_attention_logits(attn_logits_raw, query_mask_flat)
+        attn_probs = self._normalize_attention_logits(attn_logits).to(v.dtype)
+        attn = attn_probs
+        if direct_patch_mixing and self.training:
+            # For direct RGB patch mixing, soft attention averages unrelated patches and
+            # changes the task into patch blending. Use hard routing in the forward pass
+            # while preserving soft gradients during warmup.
+            needs_straight_through_hardening = (
+                self.attention_selection == "softmax"
+                or (self.attention_selection == "gumbel" and not self.attention_gumbel_hard)
+            )
+            if needs_straight_through_hardening:
+                hard_attn = self._hard_attention_from_logits(attn_logits).to(v.dtype)
+                attn = hard_attn - attn_probs.detach() + attn_probs
         # Direct patch mixing behaves like weighted image reconstruction, so dropping
         # sparse attention weights introduces random dark artifacts instead of useful regularization.
         if not direct_patch_mixing:
@@ -137,7 +149,7 @@ class MultiHeadAttention(nn.Module):
         output = mixed.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
         if not direct_patch_mixing:
             output = self.fc(output)
-        return output, attn
+        return output, attn_probs
 
 
 class PatchInpainting(nn.Module):
