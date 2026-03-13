@@ -281,6 +281,12 @@ def format_train_metric_snapshot(metrics):
             f", pta={metrics['patch_teacher_accuracy']:.3f}"
             f", pts={metrics['patch_teacher_supervised_ratio']:.3f}"
         )
+    if "candidate_rerank" in metrics:
+        summary += (
+            f", rr={metrics['candidate_rerank']:.4f}"
+            f", rra={metrics['candidate_rerank_accuracy']:.3f}"
+            f", rrs={metrics['candidate_rerank_supervised_ratio']:.3f}"
+        )
     return summary
 
 
@@ -727,6 +733,14 @@ def train(cfg, args):
                     metrics["patch_teacher_supervised_ratio"],
                     step,
                 )
+            if "candidate_rerank" in metrics:
+                writer.add_scalar("loss/candidate_rerank", metrics["candidate_rerank"], step)
+                writer.add_scalar("candidate_rerank/accuracy", metrics["candidate_rerank_accuracy"], step)
+                writer.add_scalar(
+                    "candidate_rerank/supervised_ratio",
+                    metrics["candidate_rerank_supervised_ratio"],
+                    step,
+                )
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -755,6 +769,9 @@ def train(cfg, args):
                     pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
                     pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
+                    rr=(f"{metrics['candidate_rerank']:.4f}" if "candidate_rerank" in metrics else "n/a"),
+                    rra=(f"{metrics['candidate_rerank_accuracy']:.3f}" if "candidate_rerank_accuracy" in metrics else "n/a"),
+                    rrs=(f"{metrics['candidate_rerank_supervised_ratio']:.3f}" if "candidate_rerank_supervised_ratio" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,

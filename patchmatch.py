@@ -98,6 +98,28 @@ class MultiHeadAttention(nn.Module):
             return self._hard_attention_from_logits(attn_logits)
         return self._hard_attention_from_logits(attn_logits)
 
+    def compute_attention_logits(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        *,
+        post_softmax_mask: torch.Tensor | None = None,
+        query_mask_flat: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, len_q, len_k = q.size(0), q.size(1), k.size(1)
+        q_proj = self.w_qs(q).view(batch_size, len_q, self.n_head, self.d_k).transpose(1, 2)
+        k_proj = self.w_ks(k).view(batch_size, len_k, self.n_head, self.d_k).transpose(1, 2)
+        attn_logits_raw = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3)).float()
+        if self.attention_temperature != 1.0:
+            attn_logits_raw = attn_logits_raw / self.attention_temperature
+        if post_softmax_mask is not None:
+            attn_logits_raw = attn_logits_raw.masked_fill(
+                post_softmax_mask == 0,
+                torch.finfo(attn_logits_raw.dtype).min,
+            )
+        attn_logits = self._restrict_attention_logits(attn_logits_raw, query_mask_flat)
+        return attn_logits_raw, attn_logits
+
     def forward(
         self,
         q: torch.Tensor,
@@ -109,8 +131,6 @@ class MultiHeadAttention(nn.Module):
         query_mask_flat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
-        q_proj = self.w_qs(q).view(batch_size, len_q, self.n_head, self.d_k).transpose(1, 2)
-        k_proj = self.w_ks(k).view(batch_size, len_k, self.n_head, self.d_k).transpose(1, 2)
 
         if direct_patch_mixing:
             if self.n_head != 1:
@@ -119,14 +139,12 @@ class MultiHeadAttention(nn.Module):
         else:
             v_proj = self.w_vs(v).view(batch_size, len_v, self.n_head, self.d_v).transpose(1, 2)
 
-        attn_logits_raw = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3)).float()
-        if self.attention_temperature != 1.0:
-            attn_logits_raw = attn_logits_raw / self.attention_temperature
-
-        if post_softmax_mask is not None:
-            attn_logits_raw = attn_logits_raw.masked_fill(post_softmax_mask == 0, torch.finfo(attn_logits_raw.dtype).min)
-
-        attn_logits = self._restrict_attention_logits(attn_logits_raw, query_mask_flat)
+        _, attn_logits = self.compute_attention_logits(
+            q,
+            k,
+            post_softmax_mask=post_softmax_mask,
+            query_mask_flat=query_mask_flat,
+        )
         attn_probs = self._normalize_attention_logits(attn_logits).to(v.dtype)
         attn = attn_probs
         if direct_patch_mixing and self.training:
@@ -172,6 +190,8 @@ class PatchInpainting(nn.Module):
         normalize_matching_branches: bool = False,
         learnable_matching_branch_scales: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
+        candidate_reranker: bool = False,
+        candidate_reranker_hidden_dim: int = 128,
         query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
         shared_query_key_descriptor: bool = False,
@@ -217,6 +237,8 @@ class PatchInpainting(nn.Module):
         self.normalize_matching_branches = bool(normalize_matching_branches)
         self.learnable_matching_branch_scales = bool(learnable_matching_branch_scales)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
+        self.candidate_reranker = bool(candidate_reranker)
+        self.candidate_reranker_hidden_dim = int(candidate_reranker_hidden_dim)
         self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
@@ -227,6 +249,8 @@ class PatchInpainting(nn.Module):
         self.key_feature_residual_init = float(key_feature_residual_init)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
+        if self.candidate_reranker_hidden_dim <= 0:
+            raise ValueError("candidate_reranker_hidden_dim must be positive.")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -312,6 +336,7 @@ class PatchInpainting(nn.Module):
         self.key_coarse_rgb_scale = None
         self.key_feature_scale = None
         self.shared_query_key_descriptor_head = None
+        self.candidate_reranker_head = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -373,6 +398,19 @@ class PatchInpainting(nn.Module):
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
         )
+        if self.candidate_reranker:
+            if self.multihead_attention.attention_top_k is None:
+                raise ValueError("candidate_reranker requires attention_top_k to be set.")
+            if not self.attention_masking:
+                raise ValueError("candidate_reranker currently requires attention_masking=True.")
+            rerank_input_dim = self.patch_token_dim * 4
+            self.candidate_reranker_head = nn.Sequential(
+                nn.Linear(rerank_input_dim, self.candidate_reranker_hidden_dim, bias=False),
+                nn.GELU(),
+                nn.Linear(self.candidate_reranker_hidden_dim, 1),
+            )
+            nn.init.zeros_(self.candidate_reranker_head[-1].weight)
+            nn.init.zeros_(self.candidate_reranker_head[-1].bias)
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
             nn.Parameter(
@@ -682,13 +720,34 @@ class PatchInpainting(nn.Module):
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
         batch_size, num_patches, _ = query_tokens_full.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
         eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
         dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
         valid_keys = key_valid_flat > 0.5
+        rerank_aux = None
+        shortlist_k = self.multihead_attention.attention_top_k
+        if self.candidate_reranker and shortlist_k is not None:
+            rerank_aux = {
+                "candidate_indices": torch.full(
+                    (batch_size, num_patches, shortlist_k),
+                    -1,
+                    dtype=torch.long,
+                    device=patch_values.device,
+                ),
+                "candidate_logits": torch.zeros(
+                    (batch_size, num_patches, shortlist_k),
+                    dtype=query_tokens_full.dtype,
+                    device=query_tokens_full.device,
+                ),
+                "candidate_valid_mask": torch.zeros(
+                    (batch_size, num_patches, shortlist_k),
+                    dtype=torch.bool,
+                    device=query_tokens_full.device,
+                ),
+            }
 
         for batch_idx in range(batch_size):
             query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
@@ -701,20 +760,74 @@ class PatchInpainting(nn.Module):
                 query_tokens = query_tokens_full[batch_idx : batch_idx + 1, query_indices]
                 key_tokens = key_tokens_full[batch_idx : batch_idx + 1, key_indices]
                 value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
-                mixed_queries, masked_attention = self.multihead_attention(
-                    query_tokens,
-                    key_tokens,
-                    value_tokens,
-                    direct_patch_mixing=True,
-                )
-                mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
-                masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
+                if self.candidate_reranker:
+                    _, base_logits = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
+                    base_logits = base_logits.squeeze(0).squeeze(0)
+                    candidate_count = min(base_logits.shape[-1], self.multihead_attention.attention_top_k)
+                    base_candidate_logits, candidate_local_indices = torch.topk(
+                        base_logits,
+                        k=candidate_count,
+                        dim=-1,
+                    )
+                    key_tokens_flat = key_tokens.squeeze(0)
+                    value_tokens_flat = value_tokens.squeeze(0)
+                    candidate_key_tokens = key_tokens_flat[candidate_local_indices]
+                    candidate_value_tokens = value_tokens_flat[candidate_local_indices]
+                    query_tokens_flat = query_tokens.squeeze(0)
+                    query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
+                    rerank_features = torch.cat(
+                        [
+                            query_expanded,
+                            candidate_key_tokens,
+                            query_expanded - candidate_key_tokens,
+                            query_expanded * candidate_key_tokens,
+                        ],
+                        dim=-1,
+                    )
+                    rerank_delta = self.candidate_reranker_head(rerank_features).squeeze(-1)
+                    rerank_logits = base_candidate_logits + rerank_delta
+                    rerank_logits_4d = rerank_logits.unsqueeze(0).unsqueeze(0)
+                    masked_attention = self.multihead_attention._normalize_attention_logits(rerank_logits_4d)
+                    masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
+                    selected_attention = masked_attention
+                    needs_straight_through_hardening = (
+                        self.training
+                        and (
+                            self.multihead_attention.attention_selection == "softmax"
+                            or (
+                                self.multihead_attention.attention_selection == "gumbel"
+                                and not self.multihead_attention.attention_gumbel_hard
+                            )
+                        )
+                    )
+                    if needs_straight_through_hardening:
+                        hard_attention = self.multihead_attention._hard_attention_from_logits(rerank_logits_4d)
+                        hard_attention = hard_attention.squeeze(0).squeeze(0).to(dtype=masked_attention.dtype)
+                        selected_attention = hard_attention - masked_attention.detach() + masked_attention
+                    mixed_queries = (
+                        selected_attention.unsqueeze(-1) * candidate_value_tokens.to(dtype=selected_attention.dtype)
+                    ).sum(dim=1)
+                    mixed_queries = mixed_queries.to(dtype=mixed.dtype)
+                    candidate_absolute_indices = key_indices[candidate_local_indices]
+                    replacement_rows.scatter_(1, candidate_absolute_indices, masked_attention)
+                    rerank_aux["candidate_indices"][batch_idx, query_indices, :candidate_count] = candidate_absolute_indices
+                    rerank_aux["candidate_logits"][batch_idx, query_indices, :candidate_count] = rerank_logits
+                    rerank_aux["candidate_valid_mask"][batch_idx, query_indices, :candidate_count] = True
+                else:
+                    mixed_queries, masked_attention = self.multihead_attention(
+                        query_tokens,
+                        key_tokens,
+                        value_tokens,
+                        direct_patch_mixing=True,
+                    )
+                    mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
+                    masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
+                    replacement_rows[:, key_indices] = masked_attention
                 mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
-                replacement_rows[:, key_indices] = masked_attention
 
             dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
 
-        return mixed, dense_attn
+        return mixed, dense_attn, rerank_aux
 
     def build_paper_attention_mask(
         self,
@@ -931,8 +1044,9 @@ class PatchInpainting(nn.Module):
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
+        rerank_aux = None
         if self.attention_masking:
-            mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
+            mixed_patches_flat, masked_attention, rerank_aux = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
                 patch_values,
@@ -985,5 +1099,7 @@ class PatchInpainting(nn.Module):
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
             }
+            if rerank_aux is not None:
+                aux.update(rerank_aux)
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw
