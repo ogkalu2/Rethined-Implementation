@@ -172,6 +172,9 @@ class PatchInpainting(nn.Module):
         normalize_matching_branches: bool = False,
         learnable_matching_branch_scales: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
+        separate_query_key_matching: bool = False,
+        query_context_channels: int = 32,
+        key_context_channels: int = 32,
         value_source: str = "rgb",
         fusion_mode: str = "replace",
         fusion_hidden_channels: int = 32,
@@ -209,8 +212,16 @@ class PatchInpainting(nn.Module):
         self.normalize_matching_branches = bool(normalize_matching_branches)
         self.learnable_matching_branch_scales = bool(learnable_matching_branch_scales)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
+        self.separate_query_key_matching = bool(separate_query_key_matching)
+        self.query_context_channels = int(query_context_channels)
+        self.key_context_channels = int(key_context_channels)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
+        if self.separate_query_key_matching:
+            if self.query_context_channels <= 0:
+                raise ValueError("query_context_channels must be positive when separate_query_key_matching=True.")
+            if self.key_context_channels <= 0:
+                raise ValueError("key_context_channels must be positive when separate_query_key_matching=True.")
         self.value_source = str(value_source).lower()
         if self.value_source not in {"rgb", "high_freq_residual"}:
             raise ValueError("value_source must be either 'rgb' or 'high_freq_residual'.")
@@ -237,10 +248,19 @@ class PatchInpainting(nn.Module):
             self.matching_input_dim += self.query_patch_dim
         if self.concat_features:
             self.matching_input_dim += self.feature_dim
-        if self.matching_input_dim == 0:
+        if not self.separate_query_key_matching and self.matching_input_dim == 0:
             raise ValueError("Matching must use coarse RGB patches, coarse features, or both.")
+        self.query_matching_input_dim = self.matching_input_dim
+        self.key_matching_input_dim = self.matching_input_dim
+        if self.separate_query_key_matching:
+            self.query_matching_input_dim = self.query_patch_dim + self.query_context_channels
+            if self.match_coarse_rgb:
+                self.query_matching_input_dim += self.query_patch_dim
+            if self.concat_features:
+                self.query_matching_input_dim += self.feature_dim
+            self.key_matching_input_dim = self.query_patch_dim + self.key_context_channels
         self.patch_token_dim = (
-            self.matching_input_dim
+            max(self.query_matching_input_dim, self.key_matching_input_dim)
             if self.matching_descriptor_dim is None
             else self.matching_descriptor_dim
         )
@@ -259,6 +279,8 @@ class PatchInpainting(nn.Module):
 
         self.encoder_decoder = model
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
+        self.query_context_encoder = None
+        self.key_context_encoder = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -271,8 +293,21 @@ class PatchInpainting(nn.Module):
         self.feature_branch_scale = None
         if self.concat_features and self.learnable_matching_branch_scales:
             self.feature_branch_scale = nn.Parameter(torch.tensor(1.0))
+        self.query_descriptor_head = None
+        self.key_descriptor_head = None
         self.matching_descriptor_head = None
-        if self.matching_descriptor_dim is not None:
+        if self.separate_query_key_matching:
+            self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
+            self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
+            self.query_descriptor_head = self._build_projection_head(
+                self.query_matching_input_dim,
+                self.patch_token_dim,
+            )
+            self.key_descriptor_head = self._build_projection_head(
+                self.key_matching_input_dim,
+                self.patch_token_dim,
+            )
+        elif self.matching_descriptor_dim is not None:
             hidden_dim = max(self.matching_input_dim, self.matching_descriptor_dim)
             self.matching_descriptor_head = nn.Sequential(
                 nn.Conv2d(
@@ -421,6 +456,42 @@ class PatchInpainting(nn.Module):
             branch = branch * scale.to(dtype=branch.dtype, device=branch.device)
         return self._apply_branch_dropout(branch, drop_prob)
 
+    def _build_context_encoder(self, in_channels: int, out_channels: int) -> nn.Sequential:
+        hidden_channels = max(out_channels, 32)
+        return nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                hidden_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode="reflect",
+                bias=False,
+            ),
+            nn.GELU(),
+            nn.Conv2d(
+                hidden_channels,
+                out_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode="reflect",
+                bias=False,
+            ),
+            nn.GELU(),
+        )
+
+    def _build_projection_head(self, input_dim: int, output_dim: int) -> nn.Sequential:
+        hidden_dim = output_dim
+        return nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, kernel_size=1, stride=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, output_dim, kernel_size=1, stride=1, bias=False),
+        )
+
+    def _pool_to_token_grid(self, feature_map: torch.Tensor, token_hw: tuple[int, int]) -> torch.Tensor:
+        return F.adaptive_avg_pool2d(feature_map, token_hw)
+
     def _compute_unfolding_weights(self, kernel_size: int, channels: int) -> torch.Tensor:
         weights = torch.eye(kernel_size * kernel_size, dtype=torch.float32)
         weights = weights.view(kernel_size * kernel_size, 1, kernel_size, kernel_size)
@@ -545,13 +616,14 @@ class PatchInpainting(nn.Module):
 
     def direct_patch_mix_masked_queries(
         self,
-        input_tokens: torch.Tensor,
+        query_tokens_full: torch.Tensor,
+        key_tokens_full: torch.Tensor,
         patch_values: torch.Tensor,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size, num_patches, _ = input_tokens.shape
+        batch_size, num_patches, _ = query_tokens_full.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
         eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
         dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
@@ -566,8 +638,8 @@ class PatchInpainting(nn.Module):
             key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
             replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
             if key_indices.numel() > 0:
-                query_tokens = input_tokens[batch_idx : batch_idx + 1, query_indices]
-                key_tokens = input_tokens[batch_idx : batch_idx + 1, key_indices]
+                query_tokens = query_tokens_full[batch_idx : batch_idx + 1, query_indices]
+                key_tokens = key_tokens_full[batch_idx : batch_idx + 1, key_indices]
                 value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
                 mixed_queries, masked_attention = self.multihead_attention(
                     query_tokens,
@@ -687,41 +759,94 @@ class PatchInpainting(nn.Module):
         )
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
 
-        token_inputs = []
-        if self.match_coarse_rgb:
-            coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
-            coarse_match_map = self._prepare_matching_branch(
-                coarse_match_map,
-                norm=self.coarse_rgb_branch_norm,
-                scale=self.coarse_rgb_branch_scale,
-                drop_prob=self.coarse_rgb_branch_dropout,
+        query_matching_tokens = None
+        key_matching_tokens = None
+        if self.separate_query_key_matching:
+            visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
+            query_context_map = self._pool_to_token_grid(
+                self.query_context_encoder(torch.cat([image, mask], dim=1)),
+                patch_map.shape[-2:],
             )
-            token_inputs.append(coarse_match_map)
-        if self.concat_features:
-            coarse_features = F.interpolate(
-                features[self.feature_i],
-                size=patch_map.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
+            key_context_map = self._pool_to_token_grid(
+                self.key_context_encoder(image),
+                patch_map.shape[-2:],
             )
-            coarse_features = self._prepare_matching_branch(
-                coarse_features,
-                norm=self.feature_branch_norm,
-                scale=self.feature_branch_scale,
-                drop_prob=0.0,
-            )
-            token_inputs.append(coarse_features)
 
-        token_map = token_inputs[0] if len(token_inputs) == 1 else torch.cat(token_inputs, dim=1)
-        if self.matching_descriptor_head is not None:
-            token_map = self.matching_descriptor_head(token_map)
+            query_token_inputs = [query_context_map, visible_patch_map]
+            if self.match_coarse_rgb:
+                coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
+                coarse_match_map = self._prepare_matching_branch(
+                    coarse_match_map,
+                    norm=self.coarse_rgb_branch_norm,
+                    scale=self.coarse_rgb_branch_scale,
+                    drop_prob=self.coarse_rgb_branch_dropout,
+                )
+                query_token_inputs.append(coarse_match_map)
+            if self.concat_features:
+                coarse_features = F.interpolate(
+                    features[self.feature_i],
+                    size=patch_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                coarse_features = self._prepare_matching_branch(
+                    coarse_features,
+                    norm=self.feature_branch_norm,
+                    scale=self.feature_branch_scale,
+                    drop_prob=0.0,
+                )
+                query_token_inputs.append(coarse_features)
 
-        matching_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
-        input_tokens = matching_tokens
+            key_token_inputs = [key_context_map, visible_patch_map]
+            query_token_map = torch.cat(query_token_inputs, dim=1)
+            key_token_map = torch.cat(key_token_inputs, dim=1)
+            query_token_map = self.query_descriptor_head(query_token_map)
+            key_token_map = self.key_descriptor_head(key_token_map)
+            query_matching_tokens = query_token_map.flatten(start_dim=2).transpose(1, 2)
+            key_matching_tokens = key_token_map.flatten(start_dim=2).transpose(1, 2)
+            query_tokens = query_matching_tokens
+            key_tokens = key_matching_tokens
+        else:
+            token_inputs = []
+            if self.match_coarse_rgb:
+                coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
+                coarse_match_map = self._prepare_matching_branch(
+                    coarse_match_map,
+                    norm=self.coarse_rgb_branch_norm,
+                    scale=self.coarse_rgb_branch_scale,
+                    drop_prob=self.coarse_rgb_branch_dropout,
+                )
+                token_inputs.append(coarse_match_map)
+            if self.concat_features:
+                coarse_features = F.interpolate(
+                    features[self.feature_i],
+                    size=patch_map.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                coarse_features = self._prepare_matching_branch(
+                    coarse_features,
+                    norm=self.feature_branch_norm,
+                    scale=self.feature_branch_scale,
+                    drop_prob=0.0,
+                )
+                token_inputs.append(coarse_features)
+
+            token_map = token_inputs[0] if len(token_inputs) == 1 else torch.cat(token_inputs, dim=1)
+            if self.matching_descriptor_head is not None:
+                token_map = self.matching_descriptor_head(token_map)
+
+            query_matching_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
+            key_matching_tokens = query_matching_tokens
+            query_tokens = query_matching_tokens
+            key_tokens = key_matching_tokens
+
         positional_encoding = self.get_positional_encoding()
         if positional_encoding is not None:
-            input_tokens = input_tokens + positional_encoding
-        input_tokens = self.pre_attention_norm(input_tokens)
+            query_tokens = query_tokens + positional_encoding
+            key_tokens = key_tokens + positional_encoding
+        query_tokens = self.pre_attention_norm(query_tokens)
+        key_tokens = self.pre_attention_norm(key_tokens)
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
@@ -729,7 +854,8 @@ class PatchInpainting(nn.Module):
             default_patch_values = torch.zeros_like(patch_values)
         if self.attention_masking:
             mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
-                input_tokens,
+                query_tokens,
+                key_tokens,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
@@ -737,8 +863,8 @@ class PatchInpainting(nn.Module):
             )
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(
-                input_tokens,
-                input_tokens,
+                query_tokens,
+                key_tokens,
                 patch_values,
                 direct_patch_mixing=True,
                 query_mask_flat=query_mask_flat,
@@ -776,7 +902,9 @@ class PatchInpainting(nn.Module):
                 "kernel_size": self.kernel_size,
                 "value_patch_size": self.value_patch_size,
                 "value_patch_padding": self.value_patch_padding,
-                "matching_tokens": matching_tokens,
+                "matching_tokens": query_matching_tokens,
+                "query_matching_tokens": query_matching_tokens,
+                "key_matching_tokens": key_matching_tokens,
             }
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw

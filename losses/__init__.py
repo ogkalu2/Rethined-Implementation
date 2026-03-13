@@ -220,14 +220,21 @@ class InpaintingLoss(nn.Module):
 
         query_mask_flat = attention_aux.get("query_mask_flat")
         key_valid_flat = attention_aux.get("key_valid_flat")
+        query_matching_tokens = attention_aux.get("query_matching_tokens")
+        key_matching_tokens = attention_aux.get("key_matching_tokens")
         matching_tokens = attention_aux.get("matching_tokens")
         kernel_size = int(attention_aux.get("kernel_size", 0))
         value_patch_size = int(attention_aux.get("value_patch_size", 0))
         value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
+        if query_matching_tokens is None:
+            query_matching_tokens = matching_tokens
+        if key_matching_tokens is None:
+            key_matching_tokens = matching_tokens
         if (
             query_mask_flat is None
             or key_valid_flat is None
-            or matching_tokens is None
+            or query_matching_tokens is None
+            or key_matching_tokens is None
             or kernel_size <= 0
             or value_patch_size <= 0
         ):
@@ -240,14 +247,15 @@ class InpaintingLoss(nn.Module):
             padding=value_patch_padding,
         )
         teacher_patch_tokens = self._normalize_descriptors(target_patches.detach())
-        descriptor_tokens = self._normalize_descriptors(matching_tokens)
+        descriptor_query_tokens = self._normalize_descriptors(query_matching_tokens)
+        descriptor_key_tokens = self._normalize_descriptors(key_matching_tokens)
 
         loss_terms = []
         supervised_queries = 0
         total_masked_queries = 0
         correct_matches = 0
 
-        for batch_idx in range(descriptor_tokens.shape[0]):
+        for batch_idx in range(descriptor_query_tokens.shape[0]):
             query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
             key_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
             total_masked_queries += int(query_indices.numel())
@@ -274,8 +282,8 @@ class InpaintingLoss(nn.Module):
                     continue
                 teacher_labels = top2.indices[:, 0][valid_teacher]
 
-            query_tokens = descriptor_tokens[batch_idx, query_indices[valid_teacher]]
-            key_tokens = descriptor_tokens[batch_idx, key_indices]
+            query_tokens = descriptor_query_tokens[batch_idx, query_indices[valid_teacher]]
+            key_tokens = descriptor_key_tokens[batch_idx, key_indices]
             logits = torch.matmul(query_tokens, key_tokens.transpose(0, 1))
             logits = logits / self.patch_teacher_temperature
             loss_terms.append(F.cross_entropy(logits, teacher_labels))

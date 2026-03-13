@@ -22,6 +22,9 @@ model:
     normalize_matching_branches: false
     learnable_matching_branch_scales: false
     coarse_rgb_branch_dropout: 0
+    separate_query_key_matching: true
+    query_context_channels: 32
+    key_context_channels: 32
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
