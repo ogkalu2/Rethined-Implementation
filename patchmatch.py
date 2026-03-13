@@ -19,6 +19,7 @@ class MultiHeadAttention(nn.Module):
         d_qk: int,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
+        attention_supervision_top_k: int | None = None,
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
     ):
@@ -33,6 +34,11 @@ class MultiHeadAttention(nn.Module):
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
         if self.attention_top_k is not None and self.attention_top_k <= 0:
             self.attention_top_k = None
+        self.attention_supervision_top_k = (
+            None if attention_supervision_top_k is None else int(attention_supervision_top_k)
+        )
+        if self.attention_supervision_top_k is not None and self.attention_supervision_top_k <= 0:
+            self.attention_supervision_top_k = None
         self.attention_selection = str(attention_selection).lower()
         if self.attention_selection not in {"softmax", "gumbel", "argmax"}:
             raise ValueError(
@@ -98,7 +104,9 @@ class MultiHeadAttention(nn.Module):
 
     def _collect_candidate_details(self, attn_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         top_k = attn_logits.shape[-1]
-        if self.attention_top_k is not None:
+        if self.attention_supervision_top_k is not None:
+            top_k = min(self.attention_supervision_top_k, attn_logits.shape[-1])
+        elif self.attention_top_k is not None:
             top_k = min(self.attention_top_k, attn_logits.shape[-1])
         candidate_logits, candidate_indices = torch.topk(attn_logits, k=top_k, dim=-1)
         return candidate_logits, candidate_indices
@@ -164,6 +172,7 @@ class PatchInpainting(nn.Module):
         value_patch_size: int | None = None,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
+        attention_supervision_top_k: int | None = None,
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
         matching_descriptor_dim: int | None = None,
@@ -264,6 +273,7 @@ class PatchInpainting(nn.Module):
             d_qk=int(embed_dim),
             attention_temperature=float(attention_temperature),
             attention_top_k=attention_top_k,
+            attention_supervision_top_k=attention_supervision_top_k,
             attention_selection=attention_selection,
             attention_gumbel_tau=float(attention_gumbel_tau),
         )
