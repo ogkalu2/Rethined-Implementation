@@ -109,6 +109,10 @@ class InpaintingLoss(nn.Module):
         coarse_perceptual_weight: float = 0.05,
         refined_l1_weight: float = 1.0,
         refined_query_patch_l1_weight: float = 0.0,
+        patch_teacher_weight: float = 0.0,
+        patch_teacher_temperature: float = 0.1,
+        patch_teacher_confidence_threshold: float = 0.2,
+        patch_teacher_margin_threshold: float = 0.03,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.02,
@@ -123,6 +127,10 @@ class InpaintingLoss(nn.Module):
         self.coarse_perceptual_weight = float(coarse_perceptual_weight)
         self.refined_l1_weight = float(refined_l1_weight)
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
+        self.patch_teacher_weight = float(patch_teacher_weight)
+        self.patch_teacher_temperature = float(patch_teacher_temperature)
+        self.patch_teacher_confidence_threshold = float(patch_teacher_confidence_threshold)
+        self.patch_teacher_margin_threshold = float(patch_teacher_margin_threshold)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -135,6 +143,15 @@ class InpaintingLoss(nn.Module):
         self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
         self.coarse_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
+        if self.patch_teacher_temperature <= 0:
+            raise ValueError("patch_teacher_temperature must be positive.")
+        if self.patch_teacher_weight < 0:
+            raise ValueError("patch_teacher_weight must be non-negative.")
+
+    def _normalize_descriptors(self, tokens: torch.Tensor) -> torch.Tensor:
+        tokens = tokens.float()
+        tokens = tokens - tokens.mean(dim=-1, keepdim=True)
+        return F.normalize(tokens, dim=-1, eps=1e-6)
 
     def _extract_patch_tokens(
         self,
@@ -187,6 +204,94 @@ class InpaintingLoss(nn.Module):
             return refined.new_zeros(())
         return torch.stack(losses).mean()
 
+    def _patch_teacher_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {
+            "patch_teacher": 0.0,
+            "patch_teacher_accuracy": 0.0,
+            "patch_teacher_supervised_ratio": 0.0,
+        }
+        if self.patch_teacher_weight <= 0 or attention_aux is None:
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        key_valid_flat = attention_aux.get("key_valid_flat")
+        matching_tokens = attention_aux.get("matching_tokens")
+        kernel_size = int(attention_aux.get("kernel_size", 0))
+        value_patch_size = int(attention_aux.get("value_patch_size", 0))
+        value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
+        if (
+            query_mask_flat is None
+            or key_valid_flat is None
+            or matching_tokens is None
+            or kernel_size <= 0
+            or value_patch_size <= 0
+        ):
+            return zero, metrics
+
+        target_patches = self._extract_patch_tokens(
+            refined_target,
+            patch_size=value_patch_size,
+            stride=kernel_size,
+            padding=value_patch_padding,
+        )
+        teacher_patch_tokens = self._normalize_descriptors(target_patches.detach())
+        descriptor_tokens = self._normalize_descriptors(matching_tokens)
+
+        loss_terms = []
+        supervised_queries = 0
+        total_masked_queries = 0
+        correct_matches = 0
+
+        for batch_idx in range(descriptor_tokens.shape[0]):
+            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            key_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            total_masked_queries += int(query_indices.numel())
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                continue
+
+            with torch.no_grad():
+                query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
+                key_patch_tokens = teacher_patch_tokens[batch_idx, key_indices]
+                teacher_scores = torch.matmul(query_patch_tokens, key_patch_tokens.transpose(0, 1))
+                if key_indices.numel() > 1:
+                    top2 = teacher_scores.topk(k=2, dim=-1)
+                    teacher_best = top2.values[:, 0]
+                    teacher_margin = top2.values[:, 0] - top2.values[:, 1]
+                else:
+                    top2 = teacher_scores.topk(k=1, dim=-1)
+                    teacher_best = top2.values[:, 0]
+                    teacher_margin = torch.full_like(teacher_best, float("inf"))
+                valid_teacher = (
+                    (teacher_best >= self.patch_teacher_confidence_threshold)
+                    & (teacher_margin >= self.patch_teacher_margin_threshold)
+                )
+                if not valid_teacher.any():
+                    continue
+                teacher_labels = top2.indices[:, 0][valid_teacher]
+
+            query_tokens = descriptor_tokens[batch_idx, query_indices[valid_teacher]]
+            key_tokens = descriptor_tokens[batch_idx, key_indices]
+            logits = torch.matmul(query_tokens, key_tokens.transpose(0, 1))
+            logits = logits / self.patch_teacher_temperature
+            loss_terms.append(F.cross_entropy(logits, teacher_labels))
+            predictions = logits.argmax(dim=-1)
+            supervised_queries += int(valid_teacher.sum().item())
+            correct_matches += int((predictions == teacher_labels).sum().item())
+
+        if not loss_terms:
+            return zero, metrics
+
+        loss = torch.stack(loss_terms).mean()
+        metrics["patch_teacher"] = loss.item()
+        metrics["patch_teacher_accuracy"] = correct_matches / max(supervised_queries, 1)
+        metrics["patch_teacher_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
+        return loss, metrics
+
     def generator_loss(
         self,
         coarse_raw: torch.Tensor,
@@ -207,6 +312,7 @@ class InpaintingLoss(nn.Module):
         coarse_perceptual = self.perceptual_loss(coarse_composite, coarse_target)
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
+        patch_teacher_loss, patch_teacher_metrics = self._patch_teacher_loss(refined_target, attention_aux)
         frequency = self.frequency_loss(refined, refined_target)
         perceptual = self.perceptual_loss(refined, refined_target)
 
@@ -228,6 +334,7 @@ class InpaintingLoss(nn.Module):
             + self.coarse_perceptual_weight * coarse_perceptual
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
+            + self.patch_teacher_weight * patch_teacher_loss
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
@@ -239,6 +346,9 @@ class InpaintingLoss(nn.Module):
             "coarse_perceptual": coarse_perceptual.item(),
             "refined_l1": refined_l1.item(),
             "refined_query_patch_l1": refined_query_patch_l1.item(),
+            "patch_teacher": patch_teacher_metrics["patch_teacher"],
+            "patch_teacher_accuracy": patch_teacher_metrics["patch_teacher_accuracy"],
+            "patch_teacher_supervised_ratio": patch_teacher_metrics["patch_teacher_supervised_ratio"],
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),

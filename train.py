@@ -275,6 +275,12 @@ def format_train_metric_snapshot(metrics):
     )
     if "refined_query_patch_l1" in metrics:
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
+    if "patch_teacher" in metrics:
+        summary += (
+            f", pt={metrics['patch_teacher']:.4f}"
+            f", pta={metrics['patch_teacher_accuracy']:.3f}"
+            f", pts={metrics['patch_teacher_supervised_ratio']:.3f}"
+        )
     return summary
 
 
@@ -590,6 +596,7 @@ def train(cfg, args):
     progress_bar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
     for step_idx in progress_bar:
         step = step_idx + 1
+        model.generator.set_training_step(step)
         lr_g = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         lr_d = get_lr(
             step,
@@ -712,6 +719,14 @@ def train(cfg, args):
             writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
             if "refined_query_patch_l1" in metrics:
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
+            if "patch_teacher" in metrics:
+                writer.add_scalar("loss/patch_teacher", metrics["patch_teacher"], step)
+                writer.add_scalar("patch_teacher/accuracy", metrics["patch_teacher_accuracy"], step)
+                writer.add_scalar(
+                    "patch_teacher/supervised_ratio",
+                    metrics["patch_teacher_supervised_ratio"],
+                    step,
+                )
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -738,6 +753,8 @@ def train(cfg, args):
                     d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
                     qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
+                    pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
+                    pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     perc=f"{metrics['perceptual']:.4f}",

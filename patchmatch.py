@@ -21,6 +21,7 @@ class MultiHeadAttention(nn.Module):
         attention_top_k: int | None = None,
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
+        attention_gumbel_hard: bool = True,
     ):
         super().__init__()
         self.d_v = int(d_v)
@@ -41,6 +42,7 @@ class MultiHeadAttention(nn.Module):
         self.attention_gumbel_tau = float(attention_gumbel_tau)
         if self.attention_gumbel_tau <= 0:
             raise ValueError("attention_gumbel_tau must be positive.")
+        self.attention_gumbel_hard = bool(attention_gumbel_hard)
         self.w_qs = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_ks = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(self.d_v, self.n_head * self.d_v, bias=False)
@@ -90,7 +92,7 @@ class MultiHeadAttention(nn.Module):
                 return F.gumbel_softmax(
                     attn_logits,
                     tau=self.attention_gumbel_tau,
-                    hard=True,
+                    hard=self.attention_gumbel_hard,
                     dim=-1,
                 )
             return self._hard_attention_from_logits(attn_logits)
@@ -148,9 +150,16 @@ class PatchInpainting(nn.Module):
         attention_top_k: int | None = None,
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
+        attention_gumbel_hard: bool = True,
+        attention_warmup_selection: str | None = None,
+        attention_warmup_steps: int = 0,
+        attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
+        normalize_matching_branches: bool = False,
+        learnable_matching_branch_scales: bool = False,
+        coarse_rgb_branch_dropout: float = 0.0,
         value_source: str = "rgb",
         fusion_mode: str = "replace",
         fusion_hidden_channels: int = 32,
@@ -185,6 +194,11 @@ class PatchInpainting(nn.Module):
         )
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
+        self.normalize_matching_branches = bool(normalize_matching_branches)
+        self.learnable_matching_branch_scales = bool(learnable_matching_branch_scales)
+        self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
+        if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
+            raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
         self.value_source = str(value_source).lower()
         if self.value_source not in {"rgb", "high_freq_residual"}:
             raise ValueError("value_source must be either 'rgb' or 'high_freq_residual'.")
@@ -219,9 +233,32 @@ class PatchInpainting(nn.Module):
             else self.matching_descriptor_dim
         )
         self.positional_grid_size = max(1, min(int(positional_grid_size), self.token_grid_size))
+        self.base_attention_selection = str(attention_selection).lower()
+        self.attention_warmup_selection = (
+            None if attention_warmup_selection is None else str(attention_warmup_selection).lower()
+        )
+        if self.attention_warmup_selection not in {None, "softmax", "gumbel", "argmax"}:
+            raise ValueError(
+                "attention_warmup_selection must be one of {None, 'softmax', 'gumbel', 'argmax'}."
+            )
+        self.attention_warmup_steps = max(0, int(attention_warmup_steps))
+        self.attention_gumbel_hard_start_step = max(0, int(attention_gumbel_hard_start_step))
+        self.current_training_step = 0
 
         self.encoder_decoder = model
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
+        self.coarse_rgb_branch_norm = None
+        if self.match_coarse_rgb and self.normalize_matching_branches:
+            self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
+        self.feature_branch_norm = None
+        if self.concat_features and self.normalize_matching_branches:
+            self.feature_branch_norm = nn.GroupNorm(1, self.feature_dim)
+        self.coarse_rgb_branch_scale = None
+        if self.match_coarse_rgb and self.learnable_matching_branch_scales:
+            self.coarse_rgb_branch_scale = nn.Parameter(torch.tensor(1.0))
+        self.feature_branch_scale = None
+        if self.concat_features and self.learnable_matching_branch_scales:
+            self.feature_branch_scale = nn.Parameter(torch.tensor(1.0))
         self.matching_descriptor_head = None
         if self.matching_descriptor_dim is not None:
             hidden_dim = max(self.matching_input_dim, self.matching_descriptor_dim)
@@ -248,6 +285,7 @@ class PatchInpainting(nn.Module):
             attention_top_k=attention_top_k,
             attention_selection=attention_selection,
             attention_gumbel_tau=float(attention_gumbel_tau),
+            attention_gumbel_hard=attention_gumbel_hard,
         )
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
@@ -316,6 +354,60 @@ class PatchInpainting(nn.Module):
             self._compute_unfolding_weights(self.kernel_size, 1),
             persistent=False,
         )
+        self._apply_attention_schedule()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._apply_attention_schedule()
+        return self
+
+    def set_training_step(self, step: int):
+        self.current_training_step = max(0, int(step))
+        self._apply_attention_schedule()
+
+    def _apply_attention_schedule(self):
+        if not self.training:
+            self.multihead_attention.attention_selection = self.base_attention_selection
+            self.multihead_attention.attention_gumbel_hard = True
+            return
+
+        if (
+            self.attention_warmup_selection is not None
+            and self.current_training_step < self.attention_warmup_steps
+        ):
+            self.multihead_attention.attention_selection = self.attention_warmup_selection
+            self.multihead_attention.attention_gumbel_hard = False
+            return
+
+        self.multihead_attention.attention_selection = self.base_attention_selection
+        if self.base_attention_selection == "gumbel":
+            self.multihead_attention.attention_gumbel_hard = (
+                self.current_training_step >= self.attention_gumbel_hard_start_step
+            )
+        else:
+            self.multihead_attention.attention_gumbel_hard = True
+
+    def _apply_branch_dropout(self, branch: torch.Tensor, drop_prob: float) -> torch.Tensor:
+        if (not self.training) or drop_prob <= 0:
+            return branch
+        keep_prob = 1.0 - drop_prob
+        mask = branch.new_empty((branch.shape[0], 1, 1, 1)).bernoulli_(keep_prob)
+        mask = mask / max(keep_prob, 1e-8)
+        return branch * mask
+
+    def _prepare_matching_branch(
+        self,
+        branch: torch.Tensor,
+        *,
+        norm: nn.Module | None,
+        scale: torch.Tensor | None,
+        drop_prob: float,
+    ) -> torch.Tensor:
+        if norm is not None:
+            branch = norm(branch)
+        if scale is not None:
+            branch = branch * scale.to(dtype=branch.dtype, device=branch.device)
+        return self._apply_branch_dropout(branch, drop_prob)
 
     def _compute_unfolding_weights(self, kernel_size: int, channels: int) -> torch.Tensor:
         weights = torch.eye(kernel_size * kernel_size, dtype=torch.float32)
@@ -586,6 +678,12 @@ class PatchInpainting(nn.Module):
         token_inputs = []
         if self.match_coarse_rgb:
             coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
+            coarse_match_map = self._prepare_matching_branch(
+                coarse_match_map,
+                norm=self.coarse_rgb_branch_norm,
+                scale=self.coarse_rgb_branch_scale,
+                drop_prob=self.coarse_rgb_branch_dropout,
+            )
             token_inputs.append(coarse_match_map)
         if self.concat_features:
             coarse_features = F.interpolate(
@@ -594,13 +692,20 @@ class PatchInpainting(nn.Module):
                 mode="bilinear",
                 align_corners=False,
             )
+            coarse_features = self._prepare_matching_branch(
+                coarse_features,
+                norm=self.feature_branch_norm,
+                scale=self.feature_branch_scale,
+                drop_prob=0.0,
+            )
             token_inputs.append(coarse_features)
 
         token_map = token_inputs[0] if len(token_inputs) == 1 else torch.cat(token_inputs, dim=1)
         if self.matching_descriptor_head is not None:
             token_map = self.matching_descriptor_head(token_map)
 
-        input_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
+        matching_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
+        input_tokens = matching_tokens
         positional_encoding = self.get_positional_encoding()
         if positional_encoding is not None:
             input_tokens = input_tokens + positional_encoding
@@ -655,7 +760,11 @@ class PatchInpainting(nn.Module):
         if return_aux:
             aux = {
                 "query_mask_flat": query_mask_flat,
+                "key_valid_flat": key_valid_flat,
                 "kernel_size": self.kernel_size,
+                "value_patch_size": self.value_patch_size,
+                "value_patch_padding": self.value_patch_padding,
+                "matching_tokens": matching_tokens,
             }
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw
