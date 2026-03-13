@@ -271,6 +271,10 @@ class PatchInpainting(nn.Module):
             if self.concat_features:
                 self.query_matching_input_dim += self.feature_dim
             self.key_matching_input_dim = self.query_patch_dim + self.key_context_channels
+            if self.match_coarse_rgb:
+                self.key_matching_input_dim += self.query_patch_dim
+            if self.concat_features:
+                self.key_matching_input_dim += self.feature_dim
         self.patch_token_dim = (
             max(self.query_matching_input_dim, self.key_matching_input_dim)
             if self.matching_descriptor_dim is None
@@ -313,28 +317,18 @@ class PatchInpainting(nn.Module):
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
-            self.query_descriptor_head = self._build_projection_head(
+            self.query_descriptor_head = self._build_matching_descriptor_head(
                 self.query_matching_input_dim,
                 self.patch_token_dim,
             )
-            self.key_descriptor_head = self._build_projection_head(
+            self.key_descriptor_head = self._build_matching_descriptor_head(
                 self.key_matching_input_dim,
                 self.patch_token_dim,
             )
         elif self.matching_descriptor_dim is not None:
-            hidden_dim = max(self.matching_input_dim, self.matching_descriptor_dim)
-            self.matching_descriptor_head = nn.Sequential(
-                nn.Conv2d(
-                    self.matching_input_dim,
-                    hidden_dim,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                    bias=False,
-                ),
-                nn.GELU(),
-                nn.Conv2d(hidden_dim, self.matching_descriptor_dim, kernel_size=1, stride=1, bias=False),
+            self.matching_descriptor_head = self._build_matching_descriptor_head(
+                self.matching_input_dim,
+                self.matching_descriptor_dim,
             )
         if self.query_image_context_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
@@ -506,6 +500,22 @@ class PatchInpainting(nn.Module):
         hidden_dim = output_dim
         return nn.Sequential(
             nn.Conv2d(input_dim, hidden_dim, kernel_size=1, stride=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(hidden_dim, output_dim, kernel_size=1, stride=1, bias=False),
+        )
+
+    def _build_matching_descriptor_head(self, input_dim: int, output_dim: int) -> nn.Sequential:
+        hidden_dim = max(input_dim, output_dim)
+        return nn.Sequential(
+            nn.Conv2d(
+                input_dim,
+                hidden_dim,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode="reflect",
+                bias=False,
+            ),
             nn.GELU(),
             nn.Conv2d(hidden_dim, output_dim, kernel_size=1, stride=1, bias=False),
         )
@@ -819,6 +829,10 @@ class PatchInpainting(nn.Module):
                 query_token_inputs.append(coarse_features)
 
             key_token_inputs = [key_context_map, visible_patch_map]
+            if self.match_coarse_rgb:
+                key_token_inputs.append(coarse_match_map)
+            if self.concat_features:
+                key_token_inputs.append(coarse_features)
             query_token_map = torch.cat(query_token_inputs, dim=1)
             key_token_map = torch.cat(key_token_inputs, dim=1)
             query_token_map = self.query_descriptor_head(query_token_map)
