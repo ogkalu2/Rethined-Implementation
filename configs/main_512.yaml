@@ -68,8 +68,8 @@ loss:
   refined_perceptual_mask_dilation: 9
   adversarial_weight: 0.02
   adversarial_mode: "hinge"
-  focal_alpha: 0.5
-  focal_log_matrix: true
+  focal_alpha: 1.0
+  focal_log_matrix: false
 
 discriminator:
   in_channels: 3
