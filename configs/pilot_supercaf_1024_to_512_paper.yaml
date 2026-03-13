@@ -80,7 +80,7 @@ loss:
   attention_coherence_start_step: 750
   attention_coherence_full_step: 1750
   adversarial_mode: "hinge"
-  focal_alpha: 0.5
+  focal_alpha: 1.0
   focal_log_matrix: true
 
 discriminator:
