@@ -29,7 +29,7 @@ model:
     embed_dim: 2048
     use_positional_encoding: true
     dropout: 0.1
-    feature_i: 2
+    feature_i: 3
     feature_dim: null
     concat_features: true
     detach_coarse_rgb: false
