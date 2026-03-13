@@ -16,7 +16,7 @@ model:
     attention_selection: "gumbel"
     attention_gumbel_tau: 1.0
     matching_descriptor_dim: 256
-    match_coarse_rgb: false
+    match_coarse_rgb: true
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
