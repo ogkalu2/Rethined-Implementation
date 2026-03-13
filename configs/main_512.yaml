@@ -20,7 +20,7 @@ model:
     match_coarse_rgb: true
     normalize_matching_branches: true
     learnable_matching_branch_scales: true
-    coarse_rgb_branch_dropout: 0.15
+    coarse_rgb_branch_dropout: 0
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
