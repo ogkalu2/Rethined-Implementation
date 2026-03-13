@@ -265,7 +265,7 @@ def build_checkpoint_metrics(train_metrics, best_metric_name, best_metric_mode, 
 
 
 def format_train_metric_snapshot(metrics):
-    return (
+    summary = (
         f"train g={metrics['generator_total']:.4f}, "
         f"d={metrics['discriminator_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
@@ -273,6 +273,13 @@ def format_train_metric_snapshot(metrics):
         f"ff={metrics['frequency']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
+    if "attention_supervision" in metrics:
+        summary += f", as={metrics['attention_supervision']:.3f}"
+    if "attention_candidate_match" in metrics:
+        summary += f", am={metrics['attention_candidate_match']:.3f}"
+    if "attention_offset_coherence" in metrics:
+        summary += f", coh={metrics['attention_offset_coherence']:.3f}"
+    return summary
 
 
 def save_vis(writer, batch, coarse, refined, step, log_dir=None):
@@ -624,10 +631,11 @@ def train(cfg, args):
             refine_target = batch_views["refine_target"]
 
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
-                refined_raw, attn_map, coarse_raw = model(
+                refined_raw, attn_map, coarse_raw, attention_aux = model(
                     masked_image,
                     mask,
                     value_image=refine_target,
+                    return_aux=True,
                 )
                 refined_vis = refined_raw.clamp(0, 1) 
                 coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
@@ -653,6 +661,7 @@ def train(cfg, args):
                     refine_target,
                     mask,
                     fake_logits_g,
+                    attention_aux=attention_aux,
                 )
 
             if not torch.isfinite(g_loss):
@@ -718,6 +727,12 @@ def train(cfg, args):
             writer.add_scalar("attention/top4", metrics["attention_top4"], step)
             writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
             writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
+            if "attention_supervision" in metrics:
+                writer.add_scalar("attention/supervision", metrics["attention_supervision"], step)
+            if "attention_candidate_match" in metrics:
+                writer.add_scalar("attention/candidate_match", metrics["attention_candidate_match"], step)
+            if "attention_offset_coherence" in metrics:
+                writer.add_scalar("attention/offset_coherence", metrics["attention_offset_coherence"], step)
             writer.add_scalar("lr/generator", lr_g, step)
             writer.add_scalar("lr/discriminator", lr_d, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
@@ -731,7 +746,10 @@ def train(cfg, args):
                     d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
                     a1=f"{metrics['attention_top1']:.3f}",
+                    as_=(f"{metrics['attention_supervision']:.3f}" if "attention_supervision" in metrics else "n/a"),
+                    am=(f"{metrics['attention_candidate_match']:.3f}" if "attention_candidate_match" in metrics else "n/a"),
                     ff=f"{metrics['frequency']:.4f}",
+                    coh=(f"{metrics['attention_offset_coherence']:.3f}" if "attention_offset_coherence" in metrics else "n/a"),
                     perc=f"{metrics['perceptual']:.4f}",
                     refresh=False,
                 )

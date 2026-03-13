@@ -10,9 +10,10 @@ model:
     value_patch_size: 8
     value_source: "rgb"
     attention_temperature: 0.5
-    attention_top_k: 8
+    attention_top_k: 32
     attention_selection: "gumbel"
     attention_gumbel_tau: 1.0
+    matching_descriptor_dim: 256
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
@@ -20,7 +21,7 @@ model:
     embed_dim: 2048
     use_positional_encoding: true
     dropout: 0.1
-    feature_i: 2
+    feature_i: 3
     feature_dim: null
     concat_features: true
     detach_coarse_rgb: false
@@ -63,6 +64,9 @@ loss:
   frequency_weight: 0.5
   perceptual_weight: 0.1
   adversarial_weight: 0.02
+  attention_supervision_weight: 0.05
+  attention_supervision_temperature: 0.15
+  attention_coherence_weight: 0.01
   adversarial_mode: "hinge"
   focal_alpha: 1.0
   focal_log_matrix: false
