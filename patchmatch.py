@@ -174,9 +174,12 @@ class PatchInpainting(nn.Module):
         coarse_rgb_branch_dropout: float = 0.0,
         query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
+        shared_query_key_descriptor: bool = False,
         query_context_channels: int = 32,
         key_context_channels: int = 32,
         query_context_residual_init: float = 0.0,
+        key_coarse_rgb_residual_init: float = 0.0,
+        key_feature_residual_init: float = 0.0,
         value_source: str = "rgb",
         fusion_mode: str = "replace",
         fusion_hidden_channels: int = 32,
@@ -216,9 +219,12 @@ class PatchInpainting(nn.Module):
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
         self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
+        self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
         self.query_context_channels = int(query_context_channels)
         self.key_context_channels = int(key_context_channels)
         self.query_context_residual_init = float(query_context_residual_init)
+        self.key_coarse_rgb_residual_init = float(key_coarse_rgb_residual_init)
+        self.key_feature_residual_init = float(key_feature_residual_init)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
         if self.query_image_context_matching and self.separate_query_key_matching:
@@ -230,6 +236,10 @@ class PatchInpainting(nn.Module):
                 raise ValueError("query_context_channels must be positive when separate_query_key_matching=True.")
             if self.key_context_channels <= 0:
                 raise ValueError("key_context_channels must be positive when separate_query_key_matching=True.")
+            if self.shared_query_key_descriptor and self.query_context_channels != self.key_context_channels:
+                raise ValueError(
+                    "query_context_channels and key_context_channels must match when shared_query_key_descriptor=True."
+                )
         elif self.query_image_context_matching and self.query_context_channels <= 0:
             raise ValueError(
                 "query_context_channels must be positive when query_image_context_matching=True."
@@ -299,6 +309,9 @@ class PatchInpainting(nn.Module):
         self.key_context_encoder = None
         self.query_context_descriptor_head = None
         self.query_context_scale = None
+        self.key_coarse_rgb_scale = None
+        self.key_feature_scale = None
+        self.shared_query_key_descriptor_head = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -317,14 +330,25 @@ class PatchInpainting(nn.Module):
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
-            self.query_descriptor_head = self._build_matching_descriptor_head(
-                self.query_matching_input_dim,
-                self.patch_token_dim,
-            )
-            self.key_descriptor_head = self._build_matching_descriptor_head(
-                self.key_matching_input_dim,
-                self.patch_token_dim,
-            )
+            if self.match_coarse_rgb:
+                self.key_coarse_rgb_scale = nn.Parameter(torch.tensor(self.key_coarse_rgb_residual_init))
+            if self.concat_features:
+                self.key_feature_scale = nn.Parameter(torch.tensor(self.key_feature_residual_init))
+            if self.shared_query_key_descriptor:
+                self.shared_query_key_descriptor_head = self._build_matching_descriptor_head(
+                    self.query_matching_input_dim,
+                    self.patch_token_dim,
+                    hidden_dim=max(self.matching_input_dim, self.patch_token_dim),
+                )
+            else:
+                self.query_descriptor_head = self._build_matching_descriptor_head(
+                    self.query_matching_input_dim,
+                    self.patch_token_dim,
+                )
+                self.key_descriptor_head = self._build_matching_descriptor_head(
+                    self.key_matching_input_dim,
+                    self.patch_token_dim,
+                )
         elif self.matching_descriptor_dim is not None:
             self.matching_descriptor_head = self._build_matching_descriptor_head(
                 self.matching_input_dim,
@@ -504,8 +528,13 @@ class PatchInpainting(nn.Module):
             nn.Conv2d(hidden_dim, output_dim, kernel_size=1, stride=1, bias=False),
         )
 
-    def _build_matching_descriptor_head(self, input_dim: int, output_dim: int) -> nn.Sequential:
-        hidden_dim = max(input_dim, output_dim)
+    def _build_matching_descriptor_head(
+        self,
+        input_dim: int,
+        output_dim: int,
+        hidden_dim: int | None = None,
+    ) -> nn.Sequential:
+        hidden_dim = max(input_dim, output_dim) if hidden_dim is None else int(hidden_dim)
         return nn.Sequential(
             nn.Conv2d(
                 input_dim,
@@ -830,13 +859,17 @@ class PatchInpainting(nn.Module):
 
             key_token_inputs = [key_context_map, visible_patch_map]
             if self.match_coarse_rgb:
-                key_token_inputs.append(coarse_match_map)
+                key_token_inputs.append(self.key_coarse_rgb_scale * coarse_match_map)
             if self.concat_features:
-                key_token_inputs.append(coarse_features)
+                key_token_inputs.append(self.key_feature_scale * coarse_features)
             query_token_map = torch.cat(query_token_inputs, dim=1)
             key_token_map = torch.cat(key_token_inputs, dim=1)
-            query_token_map = self.query_descriptor_head(query_token_map)
-            key_token_map = self.key_descriptor_head(key_token_map)
+            if self.shared_query_key_descriptor:
+                query_token_map = self.shared_query_key_descriptor_head(query_token_map)
+                key_token_map = self.shared_query_key_descriptor_head(key_token_map)
+            else:
+                query_token_map = self.query_descriptor_head(query_token_map)
+                key_token_map = self.key_descriptor_head(key_token_map)
             query_matching_tokens = query_token_map.flatten(start_dim=2).transpose(1, 2)
             key_matching_tokens = key_token_map.flatten(start_dim=2).transpose(1, 2)
             query_tokens = query_matching_tokens
