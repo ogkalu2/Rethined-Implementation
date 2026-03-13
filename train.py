@@ -275,14 +275,6 @@ def format_train_metric_snapshot(metrics):
     )
     if "refined_query_patch_l1" in metrics:
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
-    if "attention_supervision" in metrics:
-        summary += f", as={metrics['attention_supervision']:.3f}"
-    if "attention_supervision_coverage" in metrics:
-        summary += f", cov={metrics['attention_supervision_coverage']:.3f}"
-    if "attention_candidate_match" in metrics:
-        summary += f", am={metrics['attention_candidate_match']:.3f}"
-    if "attention_offset_coherence" in metrics:
-        summary += f", coh={metrics['attention_offset_coherence']:.3f}"
     return summary
 
 
@@ -666,7 +658,6 @@ def train(cfg, args):
                     mask,
                     fake_logits_g,
                     attention_aux=attention_aux,
-                    step=step,
                 )
 
             if not torch.isfinite(g_loss):
@@ -734,18 +725,6 @@ def train(cfg, args):
             writer.add_scalar("attention/top4", metrics["attention_top4"], step)
             writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
             writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
-            if "attention_supervision" in metrics:
-                writer.add_scalar("attention/supervision", metrics["attention_supervision"], step)
-            if "attention_supervision_coverage" in metrics:
-                writer.add_scalar("attention/supervision_coverage", metrics["attention_supervision_coverage"], step)
-            if "attention_candidate_match" in metrics:
-                writer.add_scalar("attention/candidate_match", metrics["attention_candidate_match"], step)
-            if "attention_offset_coherence" in metrics:
-                writer.add_scalar("attention/offset_coherence", metrics["attention_offset_coherence"], step)
-            if "attention_supervision_weight" in metrics:
-                writer.add_scalar("attention/supervision_weight", metrics["attention_supervision_weight"], step)
-            if "attention_coherence_weight" in metrics:
-                writer.add_scalar("attention/coherence_weight", metrics["attention_coherence_weight"], step)
             writer.add_scalar("lr/generator", lr_g, step)
             writer.add_scalar("lr/discriminator", lr_d, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
@@ -760,11 +739,7 @@ def train(cfg, args):
                     l1=f"{metrics['refined_l1']:.4f}",
                     qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
-                    as_=(f"{metrics['attention_supervision']:.3f}" if "attention_supervision" in metrics else "n/a"),
-                    cov=(f"{metrics['attention_supervision_coverage']:.3f}" if "attention_supervision_coverage" in metrics else "n/a"),
-                    am=(f"{metrics['attention_candidate_match']:.3f}" if "attention_candidate_match" in metrics else "n/a"),
                     ff=f"{metrics['frequency']:.4f}",
-                    coh=(f"{metrics['attention_offset_coherence']:.3f}" if "attention_offset_coherence" in metrics else "n/a"),
                     perc=f"{metrics['perceptual']:.4f}",
                     refresh=False,
                 )

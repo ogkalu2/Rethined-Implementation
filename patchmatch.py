@@ -19,7 +19,6 @@ class MultiHeadAttention(nn.Module):
         d_qk: int,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
-        attention_supervision_top_k: int | None = None,
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
     ):
@@ -34,11 +33,6 @@ class MultiHeadAttention(nn.Module):
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
         if self.attention_top_k is not None and self.attention_top_k <= 0:
             self.attention_top_k = None
-        self.attention_supervision_top_k = (
-            None if attention_supervision_top_k is None else int(attention_supervision_top_k)
-        )
-        if self.attention_supervision_top_k is not None and self.attention_supervision_top_k <= 0:
-            self.attention_supervision_top_k = None
         self.attention_selection = str(attention_selection).lower()
         if self.attention_selection not in {"softmax", "gumbel", "argmax"}:
             raise ValueError(
@@ -102,15 +96,6 @@ class MultiHeadAttention(nn.Module):
             return self._hard_attention_from_logits(attn_logits)
         return self._hard_attention_from_logits(attn_logits)
 
-    def _collect_candidate_details(self, attn_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        top_k = attn_logits.shape[-1]
-        if self.attention_supervision_top_k is not None:
-            top_k = min(self.attention_supervision_top_k, attn_logits.shape[-1])
-        elif self.attention_top_k is not None:
-            top_k = min(self.attention_top_k, attn_logits.shape[-1])
-        candidate_logits, candidate_indices = torch.topk(attn_logits, k=top_k, dim=-1)
-        return candidate_logits, candidate_indices
-
     def forward(
         self,
         q: torch.Tensor,
@@ -120,8 +105,7 @@ class MultiHeadAttention(nn.Module):
         post_softmax_mask: torch.Tensor | None = None,
         direct_patch_mixing: bool = False,
         query_mask_flat: torch.Tensor | None = None,
-        return_candidate_details: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
         q_proj = self.w_qs(q).view(batch_size, len_q, self.n_head, self.d_k).transpose(1, 2)
         k_proj = self.w_ks(k).view(batch_size, len_k, self.n_head, self.d_k).transpose(1, 2)
@@ -140,14 +124,6 @@ class MultiHeadAttention(nn.Module):
         if post_softmax_mask is not None:
             attn_logits_raw = attn_logits_raw.masked_fill(post_softmax_mask == 0, torch.finfo(attn_logits_raw.dtype).min)
 
-        candidate_details = None
-        if return_candidate_details:
-            candidate_logits, candidate_indices = self._collect_candidate_details(attn_logits_raw)
-            candidate_details = {
-                "candidate_logits": candidate_logits,
-                "candidate_indices": candidate_indices,
-            }
-
         attn = self._restrict_attention_logits(attn_logits_raw, query_mask_flat)
         attn = self._normalize_attention_logits(attn).to(v.dtype)
         # Direct patch mixing behaves like weighted image reconstruction, so dropping
@@ -159,8 +135,6 @@ class MultiHeadAttention(nn.Module):
         output = mixed.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
         if not direct_patch_mixing:
             output = self.fc(output)
-        if return_candidate_details:
-            return output, attn, candidate_details
         return output, attn
 
 
@@ -172,7 +146,6 @@ class PatchInpainting(nn.Module):
         value_patch_size: int | None = None,
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
-        attention_supervision_top_k: int | None = None,
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
         matching_descriptor_dim: int | None = None,
@@ -273,7 +246,6 @@ class PatchInpainting(nn.Module):
             d_qk=int(embed_dim),
             attention_temperature=float(attention_temperature),
             attention_top_k=attention_top_k,
-            attention_supervision_top_k=attention_supervision_top_k,
             attention_selection=attention_selection,
             attention_gumbel_tau=float(attention_gumbel_tau),
         )
@@ -474,28 +446,17 @@ class PatchInpainting(nn.Module):
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_patches, _ = input_tokens.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
         eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
         dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
         valid_keys = key_valid_flat > 0.5
-        matching_candidates: list[dict[str, torch.Tensor]] = []
 
         for batch_idx in range(batch_size):
             query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
-            batch_detail = {
-                "query_indices": query_indices,
-                "candidate_key_indices": torch.empty(
-                    (query_indices.numel(), 0),
-                    device=patch_values.device,
-                    dtype=torch.long,
-                ),
-                "candidate_logits": patch_values.new_empty((query_indices.numel(), 0)),
-            }
             if query_indices.numel() == 0:
-                matching_candidates.append(batch_detail)
                 continue
 
             key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
@@ -504,27 +465,20 @@ class PatchInpainting(nn.Module):
                 query_tokens = input_tokens[batch_idx : batch_idx + 1, query_indices]
                 key_tokens = input_tokens[batch_idx : batch_idx + 1, key_indices]
                 value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
-                mixed_queries, masked_attention, candidate_details = self.multihead_attention(
+                mixed_queries, masked_attention = self.multihead_attention(
                     query_tokens,
                     key_tokens,
                     value_tokens,
                     direct_patch_mixing=True,
-                    return_candidate_details=True,
                 )
                 mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
                 masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
-                local_candidate_indices = candidate_details["candidate_indices"].squeeze(0).squeeze(0)
-                candidate_logits = candidate_details["candidate_logits"].squeeze(0).squeeze(0)
-                global_candidate_indices = key_indices.index_select(0, local_candidate_indices.reshape(-1))
-                batch_detail["candidate_key_indices"] = global_candidate_indices.view_as(local_candidate_indices)
-                batch_detail["candidate_logits"] = candidate_logits
                 mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
                 replacement_rows[:, key_indices] = masked_attention
 
             dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
-            matching_candidates.append(batch_detail)
 
-        return mixed, dense_attn, {"matching_candidates": matching_candidates}
+        return mixed, dense_attn
 
     def build_paper_attention_mask(
         self,
@@ -654,11 +608,10 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
-        attention_aux = None
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
         if self.attention_masking:
-            mixed_patches_flat, masked_attention, attention_aux = self.direct_patch_mix_masked_queries(
+            mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
                 input_tokens,
                 patch_values,
                 query_mask_flat,
@@ -702,13 +655,7 @@ class PatchInpainting(nn.Module):
         if return_aux:
             aux = {
                 "query_mask_flat": query_mask_flat,
-                "key_valid_flat": key_valid_flat,
-                "token_grid_size": self.token_grid_size,
                 "kernel_size": self.kernel_size,
-                "value_patch_size": self.value_patch_size,
-                "value_patch_padding": self.value_patch_padding,
             }
-            if attention_aux is not None:
-                aux.update(attention_aux)
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw

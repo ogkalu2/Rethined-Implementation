@@ -11,7 +11,6 @@ model:
     value_source: "rgb"
     attention_temperature: 0.5
     attention_top_k: 32
-    attention_supervision_top_k: 128
     attention_selection: "gumbel"
     attention_gumbel_tau: 1.0
     matching_descriptor_dim: 256
@@ -68,17 +67,6 @@ loss:
   perceptual_weight: 0.1
   refined_perceptual_mask_dilation: 9
   adversarial_weight: 0.02
-  attention_supervision_weight: 0
-  attention_supervision_temperature: 0.15
-  attention_supervision_hard_targets: true
-  attention_supervision_confidence_threshold: 0.12
-  attention_supervision_margin_threshold: 0.02
-  attention_supervision_start_step: 3000
-  attention_supervision_full_step: 12000
-  attention_coherence_weight: 0
-  attention_coherence_similarity_threshold: 0.55
-  attention_coherence_start_step: 9000
-  attention_coherence_full_step: 24000
   adversarial_mode: "hinge"
   focal_alpha: 0.5
   focal_log_matrix: true
