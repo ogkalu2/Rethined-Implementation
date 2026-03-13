@@ -748,16 +748,15 @@ def train(cfg, args):
             write_status(log_cfg["log_dir"], step, total_steps, metrics, lr_g)
             if log_cfg.get("print_train_metrics", False):
                 progress_bar.set_postfix(
-                    step=step,
                     g=f"{metrics['generator_total']:.4f}",
                     d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
                     qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
                     pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
                     pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
+                    pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
-                    perc=f"{metrics['perceptual']:.4f}",
                     refresh=False,
                 )
 
