@@ -19,8 +19,8 @@ model:
     attention_gumbel_hard_start_step: 1500
     matching_descriptor_dim: 256
     match_coarse_rgb: true
-    normalize_matching_branches: true
-    learnable_matching_branch_scales: true
+    normalize_matching_branches: false
+    learnable_matching_branch_scales: false
     coarse_rgb_branch_dropout: 0
     nheads: 1
     stem_out_stride: 1
