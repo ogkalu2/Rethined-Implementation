@@ -172,9 +172,11 @@ class PatchInpainting(nn.Module):
         normalize_matching_branches: bool = False,
         learnable_matching_branch_scales: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
+        query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
         query_context_channels: int = 32,
         key_context_channels: int = 32,
+        query_context_residual_init: float = 0.0,
         value_source: str = "rgb",
         fusion_mode: str = "replace",
         fusion_hidden_channels: int = 32,
@@ -212,16 +214,26 @@ class PatchInpainting(nn.Module):
         self.normalize_matching_branches = bool(normalize_matching_branches)
         self.learnable_matching_branch_scales = bool(learnable_matching_branch_scales)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
+        self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.query_context_channels = int(query_context_channels)
         self.key_context_channels = int(key_context_channels)
+        self.query_context_residual_init = float(query_context_residual_init)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
+        if self.query_image_context_matching and self.separate_query_key_matching:
+            raise ValueError(
+                "query_image_context_matching and separate_query_key_matching cannot both be enabled."
+            )
         if self.separate_query_key_matching:
             if self.query_context_channels <= 0:
                 raise ValueError("query_context_channels must be positive when separate_query_key_matching=True.")
             if self.key_context_channels <= 0:
                 raise ValueError("key_context_channels must be positive when separate_query_key_matching=True.")
+        elif self.query_image_context_matching and self.query_context_channels <= 0:
+            raise ValueError(
+                "query_context_channels must be positive when query_image_context_matching=True."
+            )
         self.value_source = str(value_source).lower()
         if self.value_source not in {"rgb", "high_freq_residual"}:
             raise ValueError("value_source must be either 'rgb' or 'high_freq_residual'.")
@@ -281,6 +293,8 @@ class PatchInpainting(nn.Module):
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.query_context_encoder = None
         self.key_context_encoder = None
+        self.query_context_descriptor_head = None
+        self.query_context_scale = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -322,6 +336,13 @@ class PatchInpainting(nn.Module):
                 nn.GELU(),
                 nn.Conv2d(hidden_dim, self.matching_descriptor_dim, kernel_size=1, stride=1, bias=False),
             )
+        if self.query_image_context_matching:
+            self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
+            self.query_context_descriptor_head = self._build_projection_head(
+                self.query_context_channels + self.query_patch_dim,
+                self.patch_token_dim,
+            )
+            self.query_context_scale = nn.Parameter(torch.tensor(self.query_context_residual_init))
         self.multihead_attention = MultiHeadAttention(
             embed_dim=self.patch_token_dim,
             d_v=self.value_patch_dim,
@@ -838,6 +859,17 @@ class PatchInpainting(nn.Module):
 
             query_matching_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
             key_matching_tokens = query_matching_tokens
+            if self.query_image_context_matching:
+                visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
+                query_context_map = self._pool_to_token_grid(
+                    self.query_context_encoder(torch.cat([image, mask], dim=1)),
+                    patch_map.shape[-2:],
+                )
+                query_context_map = torch.cat([query_context_map, visible_patch_map], dim=1)
+                query_context_map = self.query_context_descriptor_head(query_context_map)
+                query_context_tokens = query_context_map.flatten(start_dim=2).transpose(1, 2)
+                query_matching_tokens = query_matching_tokens + self.query_context_scale * query_context_tokens
+
             query_tokens = query_matching_tokens
             key_tokens = key_matching_tokens
 

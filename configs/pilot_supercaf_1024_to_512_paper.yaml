@@ -22,8 +22,10 @@ model:
     normalize_matching_branches: false
     learnable_matching_branch_scales: false
     coarse_rgb_branch_dropout: 0
-    separate_query_key_matching: true
+    query_image_context_matching: true
+    separate_query_key_matching: false
     query_context_channels: 32
+    query_context_residual_init: 0.1
     key_context_channels: 32
     nheads: 1
     stem_out_stride: 1
