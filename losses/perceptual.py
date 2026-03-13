@@ -50,12 +50,20 @@ class PerceptualLoss(nn.Module):
         self.vgg = VGGFeatureExtractor()
         self.weights = weights
 
-    def forward(self, pred, target):
+    def forward(self, pred, target, mask=None):
         pred_features = self.vgg(pred)
         with torch.no_grad():
             target_features = self.vgg(target)
 
         loss = 0
         for w, pf, tf in zip(self.weights, pred_features, target_features):
-            loss += w * F.l1_loss(pf, tf)
+            if mask is None:
+                loss += w * F.l1_loss(pf, tf)
+                continue
+
+            feature_mask = F.interpolate(mask.float(), size=pf.shape[-2:], mode="bilinear", align_corners=False)
+            feature_mask = feature_mask.expand(-1, pf.shape[1], -1, -1)
+            diff = (pf - tf).abs() * feature_mask
+            denom = feature_mask.sum(dim=(1, 2, 3)).clamp_min(1e-8)
+            loss += w * (diff.sum(dim=(1, 2, 3)) / denom).mean()
         return loss

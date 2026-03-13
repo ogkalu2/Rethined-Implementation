@@ -111,6 +111,7 @@ class InpaintingLoss(nn.Module):
         refined_query_patch_l1_weight: float = 0.0,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
+        refined_perceptual_mask_dilation: int = 9,
         adversarial_weight: float = 0.02,
         attention_supervision_weight: float = 0.0,
         attention_supervision_temperature: float = 0.15,
@@ -136,6 +137,7 @@ class InpaintingLoss(nn.Module):
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
+        self.refined_perceptual_mask_dilation = int(refined_perceptual_mask_dilation)
         self.adversarial_weight = float(adversarial_weight)
         self.attention_supervision_weight = float(attention_supervision_weight)
         self.attention_supervision_temperature = float(attention_supervision_temperature)
@@ -166,6 +168,8 @@ class InpaintingLoss(nn.Module):
         self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
         self.coarse_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
+        if self.refined_perceptual_mask_dilation <= 0:
+            raise ValueError("refined_perceptual_mask_dilation must be positive.")
 
     def _extract_patch_tokens(
         self,
@@ -474,7 +478,8 @@ class InpaintingLoss(nn.Module):
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         frequency = self.frequency_loss(refined, refined_target)
-        perceptual = self.perceptual_loss(refined, refined_target)
+        refined_perceptual_mask = dilate_mask(mask, kernel_size=self.refined_perceptual_mask_dilation)
+        perceptual = self.perceptual_loss(refined, refined_target, mask=refined_perceptual_mask)
 
         adversarial = refined.new_zeros(())
         if fake_logits is not None:
