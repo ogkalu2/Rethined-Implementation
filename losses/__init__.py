@@ -108,6 +108,7 @@ class InpaintingLoss(nn.Module):
         coarse_gradient_weight: float = 0.0,
         coarse_perceptual_weight: float = 0.05,
         refined_l1_weight: float = 1.0,
+        refined_query_patch_l1_weight: float = 0.0,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.02,
@@ -132,6 +133,7 @@ class InpaintingLoss(nn.Module):
         self.coarse_gradient_weight = float(coarse_gradient_weight)
         self.coarse_perceptual_weight = float(coarse_perceptual_weight)
         self.refined_l1_weight = float(refined_l1_weight)
+        self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -185,6 +187,44 @@ class InpaintingLoss(nn.Module):
 
     def _coords_from_indices(self, indices: torch.Tensor, grid_size: int) -> torch.Tensor:
         return torch.stack((indices // grid_size, indices % grid_size), dim=-1).to(dtype=torch.float32)
+
+    def _query_patch_l1_loss(
+        self,
+        refined: torch.Tensor,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> torch.Tensor:
+        if attention_aux is None:
+            return refined.new_zeros(())
+
+        kernel_size = int(attention_aux.get("kernel_size", 0))
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        if kernel_size <= 0 or query_mask_flat is None:
+            return refined.new_zeros(())
+
+        refined_patches = self._extract_patch_tokens(
+            refined,
+            patch_size=kernel_size,
+            stride=kernel_size,
+            padding=0,
+        )
+        target_patches = self._extract_patch_tokens(
+            refined_target,
+            patch_size=kernel_size,
+            stride=kernel_size,
+            padding=0,
+        )
+        per_patch_l1 = (refined_patches - target_patches).abs().mean(dim=-1)
+        query_mask = query_mask_flat > 0.5
+
+        losses = []
+        for batch_idx in range(per_patch_l1.shape[0]):
+            masked_queries = query_mask[batch_idx]
+            if masked_queries.any():
+                losses.append(per_patch_l1[batch_idx, masked_queries].mean())
+        if not losses:
+            return refined.new_zeros(())
+        return torch.stack(losses).mean()
 
     def _teacher_patch_descriptors(
         self,
@@ -432,6 +472,7 @@ class InpaintingLoss(nn.Module):
         coarse_gradient = masked_gradient_l1_loss(coarse_blurred, target_blurred, coarse_grad_mask)
         coarse_perceptual = self.perceptual_loss(coarse_composite, coarse_target)
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
+        refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         frequency = self.frequency_loss(refined, refined_target)
         perceptual = self.perceptual_loss(refined, refined_target)
 
@@ -460,6 +501,7 @@ class InpaintingLoss(nn.Module):
             + self.coarse_gradient_weight * coarse_gradient
             + self.coarse_perceptual_weight * coarse_perceptual
             + self.refined_l1_weight * refined_l1
+            + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
@@ -472,6 +514,7 @@ class InpaintingLoss(nn.Module):
             "coarse_gradient": coarse_gradient.item(),
             "coarse_perceptual": coarse_perceptual.item(),
             "refined_l1": refined_l1.item(),
+            "refined_query_patch_l1": refined_query_patch_l1.item(),
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),

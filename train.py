@@ -273,6 +273,8 @@ def format_train_metric_snapshot(metrics):
         f"ff={metrics['frequency']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
+    if "refined_query_patch_l1" in metrics:
+        summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
     if "attention_supervision" in metrics:
         summary += f", as={metrics['attention_supervision']:.3f}"
     if "attention_supervision_coverage" in metrics:
@@ -717,6 +719,8 @@ def train(cfg, args):
                 writer.add_scalar("loss/coarse_gradient", metrics["coarse_gradient"], step)
             writer.add_scalar("loss/coarse_perceptual", metrics["coarse_perceptual"], step)
             writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
+            if "refined_query_patch_l1" in metrics:
+                writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -754,6 +758,7 @@ def train(cfg, args):
                     g=f"{metrics['generator_total']:.4f}",
                     d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
+                    qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     as_=(f"{metrics['attention_supervision']:.3f}" if "attention_supervision" in metrics else "n/a"),
                     cov=(f"{metrics['attention_supervision_coverage']:.3f}" if "attention_supervision_coverage" in metrics else "n/a"),
