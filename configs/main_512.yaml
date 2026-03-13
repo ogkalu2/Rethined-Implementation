@@ -65,7 +65,6 @@ loss:
   refined_query_patch_l1_weight: 0.5
   frequency_weight: 0.5
   perceptual_weight: 0.1
-  refined_perceptual_mask_dilation: 9
   adversarial_weight: 0.02
   adversarial_mode: "hinge"
   focal_alpha: 1.0
