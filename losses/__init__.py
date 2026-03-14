@@ -472,9 +472,8 @@ class InpaintingLoss(nn.Module):
             return zero, metrics
 
         query_mask_flat = transport_self_aux.get("query_mask_flat")
-        transport_values = transport_self_aux.get("transport_copy_values")
-        transport_validity = transport_self_aux.get("transport_validity")
-        if query_mask_flat is None or transport_values is None or transport_validity is None:
+        transport_values = transport_self_aux.get("transport_values")
+        if query_mask_flat is None or transport_values is None:
             return zero, metrics
 
         target_patches = self._extract_patch_tokens(
@@ -490,8 +489,7 @@ class InpaintingLoss(nn.Module):
                 per_query = (
                     transport_values[batch_idx, self_queries] - target_patches[batch_idx, self_queries]
                 ).abs().mean(dim=-1)
-                weights = transport_validity[batch_idx, self_queries].detach().float().clamp_min(1e-3)
-                losses.append((per_query * weights).sum() / weights.sum().clamp_min(1e-6))
+                losses.append(per_query.mean())
         if not losses:
             return zero, metrics
 
