@@ -24,6 +24,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_gumbel_hard: bool = True,
         attention_warmup_selection: str | None = None,
         attention_warmup_steps: int = 0,
+        attention_warmup_top_k: int | None = None,
         attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
@@ -53,6 +54,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_masking: bool = True,
         final_conv: bool = False,
         positional_grid_size: int = 32,
+        supervision_band_radius: int = 1,
         use_conv_unfold: bool = False,
         model,
     ):
@@ -150,12 +152,19 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.attention_warmup_selection = (
             None if attention_warmup_selection is None else str(attention_warmup_selection).lower()
         )
+        self.base_attention_top_k = None if attention_top_k is None else int(attention_top_k)
+        if self.base_attention_top_k is not None and self.base_attention_top_k <= 0:
+            self.base_attention_top_k = None
+        self.attention_warmup_top_k = None if attention_warmup_top_k is None else int(attention_warmup_top_k)
+        if self.attention_warmup_top_k is not None and self.attention_warmup_top_k <= 0:
+            self.attention_warmup_top_k = None
         if self.attention_warmup_selection not in {None, "softmax", "gumbel", "argmax"}:
             raise ValueError(
                 "attention_warmup_selection must be one of {None, 'softmax', 'gumbel', 'argmax'}."
             )
         self.attention_warmup_steps = max(0, int(attention_warmup_steps))
         self.attention_gumbel_hard_start_step = max(0, int(attention_gumbel_hard_start_step))
+        self.supervision_band_radius = max(0, int(supervision_band_radius))
         self.current_training_step = 0
 
         self.encoder_decoder = model
@@ -211,7 +220,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             dropout=float(dropout),
             d_qk=int(embed_dim),
             attention_temperature=float(attention_temperature),
-            attention_top_k=attention_top_k,
+            attention_top_k=self.base_attention_top_k,
             attention_selection=attention_selection,
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
@@ -429,6 +438,18 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         query_tokens = self.pre_attention_norm(query_tokens)
         key_tokens = self.pre_attention_norm(key_tokens)
 
+        token_hw = patch_map.shape[-2:]
+        supervision_band_mask_flat = None
+        attention_supervision_entries = None
+        if return_aux:
+            supervision_band_mask_flat, attention_supervision_entries = self.build_attention_supervision_entries(
+                query_tokens,
+                key_tokens,
+                query_mask_flat,
+                key_valid_flat,
+                token_hw,
+            )
+
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
@@ -484,6 +505,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "kernel_size": self.kernel_size,
                 "value_patch_size": self.value_patch_size,
                 "value_patch_padding": self.value_patch_padding,
+                "token_hw": token_hw,
+                "supervision_band_mask_flat": supervision_band_mask_flat,
+                "attention_supervision_entries": attention_supervision_entries,
                 "matching_tokens": query_matching_tokens,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,

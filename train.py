@@ -291,6 +291,10 @@ def format_train_metric_snapshot(metrics):
     )
     if "refined_query_patch_l1" in metrics:
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
+    if "retrieval_recall32" in metrics:
+        summary += f", r32={metrics['retrieval_recall32']:.3f}"
+    if "retrieval_coord_error" in metrics:
+        summary += f", coord={metrics['retrieval_coord_error']:.3f}"
     return summary
 
 
@@ -731,6 +735,14 @@ def train(cfg, args):
             writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
             if "refined_query_patch_l1" in metrics:
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
+            if "retrieval_loss" in metrics:
+                writer.add_scalar("loss/retrieval", metrics["retrieval_loss"], step)
+            if "boundary_identity_loss" in metrics:
+                writer.add_scalar("loss/boundary_identity", metrics["boundary_identity_loss"], step)
+            if "coordinate_loss" in metrics:
+                writer.add_scalar("loss/coordinate", metrics["coordinate_loss"], step)
+            if "coherence_loss" in metrics:
+                writer.add_scalar("loss/coherence", metrics["coherence_loss"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -744,6 +756,16 @@ def train(cfg, args):
             writer.add_scalar("attention/top4", metrics["attention_top4"], step)
             writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
             writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
+            if "retrieval_recall1" in metrics:
+                writer.add_scalar("retrieval/recall1", metrics["retrieval_recall1"], step)
+            if "retrieval_recall8" in metrics:
+                writer.add_scalar("retrieval/recall8", metrics["retrieval_recall8"], step)
+            if "retrieval_recall32" in metrics:
+                writer.add_scalar("retrieval/recall32", metrics["retrieval_recall32"], step)
+            if "retrieval_coord_error" in metrics:
+                writer.add_scalar("retrieval/coord_error", metrics["retrieval_coord_error"], step)
+            if "boundary_identity_acc" in metrics:
+                writer.add_scalar("retrieval/boundary_identity_acc", metrics["boundary_identity_acc"], step)
             writer.add_scalar("lr/generator", lr_g, step)
             writer.add_scalar("lr/discriminator", lr_d, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
@@ -757,6 +779,7 @@ def train(cfg, args):
                     l1=f"{metrics['refined_l1']:.4f}",
                     qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
+                    r32=(f"{metrics['retrieval_recall32']:.3f}" if "retrieval_recall32" in metrics else "n/a"),
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,
                 )

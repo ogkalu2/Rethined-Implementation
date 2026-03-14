@@ -5,10 +5,66 @@ from torch import nn
 from torch.nn import functional as F
 
 
+class LightweightContextBlock(nn.Module):
+    def __init__(self, channels: int, dilation: int):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            channels,
+            channels,
+            kernel_size=3,
+            stride=1,
+            padding=dilation,
+            dilation=dilation,
+            groups=channels,
+            padding_mode="reflect",
+            bias=False,
+        )
+        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1, stride=1, bias=False)
+        self.activation = nn.GELU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        x = self.depthwise(x)
+        x = self.activation(x)
+        x = self.pointwise(x)
+        x = self.activation(x)
+        return residual + x
+
+
+class LightweightContextEncoder(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int):
+        super().__init__()
+        hidden_channels = max(out_channels, 32)
+        self.stem = nn.Sequential(
+            nn.Conv2d(
+                in_channels,
+                hidden_channels,
+                kernel_size=3,
+                stride=1,
+                padding=1,
+                padding_mode="reflect",
+                bias=False,
+            ),
+            nn.GELU(),
+        )
+        self.blocks = nn.Sequential(
+            LightweightContextBlock(hidden_channels, dilation=1),
+            LightweightContextBlock(hidden_channels, dilation=2),
+            LightweightContextBlock(hidden_channels, dilation=4),
+        )
+        self.proj = nn.Conv2d(hidden_channels, out_channels, kernel_size=1, stride=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.blocks(x)
+        return self.proj(x)
+
+
 class PatchmatchHelpersMixin:
     def _apply_attention_schedule(self):
         if not self.training:
             self.multihead_attention.attention_selection = self.base_attention_selection
+            self.multihead_attention.attention_top_k = self.base_attention_top_k
             self.multihead_attention.attention_gumbel_hard = True
             return
 
@@ -17,10 +73,12 @@ class PatchmatchHelpersMixin:
             and self.current_training_step < self.attention_warmup_steps
         ):
             self.multihead_attention.attention_selection = self.attention_warmup_selection
+            self.multihead_attention.attention_top_k = self.attention_warmup_top_k
             self.multihead_attention.attention_gumbel_hard = False
             return
 
         self.multihead_attention.attention_selection = self.base_attention_selection
+        self.multihead_attention.attention_top_k = self.base_attention_top_k
         if self.base_attention_selection == "gumbel":
             self.multihead_attention.attention_gumbel_hard = (
                 self.current_training_step >= self.attention_gumbel_hard_start_step
@@ -45,29 +103,7 @@ class PatchmatchHelpersMixin:
         return self._apply_branch_dropout(branch, drop_prob)
 
     def _build_context_encoder(self, in_channels: int, out_channels: int) -> nn.Sequential:
-        hidden_channels = max(out_channels, 32)
-        return nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                hidden_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                padding_mode="reflect",
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(
-                hidden_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                padding_mode="reflect",
-                bias=False,
-            ),
-            nn.GELU(),
-        )
+        return LightweightContextEncoder(in_channels, out_channels)
 
     def _build_projection_head(self, input_dim: int, output_dim: int) -> nn.Sequential:
         hidden_dim = output_dim
@@ -95,8 +131,56 @@ class PatchmatchHelpersMixin:
                 bias=False,
             ),
             nn.GELU(),
+            LightweightContextBlock(hidden_dim, dilation=2),
             nn.Conv2d(hidden_dim, output_dim, kernel_size=1, stride=1, bias=False),
         )
+
+    def _build_supervision_band_mask(
+        self,
+        query_mask_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        batch_size = query_mask_flat.shape[0]
+        mask_map = query_mask_flat.view(batch_size, 1, token_hw[0], token_hw[1]).to(dtype=torch.float32)
+        radius = max(0, int(self.supervision_band_radius))
+        if radius > 0:
+            kernel_size = 2 * radius + 1
+            mask_map = F.max_pool2d(mask_map, kernel_size=kernel_size, stride=1, padding=radius)
+        return (mask_map > 0.5).flatten(start_dim=1)
+
+    def build_attention_supervision_entries(
+        self,
+        query_tokens: torch.Tensor,
+        key_tokens: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor | tuple[int, int]]]]:
+        band_mask_flat = self._build_supervision_band_mask(query_mask_flat, token_hw)
+        supervision_entries: list[dict[str, torch.Tensor | tuple[int, int]]] = []
+        valid_key_mask = key_valid_flat > 0.5
+
+        for batch_idx in range(query_tokens.shape[0]):
+            query_indices = band_mask_flat[batch_idx].nonzero(as_tuple=False).flatten()
+            key_indices = valid_key_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            entry: dict[str, torch.Tensor | tuple[int, int]] = {
+                "query_indices": query_indices,
+                "key_indices": key_indices,
+                "token_hw": token_hw,
+            }
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                entry["raw_logits"] = query_tokens.new_empty((0, 0), dtype=torch.float32)
+                supervision_entries.append(entry)
+                continue
+
+            raw_logits, _ = self.multihead_attention.compute_attention_logits(
+                query_tokens[batch_idx : batch_idx + 1, query_indices],
+                key_tokens[batch_idx : batch_idx + 1, key_indices],
+            )
+            entry["raw_logits"] = raw_logits.mean(dim=1).squeeze(0)
+            supervision_entries.append(entry)
+
+        return band_mask_flat, supervision_entries
 
     def direct_patch_mix_masked_queries(
         self,
