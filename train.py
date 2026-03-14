@@ -286,6 +286,7 @@ def format_train_metric_snapshot(metrics):
             f", tp={metrics['transport_patch']:.4f}"
             f", tval={metrics['transport_validity']:.4f}"
             f", tvr={metrics['transport_valid_ratio']:.3f}"
+            f", tfr={metrics['transport_fallback_ratio']:.3f}"
             f", tsp={metrics['transport_self_patch']:.4f}"
             f", tsvr={metrics['transport_self_valid_ratio']:.3f}"
             f", tsm={metrics['transport_offset_smoothness']:.4f}"
@@ -749,6 +750,7 @@ def train(cfg, args):
                 writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
                 writer.add_scalar("loss/transport_validity", metrics["transport_validity"], step)
                 writer.add_scalar("transport/valid_ratio", metrics["transport_valid_ratio"], step)
+                writer.add_scalar("transport/fallback_ratio", metrics["transport_fallback_ratio"], step)
                 writer.add_scalar("loss/transport_self_patch", metrics["transport_self_patch"], step)
                 writer.add_scalar("loss/transport_self_validity", metrics["transport_self_validity"], step)
                 writer.add_scalar(
@@ -811,6 +813,7 @@ def train(cfg, args):
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
                     tp=(f"{metrics['transport_patch']:.4f}" if "transport_patch" in metrics else "n/a"),
                     tvr=(f"{metrics['transport_valid_ratio']:.3f}" if "transport_valid_ratio" in metrics else "n/a"),
+                    tfr=(f"{metrics['transport_fallback_ratio']:.3f}" if "transport_fallback_ratio" in metrics else "n/a"),
                     tsp=(f"{metrics['transport_self_patch']:.4f}" if "transport_self_patch" in metrics else "n/a"),
                     tsvr=(f"{metrics['transport_self_valid_ratio']:.3f}" if "transport_self_valid_ratio" in metrics else "n/a"),
                     tsm=(f"{metrics['transport_offset_smoothness']:.4f}" if "transport_offset_smoothness" in metrics else "n/a"),
