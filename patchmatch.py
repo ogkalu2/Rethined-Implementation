@@ -198,6 +198,7 @@ class PatchInpainting(nn.Module):
         transport_refine_steps: int = 2,
         transport_offset_scale: float = 1.0,
         transport_refine_scale: float = 0.25,
+        transport_self_supervision_ratio: float = 0.0,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
@@ -248,6 +249,7 @@ class PatchInpainting(nn.Module):
         self.transport_refine_steps = max(0, int(transport_refine_steps))
         self.transport_offset_scale = float(transport_offset_scale)
         self.transport_refine_scale = float(transport_refine_scale)
+        self.transport_self_supervision_ratio = float(transport_self_supervision_ratio)
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
@@ -272,6 +274,8 @@ class PatchInpainting(nn.Module):
             raise ValueError("transport_offset_scale must be non-negative.")
         if self.transport_refine_scale < 0:
             raise ValueError("transport_refine_scale must be non-negative.")
+        if not 0.0 <= self.transport_self_supervision_ratio <= 1.0:
+            raise ValueError("transport_self_supervision_ratio must be in [0, 1].")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -374,6 +378,7 @@ class PatchInpainting(nn.Module):
         self.matching_descriptor_head = None
         self.transport_init_head = None
         self.transport_refine_head = None
+        self.transport_confidence_head = None
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
@@ -426,6 +431,7 @@ class PatchInpainting(nn.Module):
             transport_refine_in = (self.patch_token_dim * 2) + 4
             self.transport_init_head = self._build_transport_head(transport_init_in, 2)
             self.transport_refine_head = self._build_transport_head(transport_refine_in, 2)
+            self.transport_confidence_head = self._build_transport_head(transport_refine_in, 1)
         self.positionalencoding = (
             nn.Parameter(
                 torch.zeros(
@@ -771,6 +777,130 @@ class PatchInpainting(nn.Module):
             align_corners=True,
         )
 
+    def _sample_transport_self_mask(
+        self,
+        key_valid_flat: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.transport_self_supervision_ratio <= 0:
+            return None
+
+        mask = torch.zeros_like(key_valid_flat)
+        for batch_idx in range(key_valid_flat.shape[0]):
+            valid_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            num_valid = int(valid_indices.numel())
+            if num_valid <= 1:
+                continue
+
+            num_selected = int(round(self.transport_self_supervision_ratio * num_valid))
+            num_selected = max(1, min(num_selected, num_valid - 1))
+            if num_selected <= 0:
+                continue
+
+            choice = torch.randperm(num_valid, device=key_valid_flat.device)[:num_selected]
+            selected_indices = valid_indices[choice]
+            mask[batch_idx, selected_indices] = 1.0
+
+        if (mask > 0.5).any():
+            return mask
+        return None
+
+    def _predict_transport_field(
+        self,
+        query_tokens_full: torch.Tensor,
+        key_tokens_full: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+        *,
+        compute_confidence: bool = False,
+    ) -> dict[str, torch.Tensor | None]:
+        batch_size, _, token_dim = query_tokens_full.shape
+        height, width = token_hw
+        query_token_map = query_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
+        key_token_map = key_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
+        query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
+        valid_key_map = key_valid_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
+        base_coords = self._get_normalized_token_coords(
+            token_hw,
+            dtype=query_token_map.dtype,
+            device=query_token_map.device,
+        ).expand(batch_size, -1, -1, -1)
+
+        init_input = torch.cat([query_token_map, query_mask_map], dim=1)
+        init_offsets = torch.tanh(self.transport_init_head(init_input)) * self.transport_offset_scale
+        coords = torch.clamp(base_coords + init_offsets, -1.0, 1.0)
+
+        sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
+        sampled_validity = self._sample_transport_map(valid_key_map, coords)
+        for _ in range(self.transport_refine_steps):
+            refine_input = torch.cat(
+                [query_token_map, sampled_key_tokens, query_mask_map, sampled_validity, coords],
+                dim=1,
+            )
+            delta = torch.tanh(self.transport_refine_head(refine_input)) * self.transport_refine_scale
+            coords = torch.clamp(coords + delta, -1.0, 1.0)
+            sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
+            sampled_validity = self._sample_transport_map(valid_key_map, coords)
+
+        confidence = None
+        if compute_confidence and self.transport_confidence_head is not None:
+            confidence_input = torch.cat(
+                [query_token_map, sampled_key_tokens, query_mask_map, sampled_validity, coords],
+                dim=1,
+            )
+            confidence = torch.sigmoid(self.transport_confidence_head(confidence_input))
+
+        return {
+            "base_coords": base_coords,
+            "coords": coords,
+            "sampled_key_tokens": sampled_key_tokens,
+            "sampled_validity": sampled_validity,
+            "confidence": confidence,
+        }
+
+    def _build_transport_aux(
+        self,
+        query_tokens_full: torch.Tensor,
+        key_tokens_full: torch.Tensor,
+        source_patch_map: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+        transport_state: dict[str, torch.Tensor | None],
+        *,
+        return_diagnostics: bool,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        coords = transport_state["coords"]
+        base_coords = transport_state["base_coords"]
+        sampled_validity = transport_state["sampled_validity"]
+        confidence = transport_state["confidence"]
+
+        sampled_values = self._sample_transport_map(source_patch_map, coords)
+        sampled_values = sampled_values * sampled_validity.to(dtype=sampled_values.dtype)
+        aux = {
+            "copy_mode": self.copy_mode,
+            "query_mask_flat": query_mask_flat,
+            "key_valid_flat": key_valid_flat,
+            "transport_coords": coords.flatten(start_dim=2).transpose(1, 2),
+            "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
+            "transport_values": sampled_values.flatten(start_dim=2).transpose(1, 2),
+            "transport_validity": sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1),
+        }
+        if confidence is not None:
+            aux["transport_confidence"] = confidence.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
+        if return_diagnostics:
+            backward_state = self._predict_transport_field(
+                key_tokens_full,
+                query_tokens_full,
+                key_valid_flat,
+                torch.ones_like(query_mask_flat),
+                token_hw,
+                compute_confidence=False,
+            )
+            cycle_back_coords = self._sample_transport_map(backward_state["coords"], coords)
+            aux["transport_cycle_back_coords"] = cycle_back_coords.flatten(start_dim=2).transpose(1, 2)
+        return sampled_values, aux
+
     def _build_transport_attention(
         self,
         coords_flat: torch.Tensor,
@@ -848,40 +978,30 @@ class PatchInpainting(nn.Module):
         key_valid_flat: torch.Tensor,
         token_hw: tuple[int, int],
         default_tokens: torch.Tensor | None = None,
+        return_diagnostics: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        batch_size, num_patches, token_dim = query_tokens_full.shape
-        height, width = token_hw
-        query_token_map = query_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
-        key_token_map = key_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
-        query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
-        valid_key_map = key_valid_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
-        base_coords = self._get_normalized_token_coords(
+        batch_size = query_tokens_full.shape[0]
+        transport_state = self._predict_transport_field(
+            query_tokens_full,
+            key_tokens_full,
+            query_mask_flat,
+            key_valid_flat,
             token_hw,
-            dtype=query_token_map.dtype,
-            device=query_token_map.device,
-        ).expand(batch_size, -1, -1, -1)
-
-        init_input = torch.cat([query_token_map, query_mask_map], dim=1)
-        init_offsets = torch.tanh(self.transport_init_head(init_input)) * self.transport_offset_scale
-        coords = torch.clamp(base_coords + init_offsets, -1.0, 1.0)
-
-        sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
-        sampled_validity = self._sample_transport_map(valid_key_map, coords)
-        for _ in range(self.transport_refine_steps):
-            refine_input = torch.cat(
-                [query_token_map, sampled_key_tokens, query_mask_map, sampled_validity, coords],
-                dim=1,
-            )
-            delta = torch.tanh(self.transport_refine_head(refine_input)) * self.transport_refine_scale
-            coords = torch.clamp(coords + delta, -1.0, 1.0)
-            sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
-            sampled_validity = self._sample_transport_map(valid_key_map, coords)
-
-        sampled_values = self._sample_transport_map(source_patch_map, coords)
-        sampled_values = sampled_values * sampled_validity.to(dtype=sampled_values.dtype)
-        sampled_values_flat = sampled_values.flatten(start_dim=2).transpose(1, 2)
-        sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
-        coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
+            compute_confidence=return_diagnostics,
+        )
+        sampled_values, aux = self._build_transport_aux(
+            query_tokens_full,
+            key_tokens_full,
+            source_patch_map,
+            query_mask_flat,
+            key_valid_flat,
+            token_hw,
+            transport_state,
+            return_diagnostics=return_diagnostics,
+        )
+        sampled_values_flat = aux["transport_values"]
+        sampled_validity_flat = aux["transport_validity"]
+        coords_flat = aux["transport_coords"]
 
         mixed = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if default_tokens is not None:
@@ -901,12 +1021,6 @@ class PatchInpainting(nn.Module):
             value_dtype=source_patch_map.dtype,
             validity_flat=sampled_validity_flat,
         )
-        aux = {
-            "copy_mode": self.copy_mode,
-            "transport_coords": coords_flat,
-            "transport_values": sampled_values_flat,
-            "transport_validity": sampled_validity_flat,
-        }
         return mixed, dense_attn, aux
 
     def direct_patch_mix_masked_queries(
@@ -1183,6 +1297,7 @@ class PatchInpainting(nn.Module):
                 key_valid_flat,
                 patch_map.shape[-2:],
                 default_tokens=default_patch_values,
+                return_diagnostics=return_aux,
             )
         elif self.attention_masking:
             mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
@@ -1243,5 +1358,29 @@ class PatchInpainting(nn.Module):
             }
             if copy_aux is not None:
                 aux.update(copy_aux)
+            if self.copy_mode == "transport" and self.training:
+                transport_self_mask = self._sample_transport_self_mask(key_valid_flat)
+                if transport_self_mask is not None:
+                    transport_self_keys = key_valid_flat * (1.0 - transport_self_mask)
+                    if (transport_self_keys > 0.5).any():
+                        self_transport_state = self._predict_transport_field(
+                            query_tokens,
+                            key_tokens,
+                            transport_self_mask,
+                            transport_self_keys,
+                            patch_map.shape[-2:],
+                            compute_confidence=False,
+                        )
+                        _, transport_self_aux = self._build_transport_aux(
+                            query_tokens,
+                            key_tokens,
+                            visible_source_patch_map,
+                            transport_self_mask,
+                            transport_self_keys,
+                            patch_map.shape[-2:],
+                            self_transport_state,
+                            return_diagnostics=False,
+                        )
+                        aux["transport_self_aux"] = transport_self_aux
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw

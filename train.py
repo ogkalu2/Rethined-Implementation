@@ -286,7 +286,12 @@ def format_train_metric_snapshot(metrics):
             f", tp={metrics['transport_patch']:.4f}"
             f", tval={metrics['transport_validity']:.4f}"
             f", tvr={metrics['transport_valid_ratio']:.3f}"
+            f", tsp={metrics['transport_self_patch']:.4f}"
+            f", tsvr={metrics['transport_self_valid_ratio']:.3f}"
             f", tsm={metrics['transport_offset_smoothness']:.4f}"
+            f", tcr={metrics['transport_offset_curvature']:.4f}"
+            f", tcy={metrics['transport_cycle_consistency']:.4f}"
+            f", tcm={metrics['transport_confidence_mean']:.3f}"
         )
     return summary
 
@@ -739,9 +744,33 @@ def train(cfg, args):
                 writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
                 writer.add_scalar("loss/transport_validity", metrics["transport_validity"], step)
                 writer.add_scalar("transport/valid_ratio", metrics["transport_valid_ratio"], step)
+                writer.add_scalar("loss/transport_self_patch", metrics["transport_self_patch"], step)
+                writer.add_scalar("loss/transport_self_validity", metrics["transport_self_validity"], step)
+                writer.add_scalar(
+                    "transport/self_valid_ratio",
+                    metrics["transport_self_valid_ratio"],
+                    step,
+                )
                 writer.add_scalar(
                     "loss/transport_offset_smoothness",
                     metrics["transport_offset_smoothness"],
+                    step,
+                )
+                writer.add_scalar(
+                    "transport/offset_curvature",
+                    metrics["transport_offset_curvature"],
+                    step,
+                )
+                writer.add_scalar(
+                    "loss/transport_cycle_consistency",
+                    metrics["transport_cycle_consistency"],
+                    step,
+                )
+                writer.add_scalar("transport/cycle_error", metrics["transport_cycle_error"], step)
+                writer.add_scalar("loss/transport_confidence", metrics["transport_confidence"], step)
+                writer.add_scalar(
+                    "transport/confidence_mean",
+                    metrics["transport_confidence_mean"],
                     step,
                 )
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
@@ -774,7 +803,12 @@ def train(cfg, args):
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
                     tp=(f"{metrics['transport_patch']:.4f}" if "transport_patch" in metrics else "n/a"),
                     tvr=(f"{metrics['transport_valid_ratio']:.3f}" if "transport_valid_ratio" in metrics else "n/a"),
+                    tsp=(f"{metrics['transport_self_patch']:.4f}" if "transport_self_patch" in metrics else "n/a"),
+                    tsvr=(f"{metrics['transport_self_valid_ratio']:.3f}" if "transport_self_valid_ratio" in metrics else "n/a"),
                     tsm=(f"{metrics['transport_offset_smoothness']:.4f}" if "transport_offset_smoothness" in metrics else "n/a"),
+                    tcr=(f"{metrics['transport_offset_curvature']:.4f}" if "transport_offset_curvature" in metrics else "n/a"),
+                    tcy=(f"{metrics['transport_cycle_consistency']:.4f}" if "transport_cycle_consistency" in metrics else "n/a"),
+                    tcm=(f"{metrics['transport_confidence_mean']:.3f}" if "transport_confidence_mean" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,
