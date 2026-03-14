@@ -25,6 +25,8 @@ model:
     candidate_reranker: true
     candidate_reranker_hidden_dim: 128
     candidate_rerank_context_channels: 32
+    candidate_context_retrieval: true
+    candidate_context_retrieval_scale_init: 2.0
     candidate_rerank_selection: true
     candidate_rerank_selection_max_alpha: 1.0
     candidate_rerank_selection_start_step: 1000
