@@ -202,8 +202,6 @@ class PatchInpainting(nn.Module):
         candidate_reranker: bool = False,
         candidate_reranker_hidden_dim: int = 128,
         candidate_rerank_context_channels: int = 32,
-        candidate_context_retrieval: bool = False,
-        candidate_context_retrieval_scale_init: float = 2.0,
         candidate_rerank_selection: bool = False,
         candidate_rerank_selection_max_alpha: float = 1.0,
         candidate_rerank_selection_start_step: int = 0,
@@ -256,8 +254,6 @@ class PatchInpainting(nn.Module):
         self.candidate_reranker = bool(candidate_reranker)
         self.candidate_reranker_hidden_dim = int(candidate_reranker_hidden_dim)
         self.candidate_rerank_context_channels = int(candidate_rerank_context_channels)
-        self.candidate_context_retrieval = bool(candidate_context_retrieval)
-        self.candidate_context_retrieval_scale_init = float(candidate_context_retrieval_scale_init)
         self.candidate_rerank_selection = bool(candidate_rerank_selection)
         self.candidate_rerank_selection_max_alpha = float(candidate_rerank_selection_max_alpha)
         self.candidate_rerank_selection_start_step = max(0, int(candidate_rerank_selection_start_step))
@@ -276,8 +272,6 @@ class PatchInpainting(nn.Module):
             raise ValueError("candidate_reranker_hidden_dim must be positive.")
         if self.candidate_rerank_context_channels <= 0:
             raise ValueError("candidate_rerank_context_channels must be positive.")
-        if self.candidate_context_retrieval and not self.candidate_reranker:
-            raise ValueError("candidate_context_retrieval requires candidate_reranker=True.")
         if self.candidate_rerank_selection_max_alpha < 0:
             raise ValueError("candidate_rerank_selection_max_alpha must be non-negative.")
         if self.candidate_rerank_selection and not self.candidate_reranker:
@@ -370,9 +364,6 @@ class PatchInpainting(nn.Module):
         self.candidate_reranker_head = None
         self.candidate_query_context_encoder = None
         self.candidate_key_context_encoder = None
-        self.candidate_query_retrieval_head = None
-        self.candidate_key_retrieval_head = None
-        self.candidate_context_retrieval_scale = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -447,20 +438,6 @@ class PatchInpainting(nn.Module):
                 3,
                 self.candidate_rerank_context_channels,
             )
-            if self.candidate_context_retrieval:
-                self.candidate_query_retrieval_head = nn.Linear(
-                    self.candidate_rerank_context_channels,
-                    self.candidate_rerank_context_channels,
-                    bias=False,
-                )
-                self.candidate_key_retrieval_head = nn.Linear(
-                    self.candidate_rerank_context_channels,
-                    self.candidate_rerank_context_channels,
-                    bias=False,
-                )
-                self.candidate_context_retrieval_scale = nn.Parameter(
-                    torch.tensor(self.candidate_context_retrieval_scale_init)
-                )
             rerank_input_dim = (self.patch_token_dim * 4) + (self.candidate_rerank_context_channels * 4)
             self.candidate_reranker_head = nn.Sequential(
                 nn.Linear(rerank_input_dim, self.candidate_reranker_hidden_dim, bias=False),
@@ -583,30 +560,6 @@ class PatchInpainting(nn.Module):
         ) / max(self.candidate_rerank_selection_ramp_steps, 1)
         progress = max(0.0, min(float(progress), 1.0))
         return self.candidate_rerank_selection_max_alpha * progress
-
-    def _compute_candidate_context_logits(
-        self,
-        query_context_tokens: torch.Tensor,
-        key_context_tokens: torch.Tensor,
-    ) -> torch.Tensor | None:
-        if not self.candidate_context_retrieval:
-            return None
-        if (
-            self.candidate_query_retrieval_head is None
-            or self.candidate_key_retrieval_head is None
-            or self.candidate_context_retrieval_scale is None
-        ):
-            raise ValueError("candidate_context_retrieval is enabled but retrieval heads are missing.")
-        query_context_proj = self.candidate_query_retrieval_head(query_context_tokens)
-        key_context_proj = self.candidate_key_retrieval_head(key_context_tokens)
-        query_context_proj = F.normalize(query_context_proj, dim=-1, eps=1e-6)
-        key_context_proj = F.normalize(key_context_proj, dim=-1, eps=1e-6)
-        context_logits = torch.matmul(query_context_proj, key_context_proj.transpose(0, 1))
-        scale = self.candidate_context_retrieval_scale.to(
-            dtype=context_logits.dtype,
-            device=context_logits.device,
-        )
-        return context_logits * scale
 
     def _apply_branch_dropout(self, branch: torch.Tensor, drop_prob: float) -> torch.Tensor:
         if (not self.training) or drop_prob <= 0:
@@ -869,20 +822,9 @@ class PatchInpainting(nn.Module):
                 if self.candidate_reranker:
                     _, base_logits = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
                     base_logits = base_logits.squeeze(0).squeeze(0)
-                    if query_context_tokens_full is None or key_context_tokens_full is None:
-                        raise ValueError("candidate_reranker requires query/key context tokens.")
-                    query_context_tokens = query_context_tokens_full[batch_idx, query_indices]
-                    key_context_tokens = key_context_tokens_full[batch_idx, key_indices]
-                    retrieval_logits = base_logits
-                    context_logits = self._compute_candidate_context_logits(
-                        query_context_tokens,
-                        key_context_tokens,
-                    )
-                    if context_logits is not None:
-                        retrieval_logits = retrieval_logits + context_logits.to(dtype=retrieval_logits.dtype)
-                    candidate_count = min(retrieval_logits.shape[-1], self.multihead_attention.attention_top_k)
+                    candidate_count = min(base_logits.shape[-1], self.multihead_attention.attention_top_k)
                     base_candidate_logits, candidate_local_indices = torch.topk(
-                        retrieval_logits,
+                        base_logits,
                         k=candidate_count,
                         dim=-1,
                     )
@@ -892,6 +834,10 @@ class PatchInpainting(nn.Module):
                     query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
                     candidate_key_tokens = key_tokens_flat[candidate_local_indices]
                     candidate_value_tokens = value_tokens_flat[candidate_local_indices]
+                    if query_context_tokens_full is None or key_context_tokens_full is None:
+                        raise ValueError("candidate_reranker requires query/key context tokens.")
+                    query_context_tokens = query_context_tokens_full[batch_idx, query_indices]
+                    key_context_tokens = key_context_tokens_full[batch_idx, key_indices]
                     query_context_expanded = query_context_tokens.unsqueeze(1).expand(-1, candidate_count, -1)
                     candidate_key_context_tokens = key_context_tokens[candidate_local_indices]
                     rerank_features = torch.cat(
