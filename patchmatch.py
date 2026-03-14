@@ -1018,6 +1018,7 @@ class PatchInpainting(nn.Module):
             (query_token_map.unsqueeze(1) * sampled_key_tokens).sum(dim=2) / (token_dim ** 0.5)
         )
         slot_logits = slot_logits + torch.log(sampled_validity.clamp_min(1e-6))
+        sampled_values = sampled_values * sampled_validity.unsqueeze(2).to(dtype=sampled_values.dtype)
 
         slot_logits_flat = slot_logits.permute(0, 2, 3, 1).reshape(batch_size, num_patches, self.deformable_num_slots)
         sampled_validity_flat = sampled_validity.permute(0, 2, 3, 1).reshape(
@@ -1330,6 +1331,13 @@ class PatchInpainting(nn.Module):
             stride=self.kernel_size,
             padding=self.value_patch_padding,
         )
+        visible_value_base = value_base * (1.0 - mask)
+        visible_source_patch_map, _ = self.extract_patches(
+            visible_value_base,
+            self.value_patch_size,
+            stride=self.kernel_size,
+            padding=self.value_patch_padding,
+        )
         query_mask_flat = self.flatten_query_mask(mask)
         key_mask_patch_map, _ = self.extract_patches(
             mask,
@@ -1476,7 +1484,7 @@ class PatchInpainting(nn.Module):
             mixed_patches_flat, masked_attention, rerank_aux = self._deformable_slot_copy(
                 query_tokens,
                 key_tokens,
-                source_patch_map,
+                visible_source_patch_map,
                 fallback_patch_map,
                 query_mask_flat,
                 key_valid_flat,
