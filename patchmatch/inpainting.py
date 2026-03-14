@@ -9,16 +9,14 @@ from blocks import NativeGaussianBlur2d
 from .attention import MultiHeadAttention
 from .helpers import PatchmatchHelpersMixin
 from .patch_ops import PatchOpsMixin
-from .transport import PatchTransportMixin
 
 
-class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin, nn.Module):
+class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
     def __init__(
         self,
         *,
         kernel_size: int,
         value_patch_size: int | None = None,
-        copy_mode: str = "attention",
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
         attention_selection: str = "softmax",
@@ -27,11 +25,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
         attention_warmup_selection: str | None = None,
         attention_warmup_steps: int = 0,
         attention_gumbel_hard_start_step: int = 0,
-        transport_hidden_channels: int = 64,
-        transport_refine_steps: int = 2,
-        transport_offset_scale: float = 1.0,
-        transport_refine_scale: float = 0.25,
-        transport_self_supervision_ratio: float = 0.0,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
@@ -75,14 +68,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
         self.use_positional_encoding = bool(use_positional_encoding)
         self.feature_i = int(feature_i)
         self.feature_dim = int(feature_dim)
-        self.copy_mode = str(copy_mode).lower()
-        if self.copy_mode not in {"attention", "transport"}:
-            raise ValueError("copy_mode must be one of {'attention', 'transport'}.")
-        self.transport_hidden_channels = int(transport_hidden_channels)
-        self.transport_refine_steps = max(0, int(transport_refine_steps))
-        self.transport_offset_scale = float(transport_offset_scale)
-        self.transport_refine_scale = float(transport_refine_scale)
-        self.transport_self_supervision_ratio = float(transport_self_supervision_ratio)
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
@@ -101,14 +86,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
         self.key_feature_residual_init = float(key_feature_residual_init)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
-        if self.transport_hidden_channels <= 0:
-            raise ValueError("transport_hidden_channels must be positive.")
-        if self.transport_offset_scale < 0:
-            raise ValueError("transport_offset_scale must be non-negative.")
-        if self.transport_refine_scale < 0:
-            raise ValueError("transport_refine_scale must be non-negative.")
-        if not 0.0 <= self.transport_self_supervision_ratio <= 1.0:
-            raise ValueError("transport_self_supervision_ratio must be in [0, 1].")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -209,9 +186,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
         self.query_descriptor_head = None
         self.key_descriptor_head = None
         self.matching_descriptor_head = None
-        self.transport_init_head = None
-        self.transport_refine_head = None
-        self.transport_confidence_head = None
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
@@ -259,12 +233,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
             attention_gumbel_hard=attention_gumbel_hard,
         )
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
-        if self.copy_mode == "transport":
-            transport_init_in = self.patch_token_dim + 1
-            transport_refine_in = (self.patch_token_dim * 2) + 4
-            self.transport_init_head = self._build_transport_head(transport_init_in, 2)
-            self.transport_refine_head = self._build_transport_head(transport_refine_in, 2)
-            self.transport_confidence_head = self._build_transport_head(transport_refine_in, 1)
         self.positionalencoding = (
             nn.Parameter(
                 torch.zeros(
@@ -364,12 +332,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
 
         source_patch_map, _ = self.extract_patches(
             value_base,
-            self.value_patch_size,
-            stride=self.kernel_size,
-            padding=self.value_patch_padding,
-        )
-        visible_source_patch_map, _ = self.extract_patches(
-            visible_value_base,
             self.value_patch_size,
             stride=self.kernel_size,
             padding=self.value_patch_padding,
@@ -494,18 +456,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
-        if self.copy_mode == "transport":
-            mixed_patches_flat, masked_attention, copy_aux = self.transport_patch_mix(
-                query_tokens,
-                key_tokens,
-                source_patch_map,
-                query_mask_flat,
-                key_valid_flat,
-                patch_map.shape[-2:],
-                default_tokens=default_patch_values,
-                return_diagnostics=return_aux,
-            )
-        elif self.attention_masking:
+        if self.attention_masking:
             mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
@@ -557,36 +508,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, PatchTransportMixin
                 "kernel_size": self.kernel_size,
                 "value_patch_size": self.value_patch_size,
                 "value_patch_padding": self.value_patch_padding,
-                "copy_mode": self.copy_mode,
                 "matching_tokens": query_matching_tokens,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
             }
-            if copy_aux is not None:
-                aux.update(copy_aux)
-            if self.copy_mode == "transport" and self.training:
-                transport_self_mask = self._sample_transport_self_mask(key_valid_flat)
-                if transport_self_mask is not None:
-                    transport_self_keys = key_valid_flat * (1.0 - transport_self_mask)
-                    if (transport_self_keys > 0.5).any():
-                        self_transport_state = self._predict_transport_field(
-                            query_tokens,
-                            key_tokens,
-                            transport_self_mask,
-                            transport_self_keys,
-                            patch_map.shape[-2:],
-                            compute_confidence=False,
-                        )
-                        _, transport_self_aux = self._build_transport_aux(
-                            query_tokens,
-                            key_tokens,
-                            source_patch_map,
-                            transport_self_mask,
-                            transport_self_keys,
-                            patch_map.shape[-2:],
-                            self_transport_state,
-                            return_diagnostics=False,
-                        )
-                        aux["transport_self_aux"] = transport_self_aux
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw

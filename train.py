@@ -76,6 +76,11 @@ def create_summary_writer(log_dir: Path):
 
 def build_model_config(cfg):
     coarse_cfg = cfg["model"]["coarse_model"]
+    generator_params = {
+        k: v
+        for k, v in cfg["model"]["generator"].items()
+        if k != "copy_mode" and not k.startswith("transport_")
+    }
     return {
         "coarse_model": {
             "class": coarse_cfg.get("class", "CoarseModel"),
@@ -83,7 +88,7 @@ def build_model_config(cfg):
         },
         "generator": {
             "generator_class": "PatchInpainting",
-            "params": {k: v for k, v in cfg["model"]["generator"].items()},
+            "params": generator_params,
         },
     }
 
@@ -185,7 +190,18 @@ def save_checkpoint(
 
 
 def load_model_checkpoint(model, state_dict):
-    model.load_state_dict(state_dict, strict=True)
+    filtered_state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if ".transport_" not in key and "transport_" not in key
+    }
+    missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
+    unexpected_non_transport = [key for key in unexpected_keys if "transport_" not in key]
+    if missing_keys or unexpected_non_transport:
+        raise RuntimeError(
+            "Checkpoint is incompatible with the current attention-only model. "
+            f"Missing keys: {missing_keys}. Unexpected keys: {unexpected_non_transport}."
+        )
 
 
 def load_eval_checkpoint(path, model, device):
@@ -280,18 +296,6 @@ def format_train_metric_snapshot(metrics):
             f", pt={metrics['patch_teacher']:.4f}"
             f", pta={metrics['patch_teacher_accuracy']:.3f}"
             f", pts={metrics['patch_teacher_supervised_ratio']:.3f}"
-        )
-    if "transport_patch" in metrics:
-        summary += (
-            f", tp={metrics['transport_patch']:.4f}"
-            f", tval={metrics['transport_validity']:.4f}"
-            f", tvr={metrics['transport_valid_ratio']:.3f}"
-            f", tsp={metrics['transport_self_patch']:.4f}"
-            f", tsvr={metrics['transport_self_valid_ratio']:.3f}"
-            f", tsm={metrics['transport_offset_smoothness']:.4f}"
-            f", tcr={metrics['transport_offset_curvature']:.4f}"
-            f", tcy={metrics['transport_cycle_consistency']:.4f}"
-            f", tcm={metrics['transport_confidence_mean']:.3f}"
         )
     return summary
 
@@ -532,7 +536,8 @@ def train(cfg, args):
 
     model = InpaintingModel(build_model_config(cfg)).to(device)
     discriminator = PatchDiscriminator(**cfg["discriminator"]).to(device)
-    criterion = InpaintingLoss(**cfg["loss"]).to(device)
+    loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
+    criterion = InpaintingLoss(**loss_cfg).to(device)
 
     optimizer_g = torch.optim.Adam(
         model.parameters(),
@@ -740,39 +745,6 @@ def train(cfg, args):
                     metrics["patch_teacher_supervised_ratio"],
                     step,
                 )
-            if "transport_patch" in metrics:
-                writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
-                writer.add_scalar("loss/transport_validity", metrics["transport_validity"], step)
-                writer.add_scalar("transport/valid_ratio", metrics["transport_valid_ratio"], step)
-                writer.add_scalar("loss/transport_self_patch", metrics["transport_self_patch"], step)
-                writer.add_scalar("loss/transport_self_validity", metrics["transport_self_validity"], step)
-                writer.add_scalar(
-                    "transport/self_valid_ratio",
-                    metrics["transport_self_valid_ratio"],
-                    step,
-                )
-                writer.add_scalar(
-                    "loss/transport_offset_smoothness",
-                    metrics["transport_offset_smoothness"],
-                    step,
-                )
-                writer.add_scalar(
-                    "transport/offset_curvature",
-                    metrics["transport_offset_curvature"],
-                    step,
-                )
-                writer.add_scalar(
-                    "loss/transport_cycle_consistency",
-                    metrics["transport_cycle_consistency"],
-                    step,
-                )
-                writer.add_scalar("transport/cycle_error", metrics["transport_cycle_error"], step)
-                writer.add_scalar("loss/transport_confidence", metrics["transport_confidence"], step)
-                writer.add_scalar(
-                    "transport/confidence_mean",
-                    metrics["transport_confidence_mean"],
-                    step,
-                )
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -801,14 +773,6 @@ def train(cfg, args):
                     pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
                     pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
-                    tp=(f"{metrics['transport_patch']:.4f}" if "transport_patch" in metrics else "n/a"),
-                    tvr=(f"{metrics['transport_valid_ratio']:.3f}" if "transport_valid_ratio" in metrics else "n/a"),
-                    tsp=(f"{metrics['transport_self_patch']:.4f}" if "transport_self_patch" in metrics else "n/a"),
-                    tsvr=(f"{metrics['transport_self_valid_ratio']:.3f}" if "transport_self_valid_ratio" in metrics else "n/a"),
-                    tsm=(f"{metrics['transport_offset_smoothness']:.4f}" if "transport_offset_smoothness" in metrics else "n/a"),
-                    tcr=(f"{metrics['transport_offset_curvature']:.4f}" if "transport_offset_curvature" in metrics else "n/a"),
-                    tcy=(f"{metrics['transport_cycle_consistency']:.4f}" if "transport_cycle_consistency" in metrics else "n/a"),
-                    tcm=(f"{metrics['transport_confidence_mean']:.3f}" if "transport_confidence_mean" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,

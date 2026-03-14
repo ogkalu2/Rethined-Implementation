@@ -10,7 +10,6 @@ model:
     kernel_size: 8
     value_patch_size: 8
     value_source: "rgb"
-    copy_mode: "transport"
     attention_temperature: 0.5
     attention_top_k: 32
     attention_selection: "gumbel"
@@ -18,11 +17,6 @@ model:
     attention_warmup_selection: null
     attention_warmup_steps: 0
     attention_gumbel_hard_start_step: 0
-    transport_hidden_channels: 64
-    transport_refine_steps: 2
-    transport_offset_scale: 1.0
-    transport_refine_scale: 0.25
-    transport_self_supervision_ratio: 0.0
     matching_descriptor_dim: 256
     match_coarse_rgb: true
     normalize_matching_branches: false
@@ -88,14 +82,6 @@ loss:
   patch_teacher_temperature: 0.1
   patch_teacher_confidence_threshold: 0.2
   patch_teacher_margin_threshold: 0.03
-  transport_patch_weight: 1.0
-  transport_validity_weight: 0.1
-  transport_self_patch_weight: 0.0
-  transport_self_validity_weight: 0.0
-  transport_offset_smoothness_weight: 0.01
-  transport_cycle_consistency_weight: 0.0
-  transport_confidence_weight: 0.0
-  transport_offset_edge_scale: 5.0
   frequency_weight: 0.5
   perceptual_weight: 0.15
   adversarial_weight: 0.02

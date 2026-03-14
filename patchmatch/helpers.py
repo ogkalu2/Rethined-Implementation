@@ -28,24 +28,6 @@ class PatchmatchHelpersMixin:
         else:
             self.multihead_attention.attention_gumbel_hard = True
 
-    def _build_transport_head(self, input_dim: int, output_dim: int) -> nn.Sequential:
-        return nn.Sequential(
-            nn.Conv2d(input_dim, self.transport_hidden_channels, kernel_size=1, stride=1, bias=False),
-            nn.GELU(),
-            nn.Conv2d(
-                self.transport_hidden_channels,
-                self.transport_hidden_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                padding_mode="reflect",
-                groups=self.transport_hidden_channels,
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(self.transport_hidden_channels, output_dim, kernel_size=1, stride=1),
-        )
-
     def _apply_branch_dropout(self, branch: torch.Tensor, drop_prob: float) -> torch.Tensor:
         if (not self.training) or drop_prob <= 0:
             return branch
