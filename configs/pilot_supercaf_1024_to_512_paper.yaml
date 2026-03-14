@@ -100,9 +100,8 @@ loss:
   patch_teacher_confidence_threshold: 0.2
   patch_teacher_margin_threshold: 0.03
   coarse_global_matcher_weight: 0.1
-  coarse_global_matcher_confidence_threshold: 0.1
-  coarse_global_matcher_margin_threshold: 0.0
-  coarse_global_matcher_dustbin_threshold: 0.03
+  coarse_global_matcher_confidence_threshold: 0.2
+  coarse_global_matcher_margin_threshold: 0.03
   candidate_rerank_weight: 0.1
   candidate_rerank_temperature: 1.0
   candidate_rerank_confidence_threshold: 0.2
