@@ -116,6 +116,7 @@ class InpaintingLoss(nn.Module):
         direct_retriever_weight: float = 0.0,
         direct_retriever_temperature: float = 0.1,
         direct_retriever_teacher_top_k: int = 4,
+        direct_retriever_negative_top_k: int = 16,
         direct_retriever_teacher_temperature: float = 0.2,
         direct_retriever_confidence_threshold: float = 0.2,
         direct_retriever_margin_threshold: float = 0.03,
@@ -144,6 +145,7 @@ class InpaintingLoss(nn.Module):
         self.direct_retriever_weight = float(direct_retriever_weight)
         self.direct_retriever_temperature = float(direct_retriever_temperature)
         self.direct_retriever_teacher_top_k = max(1, int(direct_retriever_teacher_top_k))
+        self.direct_retriever_negative_top_k = max(0, int(direct_retriever_negative_top_k))
         self.direct_retriever_teacher_temperature = float(direct_retriever_teacher_temperature)
         self.direct_retriever_confidence_threshold = float(direct_retriever_confidence_threshold)
         self.direct_retriever_margin_threshold = float(direct_retriever_margin_threshold)
@@ -545,14 +547,26 @@ class InpaintingLoss(nn.Module):
             logits = torch.matmul(query_tokens, key_tokens.transpose(0, 1))
             logits = logits * retrieval_scale.to(dtype=logits.dtype, device=logits.device)
             logits = logits / self.direct_retriever_temperature
-            log_probs = F.log_softmax(logits, dim=-1)
+            candidate_logits = logits
+            candidate_positive_count = teacher_positive_indices.shape[-1]
+            if self.direct_retriever_negative_top_k > 0 and logits.shape[-1] > candidate_positive_count:
+                negative_count = min(
+                    self.direct_retriever_negative_top_k,
+                    logits.shape[-1] - candidate_positive_count,
+                )
+                negative_logits = logits.clone()
+                negative_logits.scatter_(1, teacher_positive_indices, float("-inf"))
+                _, hard_negative_indices = negative_logits.topk(k=negative_count, dim=-1)
+                candidate_indices = torch.cat([teacher_positive_indices, hard_negative_indices], dim=-1)
+                candidate_logits = logits.gather(1, candidate_indices)
+            log_probs = F.log_softmax(candidate_logits, dim=-1)
 
-            soft_targets = torch.zeros_like(log_probs)
-            soft_targets.scatter_(1, teacher_positive_indices, teacher_probs)
+            soft_targets = torch.zeros_like(candidate_logits)
+            soft_targets[:, :candidate_positive_count] = teacher_probs
             loss_terms.append(-(soft_targets * log_probs).sum(dim=-1).mean())
 
-            predictions = logits.argmax(dim=-1, keepdim=True)
-            positive_hits += int((predictions == teacher_positive_indices).any(dim=-1).sum().item())
+            predictions = candidate_logits.argmax(dim=-1)
+            positive_hits += int((predictions < candidate_positive_count).sum().item())
             supervised_queries += int(valid_teacher.sum().item())
 
         if not loss_terms:
