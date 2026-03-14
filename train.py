@@ -297,6 +297,8 @@ def format_train_metric_snapshot(metrics):
         )
     if "deformable_validity" in metrics:
         summary += f", dval={metrics['deformable_validity']:.4f}"
+    if "deformable_unmatched_prob" in metrics:
+        summary += f", dun={metrics['deformable_unmatched_prob']:.4f}"
     if "deformable_offset_smoothness" in metrics:
         summary += f", dsm={metrics['deformable_offset_smoothness']:.4f}"
     return summary
@@ -509,7 +511,8 @@ def run_eval_only(cfg, args):
     model = InpaintingModel(build_model_config(cfg)).to(device)
     if not args.resume:
         raise ValueError("--eval-only requires --resume CHECKPOINT")
-    load_eval_checkpoint(args.resume, model, device)
+    checkpoint_step = load_eval_checkpoint(args.resume, model, device)
+    model.generator.set_training_step(checkpoint_step)
     eval_loader = build_eval_loader(cfg, args)
     if eval_loader is None:
         raise ValueError("No evaluation loader configured.")
@@ -777,6 +780,8 @@ def train(cfg, args):
                 )
             if "deformable_validity" in metrics:
                 writer.add_scalar("loss/deformable_validity", metrics["deformable_validity"], step)
+            if "deformable_unmatched_prob" in metrics:
+                writer.add_scalar("deformable/unmatched_prob", metrics["deformable_unmatched_prob"], step)
             if "deformable_offset_smoothness" in metrics:
                 writer.add_scalar(
                     "loss/deformable_offset_smoothness",
@@ -819,6 +824,7 @@ def train(cfg, args):
                     dst=(f"{metrics['deformable_slot_teacher']:.4f}" if "deformable_slot_teacher" in metrics else "n/a"),
                     dsta=(f"{metrics['deformable_slot_teacher_accuracy']:.3f}" if "deformable_slot_teacher_accuracy" in metrics else "n/a"),
                     dval=(f"{metrics['deformable_validity']:.4f}" if "deformable_validity" in metrics else "n/a"),
+                    dun=(f"{metrics['deformable_unmatched_prob']:.4f}" if "deformable_unmatched_prob" in metrics else "n/a"),
                     dsm=(f"{metrics['deformable_offset_smoothness']:.4f}" if "deformable_offset_smoothness" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",

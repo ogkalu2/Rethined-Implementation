@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -200,6 +202,7 @@ class PatchInpainting(nn.Module):
         deformable_base_offset_scale: float = 1.0,
         deformable_residual_scale: float = 0.15,
         deformable_use_unmatched: bool = True,
+        deformable_unmatched_start_step: int = 0,
         deformable_hard_start_step: int = 0,
         deformable_hard_inference: bool = True,
         matching_descriptor_dim: int | None = None,
@@ -261,6 +264,7 @@ class PatchInpainting(nn.Module):
         self.deformable_base_offset_scale = float(deformable_base_offset_scale)
         self.deformable_residual_scale = float(deformable_residual_scale)
         self.deformable_use_unmatched = bool(deformable_use_unmatched)
+        self.deformable_unmatched_start_step = max(0, int(deformable_unmatched_start_step))
         self.deformable_hard_start_step = max(0, int(deformable_hard_start_step))
         self.deformable_hard_inference = bool(deformable_hard_inference)
         self.matching_descriptor_dim = (
@@ -346,6 +350,8 @@ class PatchInpainting(nn.Module):
             raise ValueError("deformable_base_offset_scale must be non-negative.")
         if self.deformable_residual_scale < 0:
             raise ValueError("deformable_residual_scale must be non-negative.")
+        if self.deformable_unmatched_start_step < 0:
+            raise ValueError("deformable_unmatched_start_step must be non-negative.")
         self.matching_input_dim = 0
         if self.match_coarse_rgb:
             self.matching_input_dim += self.query_patch_dim
@@ -484,6 +490,7 @@ class PatchInpainting(nn.Module):
         if self.copy_mode == "deformable_slots":
             base_in_channels = self.patch_token_dim + 1
             slot_in_channels = self.patch_token_dim + 3
+            slot_residual_channels = self.deformable_num_slots * 2
             self.deformable_base_head = nn.Sequential(
                 nn.Conv2d(
                     base_in_channels,
@@ -515,8 +522,14 @@ class PatchInpainting(nn.Module):
             nn.init.zeros_(self.deformable_base_head[-1].bias)
             nn.init.zeros_(self.deformable_slot_head[-1].weight)
             nn.init.zeros_(self.deformable_slot_head[-1].bias)
-            if self.deformable_use_unmatched:
-                nn.init.constant_(self.deformable_slot_head[-1].bias[-1], -1.0)
+            with torch.no_grad():
+                slot_offset_bias = self._build_deformable_slot_offset_bias()
+                if slot_offset_bias.numel() > 0:
+                    self.deformable_slot_head[-1].bias[:slot_residual_channels].copy_(
+                        slot_offset_bias.reshape(-1).to(dtype=self.deformable_slot_head[-1].bias.dtype)
+                    )
+                if self.deformable_use_unmatched:
+                    nn.init.constant_(self.deformable_slot_head[-1].bias[-1], -4.0)
         self.positionalencoding = (
             nn.Parameter(
                 torch.zeros(
@@ -837,6 +850,28 @@ class PatchInpainting(nn.Module):
             return self.deformable_hard_inference
         return self.current_training_step >= self.deformable_hard_start_step
 
+    def _should_use_deformable_unmatched(self) -> bool:
+        if not self.deformable_use_unmatched:
+            return False
+        if (not self.training) and self.current_training_step <= 0:
+            return True
+        return self.current_training_step >= self.deformable_unmatched_start_step
+
+    def _build_deformable_slot_offset_bias(self) -> torch.Tensor:
+        if self.deformable_num_slots <= 0 or self.deformable_residual_scale <= 0:
+            return torch.zeros((self.deformable_num_slots, 2), dtype=torch.float32)
+
+        angles = torch.linspace(
+            0.0,
+            2.0 * math.pi,
+            steps=self.deformable_num_slots + 1,
+            dtype=torch.float32,
+        )[:-1]
+        radius = self.deformable_residual_scale * 0.75
+        target_offsets = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1) * radius
+        normalized = (target_offsets / self.deformable_residual_scale).clamp_(-0.95, 0.95)
+        return torch.atanh(normalized)
+
     def _selection_from_logits(
         self,
         logits: torch.Tensor,
@@ -1005,8 +1040,9 @@ class PatchInpainting(nn.Module):
             :,
             slot_residual_channels : slot_residual_channels + slot_bias_channels,
         ].view(batch_size, self.deformable_num_slots, height, width)
+        use_unmatched = self._should_use_deformable_unmatched()
         unmatched_logits_map = None
-        if self.deformable_use_unmatched:
+        if use_unmatched:
             unmatched_logits_map = slot_params[:, -1:, :, :]
 
         slot_coords = torch.clamp(base_coords.unsqueeze(1) + slot_residual, -1.0, 1.0)
@@ -1093,10 +1129,12 @@ class PatchInpainting(nn.Module):
             "deformable_slot_probs": slot_probs_full,
             "deformable_slot_validity": sampled_validity_flat,
             "deformable_slot_values": sampled_values_flat,
+            "deformable_fallback_values": fallback_patch_flat,
             "deformable_slot_coords": slot_coords_flat,
             "deformable_base_coords": base_coords_flat,
             "deformable_base_offsets": base_offset_flat,
             "deformable_unmatched_prob": unmatched_probs_full,
+            "deformable_unmatched_active": use_unmatched,
         }
         if unmatched_logits_map is not None:
             aux["deformable_unmatched_logits"] = unmatched_logits_map.permute(0, 2, 3, 1).reshape(

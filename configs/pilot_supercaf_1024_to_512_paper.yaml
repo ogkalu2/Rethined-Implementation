@@ -17,6 +17,7 @@ model:
     deformable_base_offset_scale: 1.0
     deformable_residual_scale: 0.15
     deformable_use_unmatched: true
+    deformable_unmatched_start_step: 1000
     deformable_hard_start_step: 1000
     deformable_hard_inference: true
     attention_temperature: 0.5
