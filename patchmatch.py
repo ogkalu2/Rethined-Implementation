@@ -783,6 +783,8 @@ class PatchInpainting(nn.Module):
     def _snap_transport_to_valid_patches(
         self,
         source_patch_map: torch.Tensor,
+        query_tokens_full: torch.Tensor,
+        key_tokens_full: torch.Tensor,
         coords_flat: torch.Tensor,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
@@ -791,6 +793,8 @@ class PatchInpainting(nn.Module):
         batch_size, num_patches, _ = coords_flat.shape
         source_patch_values = self._flatten_patch_map(source_patch_map)
         snapped_values = source_patch_values.clone()
+        query_tokens = F.normalize(query_tokens_full.float(), dim=-1, eps=1e-6)
+        key_tokens = F.normalize(key_tokens_full.float(), dim=-1, eps=1e-6)
         selected_indices = torch.full(
             (batch_size, num_patches),
             -1,
@@ -811,9 +815,15 @@ class PatchInpainting(nn.Module):
 
             query_coords = coords_flat[batch_idx, query_indices].float()
             valid_coords = base_coords_flat[batch_idx, valid_indices].float()
-            nearest_valid = valid_indices[torch.cdist(query_coords, valid_coords).argmin(dim=1)]
-            snapped_values[batch_idx].index_copy_(0, query_indices, source_patch_values[batch_idx, nearest_valid])
-            selected_indices[batch_idx].index_copy_(0, query_indices, nearest_valid)
+            query_descriptors = query_tokens[batch_idx, query_indices]
+            valid_descriptors = key_tokens[batch_idx, valid_indices]
+            similarity = torch.matmul(query_descriptors, valid_descriptors.transpose(0, 1))
+            spatial_penalty = 0.25 * (
+                (query_coords.unsqueeze(1) - valid_coords.unsqueeze(0)).pow(2).mean(dim=-1)
+            )
+            best_valid = valid_indices[(similarity - spatial_penalty).argmax(dim=1)]
+            snapped_values[batch_idx].index_copy_(0, query_indices, source_patch_values[batch_idx, best_valid])
+            selected_indices[batch_idx].index_copy_(0, query_indices, best_valid)
 
         return snapped_values, selected_indices
 
@@ -917,6 +927,8 @@ class PatchInpainting(nn.Module):
         coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
         sampled_values_flat, selected_indices = self._snap_transport_to_valid_patches(
             source_patch_map,
+            query_tokens_full,
+            key_tokens_full,
             coords_flat,
             query_mask_flat,
             key_valid_flat,
