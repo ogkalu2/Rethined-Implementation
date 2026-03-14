@@ -787,11 +787,14 @@ class PatchInpainting(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bilinear_values = self._sample_transport_map(source_patch_map, coords, mode="bilinear")
         nearest_values = self._sample_transport_map(source_patch_map, coords, mode="nearest")
+        normalizer = sampled_validity.clamp_min(0.05).to(dtype=bilinear_values.dtype)
         normalized_bilinear = torch.where(
             sampled_validity > 1e-3,
-            bilinear_values / sampled_validity.clamp_min(1e-3).to(dtype=bilinear_values.dtype),
+            bilinear_values / normalizer,
             torch.zeros_like(bilinear_values),
         )
+        if self.value_source == "rgb":
+            normalized_bilinear = normalized_bilinear.clamp(0.0, 1.0)
         sharp_values = normalized_bilinear + (nearest_values - normalized_bilinear).detach()
         return sharp_values, normalized_bilinear
 
