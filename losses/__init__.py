@@ -113,16 +113,6 @@ class InpaintingLoss(nn.Module):
         patch_teacher_temperature: float = 0.1,
         patch_teacher_confidence_threshold: float = 0.2,
         patch_teacher_margin_threshold: float = 0.03,
-        candidate_rerank_weight: float = 0.0,
-        candidate_rerank_temperature: float = 1.0,
-        candidate_rerank_confidence_threshold: float = 0.2,
-        candidate_rerank_margin_threshold: float = 0.03,
-        deformable_slot_teacher_weight: float = 0.0,
-        deformable_slot_teacher_temperature: float = 1.0,
-        deformable_slot_teacher_confidence_threshold: float = 0.2,
-        deformable_validity_weight: float = 0.0,
-        deformable_offset_smoothness_weight: float = 0.0,
-        deformable_offset_edge_scale: float = 5.0,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.02,
@@ -141,16 +131,6 @@ class InpaintingLoss(nn.Module):
         self.patch_teacher_temperature = float(patch_teacher_temperature)
         self.patch_teacher_confidence_threshold = float(patch_teacher_confidence_threshold)
         self.patch_teacher_margin_threshold = float(patch_teacher_margin_threshold)
-        self.candidate_rerank_weight = float(candidate_rerank_weight)
-        self.candidate_rerank_temperature = float(candidate_rerank_temperature)
-        self.candidate_rerank_confidence_threshold = float(candidate_rerank_confidence_threshold)
-        self.candidate_rerank_margin_threshold = float(candidate_rerank_margin_threshold)
-        self.deformable_slot_teacher_weight = float(deformable_slot_teacher_weight)
-        self.deformable_slot_teacher_temperature = float(deformable_slot_teacher_temperature)
-        self.deformable_slot_teacher_confidence_threshold = float(deformable_slot_teacher_confidence_threshold)
-        self.deformable_validity_weight = float(deformable_validity_weight)
-        self.deformable_offset_smoothness_weight = float(deformable_offset_smoothness_weight)
-        self.deformable_offset_edge_scale = float(deformable_offset_edge_scale)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -167,20 +147,6 @@ class InpaintingLoss(nn.Module):
             raise ValueError("patch_teacher_temperature must be positive.")
         if self.patch_teacher_weight < 0:
             raise ValueError("patch_teacher_weight must be non-negative.")
-        if self.candidate_rerank_temperature <= 0:
-            raise ValueError("candidate_rerank_temperature must be positive.")
-        if self.candidate_rerank_weight < 0:
-            raise ValueError("candidate_rerank_weight must be non-negative.")
-        if self.deformable_slot_teacher_temperature <= 0:
-            raise ValueError("deformable_slot_teacher_temperature must be positive.")
-        if self.deformable_slot_teacher_weight < 0:
-            raise ValueError("deformable_slot_teacher_weight must be non-negative.")
-        if self.deformable_validity_weight < 0:
-            raise ValueError("deformable_validity_weight must be non-negative.")
-        if self.deformable_offset_smoothness_weight < 0:
-            raise ValueError("deformable_offset_smoothness_weight must be non-negative.")
-        if self.deformable_offset_edge_scale < 0:
-            raise ValueError("deformable_offset_edge_scale must be non-negative.")
 
     def _normalize_descriptors(self, tokens: torch.Tensor) -> torch.Tensor:
         tokens = tokens.float()
@@ -354,321 +320,6 @@ class InpaintingLoss(nn.Module):
         metrics["patch_teacher_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
         return loss, metrics
 
-    def _candidate_rerank_loss(
-        self,
-        refined_target: torch.Tensor,
-        attention_aux: dict[str, object] | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        zero = refined_target.new_zeros(())
-        metrics = {
-            "candidate_rerank": 0.0,
-            "candidate_rerank_accuracy": 0.0,
-            "candidate_rerank_base_accuracy": 0.0,
-            "candidate_rerank_teacher_in_topk": 0.0,
-            "candidate_rerank_supervised_ratio": 0.0,
-        }
-        if self.candidate_rerank_weight <= 0 or attention_aux is None:
-            return zero, metrics
-
-        query_mask_flat = attention_aux.get("query_mask_flat")
-        key_valid_flat = attention_aux.get("key_valid_flat")
-        candidate_indices = attention_aux.get("candidate_indices")
-        candidate_base_logits = attention_aux.get("candidate_base_logits")
-        candidate_logits = attention_aux.get("candidate_logits")
-        candidate_valid_mask = attention_aux.get("candidate_valid_mask")
-        kernel_size = int(attention_aux.get("kernel_size", 0))
-        value_patch_size = int(attention_aux.get("value_patch_size", 0))
-        value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
-        if (
-            query_mask_flat is None
-            or key_valid_flat is None
-            or candidate_indices is None
-            or candidate_base_logits is None
-            or candidate_logits is None
-            or candidate_valid_mask is None
-            or kernel_size <= 0
-            or value_patch_size <= 0
-        ):
-            return zero, metrics
-
-        target_patches = self._extract_patch_tokens(
-            refined_target,
-            patch_size=value_patch_size,
-            stride=kernel_size,
-            padding=value_patch_padding,
-        )
-        teacher_patch_tokens = self._normalize_descriptors(target_patches.detach())
-
-        loss_terms = []
-        supervised_queries = 0
-        total_masked_queries = 0
-        correct_matches = 0
-        base_correct_matches = 0
-        retrieval_supervised_queries = 0
-        retrieval_hits = 0
-
-        for batch_idx in range(teacher_patch_tokens.shape[0]):
-            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            total_masked_queries += int(query_indices.numel())
-            if query_indices.numel() == 0:
-                continue
-
-            key_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            if key_indices.numel() == 0:
-                continue
-
-            batch_candidate_indices = candidate_indices[batch_idx, query_indices]
-            batch_candidate_logits = candidate_logits[batch_idx, query_indices]
-            batch_candidate_valid = candidate_valid_mask[batch_idx, query_indices]
-            query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
-            valid_key_patch_tokens = teacher_patch_tokens[batch_idx, key_indices]
-            global_teacher_scores = torch.matmul(query_patch_tokens, valid_key_patch_tokens.transpose(0, 1))
-            global_teacher_best, global_teacher_labels = global_teacher_scores.max(dim=-1)
-            global_teacher_top2 = global_teacher_scores.topk(k=min(2, global_teacher_scores.shape[-1]), dim=-1).values
-            global_teacher_margin = torch.full_like(global_teacher_best, float("inf"))
-            if global_teacher_top2.shape[-1] > 1:
-                global_teacher_margin = global_teacher_top2[:, 0] - global_teacher_top2[:, 1]
-            valid_global_teacher = (
-                (global_teacher_best >= self.candidate_rerank_confidence_threshold)
-                & (global_teacher_margin >= self.candidate_rerank_margin_threshold)
-            )
-            if valid_global_teacher.any():
-                teacher_absolute_indices = key_indices[global_teacher_labels[valid_global_teacher]]
-                teacher_hit_mask = (
-                    (batch_candidate_indices[valid_global_teacher] == teacher_absolute_indices.unsqueeze(-1))
-                    & batch_candidate_valid[valid_global_teacher]
-                ).any(dim=-1)
-                retrieval_supervised_queries += int(valid_global_teacher.sum().item())
-                retrieval_hits += int(teacher_hit_mask.sum().item())
-
-            if not batch_candidate_valid.any():
-                continue
-
-            safe_candidate_indices = batch_candidate_indices.clamp_min(0)
-            candidate_patch_tokens = teacher_patch_tokens[batch_idx, safe_candidate_indices]
-            teacher_scores = (query_patch_tokens.unsqueeze(1) * candidate_patch_tokens).sum(dim=-1)
-            teacher_scores = teacher_scores.masked_fill(
-                ~batch_candidate_valid,
-                torch.finfo(teacher_scores.dtype).min,
-            )
-
-            valid_counts = batch_candidate_valid.sum(dim=-1)
-            teacher_best = teacher_scores.max(dim=-1).values
-            teacher_top2 = teacher_scores.topk(k=min(2, teacher_scores.shape[-1]), dim=-1).values
-            teacher_margin = torch.full_like(teacher_best, float("inf"))
-            if teacher_top2.shape[-1] > 1:
-                teacher_margin = teacher_top2[:, 0] - teacher_top2[:, 1]
-            valid_teacher = (
-                (valid_counts > 0)
-                & (teacher_best >= self.candidate_rerank_confidence_threshold)
-                & (teacher_margin >= self.candidate_rerank_margin_threshold)
-            )
-            if not valid_teacher.any():
-                continue
-
-            logits = batch_candidate_logits[valid_teacher] / self.candidate_rerank_temperature
-            base_logits = candidate_base_logits[batch_idx, query_indices][valid_teacher] / self.candidate_rerank_temperature
-            valid_mask = batch_candidate_valid[valid_teacher]
-            logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
-            base_logits = base_logits.masked_fill(~valid_mask, torch.finfo(base_logits.dtype).min)
-            teacher_labels = teacher_scores[valid_teacher].argmax(dim=-1)
-            loss_terms.append(F.cross_entropy(logits, teacher_labels))
-            predictions = logits.argmax(dim=-1)
-            base_predictions = base_logits.argmax(dim=-1)
-            supervised_queries += int(valid_teacher.sum().item())
-            correct_matches += int((predictions == teacher_labels).sum().item())
-            base_correct_matches += int((base_predictions == teacher_labels).sum().item())
-
-        metrics["candidate_rerank_teacher_in_topk"] = retrieval_hits / max(retrieval_supervised_queries, 1)
-        if not loss_terms:
-            return zero, metrics
-
-        loss = torch.stack(loss_terms).mean()
-        metrics["candidate_rerank"] = loss.item()
-        metrics["candidate_rerank_accuracy"] = correct_matches / max(supervised_queries, 1)
-        metrics["candidate_rerank_base_accuracy"] = base_correct_matches / max(supervised_queries, 1)
-        metrics["candidate_rerank_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
-        return loss, metrics
-
-    def _deformable_slot_teacher_loss(
-        self,
-        refined_target: torch.Tensor,
-        attention_aux: dict[str, object] | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        zero = refined_target.new_zeros(())
-        metrics = {
-            "deformable_slot_teacher": 0.0,
-            "deformable_slot_teacher_accuracy": 0.0,
-            "deformable_slot_teacher_supervised_ratio": 0.0,
-        }
-        if self.deformable_slot_teacher_weight <= 0 or attention_aux is None:
-            return zero, metrics
-        if attention_aux.get("copy_mode") != "deformable_slots":
-            return zero, metrics
-
-        query_mask_flat = attention_aux.get("query_mask_flat")
-        slot_logits = attention_aux.get("deformable_slot_logits")
-        slot_values = attention_aux.get("deformable_slot_values")
-        slot_validity = attention_aux.get("deformable_slot_validity")
-        fallback_values = attention_aux.get("deformable_fallback_values")
-        unmatched_logits = attention_aux.get("deformable_unmatched_logits")
-        value_patch_size = int(attention_aux.get("value_patch_size", 0))
-        value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
-        kernel_size = int(attention_aux.get("kernel_size", 0))
-        if (
-            query_mask_flat is None
-            or slot_logits is None
-            or slot_values is None
-            or slot_validity is None
-            or value_patch_size <= 0
-            or kernel_size <= 0
-        ):
-            return zero, metrics
-
-        target_patches = self._extract_patch_tokens(
-            refined_target,
-            patch_size=value_patch_size,
-            stride=kernel_size,
-            padding=value_patch_padding,
-        ).detach()
-        loss_terms = []
-        supervised_queries = 0
-        total_masked_queries = 0
-        correct_matches = 0
-
-        for batch_idx in range(target_patches.shape[0]):
-            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            total_masked_queries += int(query_indices.numel())
-            if query_indices.numel() == 0:
-                continue
-
-            target_tokens = target_patches[batch_idx, query_indices]
-            candidate_values = slot_values[batch_idx, query_indices]
-            candidate_validity = slot_validity[batch_idx, query_indices].to(dtype=candidate_values.dtype)
-            candidate_errors = (candidate_values - target_tokens.unsqueeze(1)).abs().mean(dim=-1)
-            candidate_errors = candidate_errors + ((1.0 - candidate_validity) * 1e3)
-            best_slot_errors, teacher_labels = candidate_errors.min(dim=-1)
-            logits = slot_logits[batch_idx, query_indices] / self.deformable_slot_teacher_temperature
-            supervised_mask = torch.ones_like(teacher_labels, dtype=torch.bool)
-
-            if unmatched_logits is not None:
-                fallback_errors = torch.full_like(best_slot_errors, float("inf"))
-                if fallback_values is not None:
-                    fallback_errors = (
-                        fallback_values[batch_idx, query_indices] - target_tokens
-                    ).abs().mean(dim=-1)
-                teacher_labels = torch.where(
-                    fallback_errors <= best_slot_errors,
-                    torch.full_like(teacher_labels, candidate_errors.shape[-1]),
-                    teacher_labels,
-                )
-                logits = torch.cat(
-                    [logits, unmatched_logits[batch_idx, query_indices].unsqueeze(-1)],
-                    dim=-1,
-                )
-
-            if not supervised_mask.any():
-                continue
-
-            loss_terms.append(F.cross_entropy(logits[supervised_mask], teacher_labels[supervised_mask]))
-            predictions = logits.argmax(dim=-1)
-            supervised_queries += int(supervised_mask.sum().item())
-            correct_matches += int((predictions[supervised_mask] == teacher_labels[supervised_mask]).sum().item())
-
-        if not loss_terms:
-            return zero, metrics
-
-        loss = torch.stack(loss_terms).mean()
-        metrics["deformable_slot_teacher"] = loss.item()
-        metrics["deformable_slot_teacher_accuracy"] = correct_matches / max(supervised_queries, 1)
-        metrics["deformable_slot_teacher_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
-        return loss, metrics
-
-    def _deformable_validity_loss(
-        self,
-        refined_target: torch.Tensor,
-        attention_aux: dict[str, object] | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        zero = refined_target.new_zeros(())
-        metrics = {"deformable_validity": 0.0}
-        if self.deformable_validity_weight <= 0 or attention_aux is None:
-            return zero, metrics
-        if attention_aux.get("copy_mode") != "deformable_slots":
-            return zero, metrics
-
-        query_mask_flat = attention_aux.get("query_mask_flat")
-        slot_probs = attention_aux.get("deformable_slot_probs")
-        slot_validity = attention_aux.get("deformable_slot_validity")
-        if query_mask_flat is None or slot_probs is None or slot_validity is None:
-            return zero, metrics
-
-        masked_queries = (query_mask_flat > 0.5).unsqueeze(-1).to(dtype=slot_probs.dtype)
-        weighted_invalidity = slot_probs * (1.0 - slot_validity.to(dtype=slot_probs.dtype)) * masked_queries
-        denom = (masked_queries * slot_probs.new_ones(slot_probs.shape)).sum().clamp_min(1e-6)
-        loss = weighted_invalidity.sum() / denom
-        metrics["deformable_validity"] = loss.item()
-        return loss, metrics
-
-    def _deformable_unmatched_prob_metric(
-        self,
-        refined_target: torch.Tensor,
-        attention_aux: dict[str, object] | None,
-    ) -> dict[str, float]:
-        metrics = {"deformable_unmatched_prob": 0.0}
-        if attention_aux is None:
-            return metrics
-        if attention_aux.get("copy_mode") != "deformable_slots":
-            return metrics
-
-        query_mask_flat = attention_aux.get("query_mask_flat")
-        unmatched_prob = attention_aux.get("deformable_unmatched_prob")
-        if query_mask_flat is None or unmatched_prob is None:
-            return metrics
-
-        masked_queries = query_mask_flat > 0.5
-        if masked_queries.any():
-            metrics["deformable_unmatched_prob"] = unmatched_prob[masked_queries].float().mean().item()
-        return metrics
-
-    def _deformable_offset_smoothness_loss(
-        self,
-        refined_target: torch.Tensor,
-        attention_aux: dict[str, object] | None,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        zero = refined_target.new_zeros(())
-        metrics = {"deformable_offset_smoothness": 0.0}
-        if self.deformable_offset_smoothness_weight <= 0 or attention_aux is None:
-            return zero, metrics
-        if attention_aux.get("copy_mode") != "deformable_slots":
-            return zero, metrics
-
-        query_mask_flat = attention_aux.get("query_mask_flat")
-        base_offsets = attention_aux.get("deformable_base_offsets")
-        if query_mask_flat is None or base_offsets is None:
-            return zero, metrics
-
-        token_grid_size = int(refined_target.shape[-1] // max(attention_aux.get("kernel_size", 1), 1))
-        coord_map = base_offsets.transpose(1, 2).contiguous().view(base_offsets.shape[0], 2, token_grid_size, token_grid_size)
-        query_mask_map = query_mask_flat.view(base_offsets.shape[0], 1, token_grid_size, token_grid_size).to(dtype=coord_map.dtype)
-        token_target = F.adaptive_avg_pool2d(refined_target, (token_grid_size, token_grid_size))
-        edge_x = torch.exp(
-            -self.deformable_offset_edge_scale
-            * (token_target[:, :, :, 1:] - token_target[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
-        )
-        edge_y = torch.exp(
-            -self.deformable_offset_edge_scale
-            * (token_target[:, :, 1:, :] - token_target[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
-        )
-        mask_x = query_mask_map[:, :, :, 1:] * query_mask_map[:, :, :, :-1]
-        mask_y = query_mask_map[:, :, 1:, :] * query_mask_map[:, :, :-1, :]
-        diff_x = (coord_map[:, :, :, 1:] - coord_map[:, :, :, :-1]).abs().sum(dim=1, keepdim=True)
-        diff_y = (coord_map[:, :, 1:, :] - coord_map[:, :, :-1, :]).abs().sum(dim=1, keepdim=True)
-        denom_x = (mask_x * edge_x).sum().clamp_min(1e-6)
-        denom_y = (mask_y * edge_y).sum().clamp_min(1e-6)
-        loss = 0.5 * (((diff_x * mask_x * edge_x).sum() / denom_x) + ((diff_y * mask_y * edge_y).sum() / denom_y))
-        metrics["deformable_offset_smoothness"] = loss.item()
-        return loss, metrics
-
     def generator_loss(
         self,
         coarse_raw: torch.Tensor,
@@ -690,26 +341,6 @@ class InpaintingLoss(nn.Module):
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         patch_teacher_loss, patch_teacher_metrics = self._patch_teacher_loss(refined_target, attention_aux)
-        candidate_rerank_loss, candidate_rerank_metrics = self._candidate_rerank_loss(
-            refined_target,
-            attention_aux,
-        )
-        deformable_slot_teacher_loss, deformable_slot_teacher_metrics = self._deformable_slot_teacher_loss(
-            refined_target,
-            attention_aux,
-        )
-        deformable_validity_loss, deformable_validity_metrics = self._deformable_validity_loss(
-            refined_target,
-            attention_aux,
-        )
-        deformable_unmatched_metrics = self._deformable_unmatched_prob_metric(
-            refined_target,
-            attention_aux,
-        )
-        deformable_offset_smoothness_loss, deformable_offset_smoothness_metrics = self._deformable_offset_smoothness_loss(
-            refined_target,
-            attention_aux,
-        )
         frequency = self.frequency_loss(refined, refined_target)
         perceptual = self.perceptual_loss(refined, refined_target)
 
@@ -732,10 +363,6 @@ class InpaintingLoss(nn.Module):
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + self.patch_teacher_weight * patch_teacher_loss
-            + self.candidate_rerank_weight * candidate_rerank_loss
-            + self.deformable_slot_teacher_weight * deformable_slot_teacher_loss
-            + self.deformable_validity_weight * deformable_validity_loss
-            + self.deformable_offset_smoothness_weight * deformable_offset_smoothness_loss
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
@@ -750,17 +377,6 @@ class InpaintingLoss(nn.Module):
             "patch_teacher": patch_teacher_metrics["patch_teacher"],
             "patch_teacher_accuracy": patch_teacher_metrics["patch_teacher_accuracy"],
             "patch_teacher_supervised_ratio": patch_teacher_metrics["patch_teacher_supervised_ratio"],
-            "candidate_rerank": candidate_rerank_metrics["candidate_rerank"],
-            "candidate_rerank_accuracy": candidate_rerank_metrics["candidate_rerank_accuracy"],
-            "candidate_rerank_base_accuracy": candidate_rerank_metrics["candidate_rerank_base_accuracy"],
-            "candidate_rerank_teacher_in_topk": candidate_rerank_metrics["candidate_rerank_teacher_in_topk"],
-            "candidate_rerank_supervised_ratio": candidate_rerank_metrics["candidate_rerank_supervised_ratio"],
-            "deformable_slot_teacher": deformable_slot_teacher_metrics["deformable_slot_teacher"],
-            "deformable_slot_teacher_accuracy": deformable_slot_teacher_metrics["deformable_slot_teacher_accuracy"],
-            "deformable_slot_teacher_supervised_ratio": deformable_slot_teacher_metrics["deformable_slot_teacher_supervised_ratio"],
-            "deformable_validity": deformable_validity_metrics["deformable_validity"],
-            "deformable_unmatched_prob": deformable_unmatched_metrics["deformable_unmatched_prob"],
-            "deformable_offset_smoothness": deformable_offset_smoothness_metrics["deformable_offset_smoothness"],
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),

@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -195,29 +193,12 @@ class PatchInpainting(nn.Module):
         attention_warmup_selection: str | None = None,
         attention_warmup_steps: int = 0,
         attention_gumbel_hard_start_step: int = 0,
-        copy_mode: str = "attention",
-        deformable_num_slots: int = 4,
-        deformable_hidden_channels: int = 128,
-        deformable_coarse_stride: int = 4,
-        deformable_base_offset_scale: float = 1.0,
-        deformable_residual_scale: float = 0.15,
-        deformable_use_unmatched: bool = True,
-        deformable_unmatched_start_step: int = 0,
-        deformable_hard_start_step: int = 0,
-        deformable_hard_inference: bool = True,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         normalize_matching_branches: bool = False,
         learnable_matching_branch_scales: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
-        candidate_reranker: bool = False,
-        candidate_reranker_hidden_dim: int = 128,
-        candidate_rerank_context_channels: int = 32,
-        candidate_rerank_selection: bool = False,
-        candidate_rerank_selection_max_alpha: float = 1.0,
-        candidate_rerank_selection_start_step: int = 0,
-        candidate_rerank_selection_ramp_steps: int = 0,
         query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
         shared_query_key_descriptor: bool = False,
@@ -255,18 +236,6 @@ class PatchInpainting(nn.Module):
         self.use_positional_encoding = bool(use_positional_encoding)
         self.feature_i = int(feature_i)
         self.feature_dim = int(feature_dim)
-        self.copy_mode = str(copy_mode).lower()
-        if self.copy_mode not in {"attention", "deformable_slots"}:
-            raise ValueError("copy_mode must be one of {'attention', 'deformable_slots'}.")
-        self.deformable_num_slots = int(deformable_num_slots)
-        self.deformable_hidden_channels = int(deformable_hidden_channels)
-        self.deformable_coarse_stride = int(deformable_coarse_stride)
-        self.deformable_base_offset_scale = float(deformable_base_offset_scale)
-        self.deformable_residual_scale = float(deformable_residual_scale)
-        self.deformable_use_unmatched = bool(deformable_use_unmatched)
-        self.deformable_unmatched_start_step = max(0, int(deformable_unmatched_start_step))
-        self.deformable_hard_start_step = max(0, int(deformable_hard_start_step))
-        self.deformable_hard_inference = bool(deformable_hard_inference)
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
@@ -275,13 +244,6 @@ class PatchInpainting(nn.Module):
         self.normalize_matching_branches = bool(normalize_matching_branches)
         self.learnable_matching_branch_scales = bool(learnable_matching_branch_scales)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
-        self.candidate_reranker = bool(candidate_reranker)
-        self.candidate_reranker_hidden_dim = int(candidate_reranker_hidden_dim)
-        self.candidate_rerank_context_channels = int(candidate_rerank_context_channels)
-        self.candidate_rerank_selection = bool(candidate_rerank_selection)
-        self.candidate_rerank_selection_max_alpha = float(candidate_rerank_selection_max_alpha)
-        self.candidate_rerank_selection_start_step = max(0, int(candidate_rerank_selection_start_step))
-        self.candidate_rerank_selection_ramp_steps = max(0, int(candidate_rerank_selection_ramp_steps))
         self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
@@ -292,16 +254,6 @@ class PatchInpainting(nn.Module):
         self.key_feature_residual_init = float(key_feature_residual_init)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
-        if self.candidate_reranker_hidden_dim <= 0:
-            raise ValueError("candidate_reranker_hidden_dim must be positive.")
-        if self.candidate_rerank_context_channels <= 0:
-            raise ValueError("candidate_rerank_context_channels must be positive.")
-        if self.candidate_rerank_selection_max_alpha < 0:
-            raise ValueError("candidate_rerank_selection_max_alpha must be non-negative.")
-        if self.candidate_rerank_selection and not self.candidate_reranker:
-            raise ValueError("candidate_rerank_selection requires candidate_reranker=True.")
-        if self.copy_mode == "deformable_slots" and self.candidate_reranker:
-            raise ValueError("candidate_reranker is only supported with copy_mode='attention'.")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -340,18 +292,6 @@ class PatchInpainting(nn.Module):
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
-        if self.deformable_num_slots <= 0:
-            raise ValueError("deformable_num_slots must be positive.")
-        if self.deformable_hidden_channels <= 0:
-            raise ValueError("deformable_hidden_channels must be positive.")
-        if self.deformable_coarse_stride <= 0 or self.token_grid_size % self.deformable_coarse_stride != 0:
-            raise ValueError("deformable_coarse_stride must be positive and evenly divide the token grid size.")
-        if self.deformable_base_offset_scale < 0:
-            raise ValueError("deformable_base_offset_scale must be non-negative.")
-        if self.deformable_residual_scale < 0:
-            raise ValueError("deformable_residual_scale must be non-negative.")
-        if self.deformable_unmatched_start_step < 0:
-            raise ValueError("deformable_unmatched_start_step must be non-negative.")
         self.matching_input_dim = 0
         if self.match_coarse_rgb:
             self.matching_input_dim += self.query_patch_dim
@@ -399,11 +339,6 @@ class PatchInpainting(nn.Module):
         self.key_coarse_rgb_scale = None
         self.key_feature_scale = None
         self.shared_query_key_descriptor_head = None
-        self.candidate_reranker_head = None
-        self.candidate_query_context_encoder = None
-        self.candidate_key_context_encoder = None
-        self.deformable_base_head = None
-        self.deformable_slot_head = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -465,71 +400,7 @@ class PatchInpainting(nn.Module):
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
         )
-        if self.candidate_reranker:
-            if self.multihead_attention.attention_top_k is None:
-                raise ValueError("candidate_reranker requires attention_top_k to be set.")
-            if not self.attention_masking:
-                raise ValueError("candidate_reranker currently requires attention_masking=True.")
-            self.candidate_query_context_encoder = self._build_context_encoder(
-                7,
-                self.candidate_rerank_context_channels,
-            )
-            self.candidate_key_context_encoder = self._build_context_encoder(
-                3,
-                self.candidate_rerank_context_channels,
-            )
-            rerank_input_dim = (self.patch_token_dim * 4) + (self.candidate_rerank_context_channels * 4)
-            self.candidate_reranker_head = nn.Sequential(
-                nn.Linear(rerank_input_dim, self.candidate_reranker_hidden_dim, bias=False),
-                nn.GELU(),
-                nn.Linear(self.candidate_reranker_hidden_dim, 1),
-            )
-            nn.init.zeros_(self.candidate_reranker_head[-1].weight)
-            nn.init.zeros_(self.candidate_reranker_head[-1].bias)
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
-        if self.copy_mode == "deformable_slots":
-            base_in_channels = self.patch_token_dim + 1
-            slot_in_channels = self.patch_token_dim + 3
-            slot_residual_channels = self.deformable_num_slots * 2
-            self.deformable_base_head = nn.Sequential(
-                nn.Conv2d(
-                    base_in_channels,
-                    self.deformable_hidden_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                    bias=False,
-                ),
-                nn.GELU(),
-                nn.Conv2d(self.deformable_hidden_channels, 2, kernel_size=1, stride=1),
-            )
-            slot_out_channels = (self.deformable_num_slots * 3) + (1 if self.deformable_use_unmatched else 0)
-            self.deformable_slot_head = nn.Sequential(
-                nn.Conv2d(
-                    slot_in_channels,
-                    self.deformable_hidden_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                    bias=False,
-                ),
-                nn.GELU(),
-                nn.Conv2d(self.deformable_hidden_channels, slot_out_channels, kernel_size=1, stride=1),
-            )
-            nn.init.zeros_(self.deformable_base_head[-1].weight)
-            nn.init.zeros_(self.deformable_base_head[-1].bias)
-            nn.init.zeros_(self.deformable_slot_head[-1].weight)
-            nn.init.zeros_(self.deformable_slot_head[-1].bias)
-            with torch.no_grad():
-                slot_offset_bias = self._build_deformable_slot_offset_bias()
-                if slot_offset_bias.numel() > 0:
-                    self.deformable_slot_head[-1].bias[:slot_residual_channels].copy_(
-                        slot_offset_bias.reshape(-1).to(dtype=self.deformable_slot_head[-1].bias.dtype)
-                    )
-                if self.deformable_use_unmatched:
-                    nn.init.constant_(self.deformable_slot_head[-1].bias[-1], -4.0)
         self.positionalencoding = (
             nn.Parameter(
                 torch.zeros(
@@ -628,21 +499,6 @@ class PatchInpainting(nn.Module):
             )
         else:
             self.multihead_attention.attention_gumbel_hard = True
-
-    def _candidate_rerank_selection_alpha(self) -> float:
-        if (not self.candidate_reranker) or (not self.candidate_rerank_selection):
-            return 0.0
-        if self.candidate_rerank_selection_max_alpha <= 0:
-            return 0.0
-        if self.current_training_step < self.candidate_rerank_selection_start_step:
-            return 0.0
-        if self.candidate_rerank_selection_ramp_steps <= 0:
-            return self.candidate_rerank_selection_max_alpha
-        progress = (
-            self.current_training_step - self.candidate_rerank_selection_start_step
-        ) / max(self.candidate_rerank_selection_ramp_steps, 1)
-        progress = max(0.0, min(float(progress), 1.0))
-        return self.candidate_rerank_selection_max_alpha * progress
 
     def _apply_branch_dropout(self, branch: torch.Tensor, drop_prob: float) -> torch.Tensor:
         if (not self.training) or drop_prob <= 0:
@@ -845,349 +701,21 @@ class PatchInpainting(nn.Module):
             output = output[..., padding:-padding, padding:-padding]
         return output
 
-    def _should_harden_deformable_copy(self) -> bool:
-        if not self.training:
-            return self.deformable_hard_inference
-        return self.current_training_step >= self.deformable_hard_start_step
-
-    def _should_use_deformable_unmatched(self) -> bool:
-        if not self.deformable_use_unmatched:
-            return False
-        if (not self.training) and self.current_training_step <= 0:
-            return True
-        return self.current_training_step >= self.deformable_unmatched_start_step
-
-    def _build_deformable_slot_offset_bias(self) -> torch.Tensor:
-        if self.deformable_num_slots <= 0 or self.deformable_residual_scale <= 0:
-            return torch.zeros((self.deformable_num_slots, 2), dtype=torch.float32)
-
-        angles = torch.linspace(
-            0.0,
-            2.0 * math.pi,
-            steps=self.deformable_num_slots + 1,
-            dtype=torch.float32,
-        )[:-1]
-        radius = self.deformable_residual_scale * 0.75
-        target_offsets = torch.stack([torch.cos(angles), torch.sin(angles)], dim=-1) * radius
-        normalized = (target_offsets / self.deformable_residual_scale).clamp_(-0.95, 0.95)
-        return torch.atanh(normalized)
-
-    def _selection_from_logits(
-        self,
-        logits: torch.Tensor,
-        *,
-        value_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        probs = F.softmax(logits, dim=-1).to(value_dtype)
-        if not self._should_harden_deformable_copy():
-            return probs, probs
-
-        hard = torch.zeros_like(probs)
-        hard.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
-        if self.training:
-            selection = hard - probs.detach() + probs
-        else:
-            selection = hard
-        return selection, probs
-
-    def _get_normalized_token_coords(
-        self,
-        token_hw: tuple[int, int],
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        height, width = token_hw
-        ys = torch.linspace(-1.0, 1.0, steps=height, dtype=dtype, device=device)
-        xs = torch.linspace(-1.0, 1.0, steps=width, dtype=dtype, device=device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        return torch.stack([grid_x, grid_y], dim=0).unsqueeze(0)
-
-    def _sample_slots_from_map(
-        self,
-        feature_map: torch.Tensor,
-        slot_coords: torch.Tensor,
-    ) -> torch.Tensor:
-        sampled = []
-        for slot_idx in range(slot_coords.shape[1]):
-            grid = slot_coords[:, slot_idx].permute(0, 2, 3, 1).contiguous()
-            sampled.append(
-                F.grid_sample(
-                    feature_map,
-                    grid,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=True,
-                )
-            )
-        return torch.stack(sampled, dim=1)
-
-    def _build_sparse_slot_attention(
-        self,
-        slot_coords_flat: torch.Tensor,
-        slot_probs_flat: torch.Tensor,
-        query_mask_flat: torch.Tensor,
-        token_hw: tuple[int, int],
-        *,
-        value_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        batch_size, num_patches, num_slots, _ = slot_coords_flat.shape
-        height, width = token_hw
-        dense_attn = torch.eye(num_patches, device=slot_coords_flat.device, dtype=value_dtype)
-        dense_attn = dense_attn.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
-        masked_queries = query_mask_flat > 0.5
-        width_scale = max(width - 1, 1)
-        height_scale = max(height - 1, 1)
-
-        for batch_idx in range(batch_size):
-            query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
-            if query_indices.numel() == 0:
-                continue
-
-            replacement_rows = dense_attn.new_zeros((query_indices.numel(), num_patches))
-            coords = slot_coords_flat[batch_idx, query_indices]
-            probs = slot_probs_flat[batch_idx, query_indices].to(dtype=replacement_rows.dtype)
-
-            x_pos = (coords[..., 0] + 1.0) * 0.5 * width_scale
-            y_pos = (coords[..., 1] + 1.0) * 0.5 * height_scale
-            x0 = x_pos.floor().long().clamp_(0, width - 1)
-            y0 = y_pos.floor().long().clamp_(0, height - 1)
-            x1 = (x0 + 1).clamp_(0, width - 1)
-            y1 = (y0 + 1).clamp_(0, height - 1)
-            wx1 = (x_pos - x0.to(dtype=x_pos.dtype)).clamp_(0.0, 1.0)
-            wy1 = (y_pos - y0.to(dtype=y_pos.dtype)).clamp_(0.0, 1.0)
-            wx0 = 1.0 - wx1
-            wy0 = 1.0 - wy1
-
-            candidate_indices = torch.stack(
-                [
-                    (y0 * width) + x0,
-                    (y0 * width) + x1,
-                    (y1 * width) + x0,
-                    (y1 * width) + x1,
-                ],
-                dim=-1,
-            )
-            bilinear_weights = torch.stack(
-                [
-                    wy0 * wx0,
-                    wy0 * wx1,
-                    wy1 * wx0,
-                    wy1 * wx1,
-                ],
-                dim=-1,
-            )
-            weighted_probs = (probs.unsqueeze(-1) * bilinear_weights).reshape(query_indices.numel(), -1)
-            replacement_rows.scatter_add_(
-                1,
-                candidate_indices.reshape(query_indices.numel(), -1),
-                weighted_probs,
-            )
-            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
-
-        return dense_attn
-
-    def _deformable_slot_copy(
-        self,
-        query_tokens_full: torch.Tensor,
-        key_tokens_full: torch.Tensor,
-        source_patch_map: torch.Tensor,
-        fallback_patch_map: torch.Tensor,
-        query_mask_flat: torch.Tensor,
-        key_valid_flat: torch.Tensor,
-        token_hw: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        batch_size, num_patches, token_dim = query_tokens_full.shape
-        height, width = token_hw
-        query_token_map = query_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
-        key_token_map = key_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
-        query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
-        valid_key_map = key_valid_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
-
-        base_head_input = torch.cat([query_token_map, query_mask_map], dim=1)
-        coarse_input = F.avg_pool2d(
-            base_head_input,
-            kernel_size=self.deformable_coarse_stride,
-            stride=self.deformable_coarse_stride,
-        )
-        base_offset_low = torch.tanh(self.deformable_base_head(coarse_input)) * self.deformable_base_offset_scale
-        base_offset_map = F.interpolate(
-            base_offset_low,
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        base_coords = torch.clamp(
-            self._get_normalized_token_coords(token_hw, dtype=query_token_map.dtype, device=query_token_map.device)
-            + base_offset_map,
-            -1.0,
-            1.0,
-        )
-        slot_head_input = torch.cat([query_token_map, query_mask_map, base_offset_map], dim=1)
-        slot_params = self.deformable_slot_head(slot_head_input)
-        slot_residual_channels = self.deformable_num_slots * 2
-        slot_bias_channels = self.deformable_num_slots
-        slot_residual = slot_params[:, :slot_residual_channels].view(
-            batch_size,
-            self.deformable_num_slots,
-            2,
-            height,
-            width,
-        )
-        slot_residual = torch.tanh(slot_residual) * self.deformable_residual_scale
-        slot_bias = slot_params[
-            :,
-            slot_residual_channels : slot_residual_channels + slot_bias_channels,
-        ].view(batch_size, self.deformable_num_slots, height, width)
-        use_unmatched = self._should_use_deformable_unmatched()
-        unmatched_logits_map = None
-        if use_unmatched:
-            unmatched_logits_map = slot_params[:, -1:, :, :]
-
-        slot_coords = torch.clamp(base_coords.unsqueeze(1) + slot_residual, -1.0, 1.0)
-        sampled_values = self._sample_slots_from_map(source_patch_map, slot_coords)
-        sampled_key_tokens = self._sample_slots_from_map(key_token_map, slot_coords)
-        sampled_validity = self._sample_slots_from_map(valid_key_map, slot_coords).squeeze(2)
-
-        slot_logits = slot_bias + (
-            (query_token_map.unsqueeze(1) * sampled_key_tokens).sum(dim=2) / (token_dim ** 0.5)
-        )
-        slot_logits = slot_logits + torch.log(sampled_validity.clamp_min(1e-6))
-        sampled_values = sampled_values * sampled_validity.unsqueeze(2).to(dtype=sampled_values.dtype)
-
-        slot_logits_flat = slot_logits.permute(0, 2, 3, 1).reshape(batch_size, num_patches, self.deformable_num_slots)
-        sampled_validity_flat = sampled_validity.permute(0, 2, 3, 1).reshape(
-            batch_size,
-            num_patches,
-            self.deformable_num_slots,
-        )
-        sampled_values_flat = sampled_values.permute(0, 3, 4, 1, 2).reshape(
-            batch_size,
-            num_patches,
-            self.deformable_num_slots,
-            self.value_patch_dim,
-        )
-        slot_coords_flat = slot_coords.permute(0, 3, 4, 1, 2).reshape(
-            batch_size,
-            num_patches,
-            self.deformable_num_slots,
-            2,
-        )
-        base_coords_flat = base_coords.permute(0, 2, 3, 1).reshape(batch_size, num_patches, 2)
-        base_offset_flat = base_offset_map.permute(0, 2, 3, 1).reshape(batch_size, num_patches, 2)
-        fallback_patch_flat = fallback_patch_map.flatten(start_dim=2).transpose(1, 2)
-
-        mixed = fallback_patch_flat.clone()
-        slot_probs_full = slot_logits_flat.new_zeros(slot_logits_flat.shape)
-        unmatched_probs_full = slot_logits_flat.new_zeros((batch_size, num_patches))
-        for batch_idx in range(batch_size):
-            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            if query_indices.numel() == 0:
-                continue
-
-            query_slot_logits = slot_logits_flat[batch_idx, query_indices]
-            if unmatched_logits_map is not None:
-                unmatched_logits = unmatched_logits_map.permute(0, 2, 3, 1).reshape(batch_size, num_patches)[
-                    batch_idx,
-                    query_indices,
-                ].unsqueeze(-1)
-                final_logits = torch.cat([query_slot_logits, unmatched_logits], dim=-1)
-                selection, probs = self._selection_from_logits(final_logits, value_dtype=source_patch_map.dtype)
-                slot_selection = selection[:, :-1]
-                slot_probs = probs[:, :-1]
-                unmatched_selection = selection[:, -1:].to(dtype=source_patch_map.dtype)
-                unmatched_probs = probs[:, -1]
-            else:
-                slot_selection, slot_probs = self._selection_from_logits(
-                    query_slot_logits,
-                    value_dtype=source_patch_map.dtype,
-                )
-                unmatched_selection = slot_selection.new_zeros((slot_selection.shape[0], 1))
-                unmatched_probs = slot_probs.new_zeros(slot_probs.shape[0])
-
-            mixed_queries = torch.einsum(
-                "qk,qkp->qp",
-                slot_selection,
-                sampled_values_flat[batch_idx, query_indices],
-            ).to(dtype=mixed.dtype)
-            mixed_queries = mixed_queries + (unmatched_selection * fallback_patch_flat[batch_idx, query_indices])
-            mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
-            slot_probs_full[batch_idx, query_indices] = slot_probs.to(dtype=slot_probs_full.dtype)
-            unmatched_probs_full[batch_idx, query_indices] = unmatched_probs.to(dtype=unmatched_probs_full.dtype)
-
-        dense_attn = self._build_sparse_slot_attention(
-            slot_coords_flat,
-            slot_probs_full,
-            query_mask_flat,
-            token_hw,
-            value_dtype=source_patch_map.dtype,
-        )
-        aux = {
-            "copy_mode": self.copy_mode,
-            "deformable_slot_logits": slot_logits_flat,
-            "deformable_slot_probs": slot_probs_full,
-            "deformable_slot_validity": sampled_validity_flat,
-            "deformable_slot_values": sampled_values_flat,
-            "deformable_fallback_values": fallback_patch_flat,
-            "deformable_slot_coords": slot_coords_flat,
-            "deformable_base_coords": base_coords_flat,
-            "deformable_base_offsets": base_offset_flat,
-            "deformable_unmatched_prob": unmatched_probs_full,
-            "deformable_unmatched_active": use_unmatched,
-        }
-        if unmatched_logits_map is not None:
-            aux["deformable_unmatched_logits"] = unmatched_logits_map.permute(0, 2, 3, 1).reshape(
-                batch_size,
-                num_patches,
-            )
-        return mixed, dense_attn, aux
-
     def direct_patch_mix_masked_queries(
         self,
         query_tokens_full: torch.Tensor,
         key_tokens_full: torch.Tensor,
-        query_context_tokens_full: torch.Tensor | None,
-        key_context_tokens_full: torch.Tensor | None,
         patch_values: torch.Tensor,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_patches, _ = query_tokens_full.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
         eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
         dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
         valid_keys = key_valid_flat > 0.5
-        rerank_aux = None
-        shortlist_k = self.multihead_attention.attention_top_k
-        if self.candidate_reranker and shortlist_k is not None:
-            selection_alpha = self._candidate_rerank_selection_alpha()
-            rerank_aux = {
-                "candidate_indices": torch.full(
-                    (batch_size, num_patches, shortlist_k),
-                    -1,
-                    dtype=torch.long,
-                    device=patch_values.device,
-                ),
-                "candidate_base_logits": torch.zeros(
-                    (batch_size, num_patches, shortlist_k),
-                    dtype=query_tokens_full.dtype,
-                    device=query_tokens_full.device,
-                ),
-                "candidate_logits": torch.zeros(
-                    (batch_size, num_patches, shortlist_k),
-                    dtype=query_tokens_full.dtype,
-                    device=query_tokens_full.device,
-                ),
-                "candidate_valid_mask": torch.zeros(
-                    (batch_size, num_patches, shortlist_k),
-                    dtype=torch.bool,
-                    device=query_tokens_full.device,
-                ),
-                "candidate_selection_alpha": query_tokens_full.new_tensor(selection_alpha),
-            }
 
         for batch_idx in range(batch_size):
             query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
@@ -1200,80 +728,20 @@ class PatchInpainting(nn.Module):
                 query_tokens = query_tokens_full[batch_idx : batch_idx + 1, query_indices]
                 key_tokens = key_tokens_full[batch_idx : batch_idx + 1, key_indices]
                 value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
-                if self.candidate_reranker:
-                    _, base_logits = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
-                    base_logits = base_logits.squeeze(0).squeeze(0)
-                    candidate_count = min(base_logits.shape[-1], self.multihead_attention.attention_top_k)
-                    base_candidate_logits, candidate_local_indices = torch.topk(
-                        base_logits,
-                        k=candidate_count,
-                        dim=-1,
-                    )
-                    query_tokens_flat = query_tokens.squeeze(0)
-                    key_tokens_flat = key_tokens.squeeze(0)
-                    value_tokens_flat = value_tokens.squeeze(0)
-                    query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
-                    candidate_key_tokens = key_tokens_flat[candidate_local_indices]
-                    candidate_value_tokens = value_tokens_flat[candidate_local_indices]
-                    if query_context_tokens_full is None or key_context_tokens_full is None:
-                        raise ValueError("candidate_reranker requires query/key context tokens.")
-                    query_context_tokens = query_context_tokens_full[batch_idx, query_indices]
-                    key_context_tokens = key_context_tokens_full[batch_idx, key_indices]
-                    query_context_expanded = query_context_tokens.unsqueeze(1).expand(-1, candidate_count, -1)
-                    candidate_key_context_tokens = key_context_tokens[candidate_local_indices]
-                    rerank_features = torch.cat(
-                        [
-                            query_expanded,
-                            candidate_key_tokens,
-                            query_expanded - candidate_key_tokens,
-                            query_expanded * candidate_key_tokens,
-                            query_context_expanded,
-                            candidate_key_context_tokens,
-                            query_context_expanded - candidate_key_context_tokens,
-                            query_context_expanded * candidate_key_context_tokens,
-                        ],
-                        dim=-1,
-                    )
-                    rerank_delta = self.candidate_reranker_head(rerank_features).squeeze(-1)
-                    rerank_logits = base_candidate_logits + rerank_delta
-                    selection_logits = base_candidate_logits + (selection_alpha * rerank_delta)
-                    selection_attn, selection_probs = self.multihead_attention.attention_from_logits(
-                        selection_logits,
-                        value_dtype=value_tokens.dtype,
-                        direct_patch_mixing=True,
-                    )
-                    mixed_queries = torch.einsum(
-                        "qk,qkd->qd",
-                        selection_attn,
-                        candidate_value_tokens,
-                    ).to(dtype=mixed.dtype)
-                    masked_attention = replacement_rows.new_zeros((query_indices.numel(), key_indices.numel()))
-                    masked_attention.scatter_(
-                        1,
-                        candidate_local_indices,
-                        selection_probs.to(dtype=masked_attention.dtype),
-                    )
-                    candidate_absolute_indices = key_indices[candidate_local_indices]
-                    replacement_rows[:, key_indices] = masked_attention
-                    rerank_aux["candidate_indices"][batch_idx, query_indices, :candidate_count] = candidate_absolute_indices
-                    rerank_aux["candidate_base_logits"][batch_idx, query_indices, :candidate_count] = base_candidate_logits
-                    rerank_aux["candidate_logits"][batch_idx, query_indices, :candidate_count] = rerank_logits
-                    rerank_aux["candidate_valid_mask"][batch_idx, query_indices, :candidate_count] = True
-                else:
-                    mixed_queries, masked_attention = self.multihead_attention(
-                        query_tokens,
-                        key_tokens,
-                        value_tokens,
-                        direct_patch_mixing=True,
-                    )
-                    mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
-                    masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
-                    replacement_rows[:, key_indices] = masked_attention
+                mixed_queries, masked_attention = self.multihead_attention(
+                    query_tokens,
+                    key_tokens,
+                    value_tokens,
+                    direct_patch_mixing=True,
+                )
+                mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
+                masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
+                replacement_rows[:, key_indices] = masked_attention
                 mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
 
             dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
 
-        return mixed, dense_attn, rerank_aux
+        return mixed, dense_attn
 
     def build_paper_attention_mask(
         self,
@@ -1369,13 +837,6 @@ class PatchInpainting(nn.Module):
             stride=self.kernel_size,
             padding=self.value_patch_padding,
         )
-        visible_value_base = value_base * (1.0 - mask)
-        visible_source_patch_map, _ = self.extract_patches(
-            visible_value_base,
-            self.value_patch_size,
-            stride=self.kernel_size,
-            padding=self.value_patch_padding,
-        )
         query_mask_flat = self.flatten_query_mask(mask)
         key_mask_patch_map, _ = self.extract_patches(
             mask,
@@ -1387,19 +848,6 @@ class PatchInpainting(nn.Module):
 
         query_matching_tokens = None
         key_matching_tokens = None
-        candidate_query_context_tokens = None
-        candidate_key_context_tokens = None
-        if self.candidate_reranker:
-            candidate_query_context_map = self._pool_to_token_grid(
-                self.candidate_query_context_encoder(torch.cat([image, coarse_composite, mask], dim=1)),
-                patch_map.shape[-2:],
-            )
-            candidate_key_context_map = self._pool_to_token_grid(
-                self.candidate_key_context_encoder(known_image),
-                patch_map.shape[-2:],
-            )
-            candidate_query_context_tokens = candidate_query_context_map.flatten(start_dim=2).transpose(1, 2)
-            candidate_key_context_tokens = candidate_key_context_map.flatten(start_dim=2).transpose(1, 2)
         if self.separate_query_key_matching:
             visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
             query_context_map = self._pool_to_token_grid(
@@ -1508,32 +956,12 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
-        fallback_patch_map, _ = self.extract_patches(
-            coarse_composite,
-            self.value_patch_size,
-            stride=self.kernel_size,
-            padding=self.value_patch_padding,
-        )
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
-            fallback_patch_map = torch.zeros_like(source_patch_map)
-        rerank_aux = None
-        if self.copy_mode == "deformable_slots":
-            mixed_patches_flat, masked_attention, rerank_aux = self._deformable_slot_copy(
+        if self.attention_masking:
+            mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
-                visible_source_patch_map,
-                fallback_patch_map,
-                query_mask_flat,
-                key_valid_flat,
-                patch_map.shape[-2:],
-            )
-        elif self.attention_masking:
-            mixed_patches_flat, masked_attention, rerank_aux = self.direct_patch_mix_masked_queries(
-                query_tokens,
-                key_tokens,
-                candidate_query_context_tokens,
-                candidate_key_context_tokens,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
@@ -1580,12 +1008,9 @@ class PatchInpainting(nn.Module):
                 "kernel_size": self.kernel_size,
                 "value_patch_size": self.value_patch_size,
                 "value_patch_padding": self.value_patch_padding,
-                "copy_mode": self.copy_mode,
                 "matching_tokens": query_matching_tokens,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
             }
-            if rerank_aux is not None:
-                aux.update(rerank_aux)
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw

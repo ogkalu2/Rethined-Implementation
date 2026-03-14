@@ -281,26 +281,6 @@ def format_train_metric_snapshot(metrics):
             f", pta={metrics['patch_teacher_accuracy']:.3f}"
             f", pts={metrics['patch_teacher_supervised_ratio']:.3f}"
         )
-    if "candidate_rerank" in metrics:
-        summary += (
-            f", rr={metrics['candidate_rerank']:.4f}"
-            f", rra={metrics['candidate_rerank_accuracy']:.3f}"
-            f", rrb={metrics['candidate_rerank_base_accuracy']:.3f}"
-            f", rrh={metrics['candidate_rerank_teacher_in_topk']:.3f}"
-            f", rrs={metrics['candidate_rerank_supervised_ratio']:.3f}"
-        )
-    if "deformable_slot_teacher" in metrics:
-        summary += (
-            f", dst={metrics['deformable_slot_teacher']:.4f}"
-            f", dsta={metrics['deformable_slot_teacher_accuracy']:.3f}"
-            f", dsts={metrics['deformable_slot_teacher_supervised_ratio']:.3f}"
-        )
-    if "deformable_validity" in metrics:
-        summary += f", dval={metrics['deformable_validity']:.4f}"
-    if "deformable_unmatched_prob" in metrics:
-        summary += f", dun={metrics['deformable_unmatched_prob']:.4f}"
-    if "deformable_offset_smoothness" in metrics:
-        summary += f", dsm={metrics['deformable_offset_smoothness']:.4f}"
     return summary
 
 
@@ -748,46 +728,6 @@ def train(cfg, args):
                     metrics["patch_teacher_supervised_ratio"],
                     step,
                 )
-            if "candidate_rerank" in metrics:
-                writer.add_scalar("loss/candidate_rerank", metrics["candidate_rerank"], step)
-                writer.add_scalar("candidate_rerank/accuracy", metrics["candidate_rerank_accuracy"], step)
-                writer.add_scalar(
-                    "candidate_rerank/base_accuracy",
-                    metrics["candidate_rerank_base_accuracy"],
-                    step,
-                )
-                writer.add_scalar(
-                    "candidate_rerank/teacher_in_topk",
-                    metrics["candidate_rerank_teacher_in_topk"],
-                    step,
-                )
-                writer.add_scalar(
-                    "candidate_rerank/supervised_ratio",
-                    metrics["candidate_rerank_supervised_ratio"],
-                    step,
-                )
-            if "deformable_slot_teacher" in metrics:
-                writer.add_scalar("loss/deformable_slot_teacher", metrics["deformable_slot_teacher"], step)
-                writer.add_scalar(
-                    "deformable_slot_teacher/accuracy",
-                    metrics["deformable_slot_teacher_accuracy"],
-                    step,
-                )
-                writer.add_scalar(
-                    "deformable_slot_teacher/supervised_ratio",
-                    metrics["deformable_slot_teacher_supervised_ratio"],
-                    step,
-                )
-            if "deformable_validity" in metrics:
-                writer.add_scalar("loss/deformable_validity", metrics["deformable_validity"], step)
-            if "deformable_unmatched_prob" in metrics:
-                writer.add_scalar("deformable/unmatched_prob", metrics["deformable_unmatched_prob"], step)
-            if "deformable_offset_smoothness" in metrics:
-                writer.add_scalar(
-                    "loss/deformable_offset_smoothness",
-                    metrics["deformable_offset_smoothness"],
-                    step,
-                )
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -816,16 +756,6 @@ def train(cfg, args):
                     pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
                     pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
-                    rr=(f"{metrics['candidate_rerank']:.4f}" if "candidate_rerank" in metrics else "n/a"),
-                    rra=(f"{metrics['candidate_rerank_accuracy']:.3f}" if "candidate_rerank_accuracy" in metrics else "n/a"),
-                    rrb=(f"{metrics['candidate_rerank_base_accuracy']:.3f}" if "candidate_rerank_base_accuracy" in metrics else "n/a"),
-                    rrh=(f"{metrics['candidate_rerank_teacher_in_topk']:.3f}" if "candidate_rerank_teacher_in_topk" in metrics else "n/a"),
-                    rrs=(f"{metrics['candidate_rerank_supervised_ratio']:.3f}" if "candidate_rerank_supervised_ratio" in metrics else "n/a"),
-                    dst=(f"{metrics['deformable_slot_teacher']:.4f}" if "deformable_slot_teacher" in metrics else "n/a"),
-                    dsta=(f"{metrics['deformable_slot_teacher_accuracy']:.3f}" if "deformable_slot_teacher_accuracy" in metrics else "n/a"),
-                    dval=(f"{metrics['deformable_validity']:.4f}" if "deformable_validity" in metrics else "n/a"),
-                    dun=(f"{metrics['deformable_unmatched_prob']:.4f}" if "deformable_unmatched_prob" in metrics else "n/a"),
-                    dsm=(f"{metrics['deformable_offset_smoothness']:.4f}" if "deformable_offset_smoothness" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,

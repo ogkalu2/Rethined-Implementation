@@ -10,16 +10,6 @@ model:
     kernel_size: 8
     value_patch_size: 8
     value_source: "rgb"
-    copy_mode: "deformable_slots"
-    deformable_num_slots: 4
-    deformable_hidden_channels: 128
-    deformable_coarse_stride: 4
-    deformable_base_offset_scale: 1.0
-    deformable_residual_scale: 0.15
-    deformable_use_unmatched: true
-    deformable_unmatched_start_step: 1000
-    deformable_hard_start_step: 1000
-    deformable_hard_inference: true
     attention_temperature: 0.5
     attention_top_k: 32
     attention_selection: "gumbel"
@@ -32,13 +22,6 @@ model:
     normalize_matching_branches: false
     learnable_matching_branch_scales: false
     coarse_rgb_branch_dropout: 0
-    candidate_reranker: false
-    candidate_reranker_hidden_dim: 128
-    candidate_rerank_context_channels: 32
-    candidate_rerank_selection: false
-    candidate_rerank_selection_max_alpha: 1.0
-    candidate_rerank_selection_start_step: 1000
-    candidate_rerank_selection_ramp_steps: 1000
     query_image_context_matching: true
     separate_query_key_matching: false
     shared_query_key_descriptor: false
@@ -99,16 +82,6 @@ loss:
   patch_teacher_temperature: 0.1
   patch_teacher_confidence_threshold: 0.2
   patch_teacher_margin_threshold: 0.03
-  candidate_rerank_weight: 0.0
-  candidate_rerank_temperature: 1.0
-  candidate_rerank_confidence_threshold: 0.2
-  candidate_rerank_margin_threshold: 0.03
-  deformable_slot_teacher_weight: 0.1
-  deformable_slot_teacher_temperature: 1.0
-  deformable_slot_teacher_confidence_threshold: 0.2
-  deformable_validity_weight: 0.05
-  deformable_offset_smoothness_weight: 0.02
-  deformable_offset_edge_scale: 5.0
   frequency_weight: 0.5
   perceptual_weight: 0.15
   adversarial_weight: 0.02
