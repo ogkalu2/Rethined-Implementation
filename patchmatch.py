@@ -907,7 +907,7 @@ class PatchInpainting(nn.Module):
         sampled_values_flat = normalized_values.flatten(start_dim=2).transpose(1, 2)
         sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
         hard_validity_flat = hard_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
-        fallback_mask = sampled_validity_flat < self.transport_fallback_validity_threshold
+        fallback_mask = hard_validity_flat < self.transport_fallback_validity_threshold
         if default_tokens is not None:
             valid_copy = (~fallback_mask).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
