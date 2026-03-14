@@ -991,7 +991,6 @@ class PatchInpainting(nn.Module):
             ~coarse_valid_flat.unsqueeze(1),
             torch.finfo(coarse_logits.dtype).min,
         )
-        logit_dtype = coarse_logits.dtype
 
         unmatched_logits = None
         if self.coarse_to_fine_unmatched_head is not None:
@@ -1030,7 +1029,7 @@ class PatchInpainting(nn.Module):
             fine_coord_flat,
         )
 
-        query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=predicted_coords.dtype)
+        query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=dtype)
         coord_map = predicted_coords.transpose(1, 2).contiguous().view(batch_size, 2, height, width)
         coord_map = (coord_map * query_mask_map) + (token_coord_map * (1.0 - query_mask_map))
         coarse_confidence_map = coarse_confidence.view(batch_size, 1, height, width)
@@ -1063,8 +1062,8 @@ class PatchInpainting(nn.Module):
         )
         local_candidate_logits = torch.full(
             (batch_size, num_patches, total_local_candidates),
-            torch.finfo(logit_dtype).min,
-            dtype=logit_dtype,
+            torch.finfo(dtype).min,
+            dtype=dtype,
             device=device,
         )
         local_candidate_valid_mask = torch.zeros(
@@ -1080,11 +1079,11 @@ class PatchInpainting(nn.Module):
         )
         coarse_top_logits = torch.full(
             (batch_size, num_patches, top_m),
-            torch.finfo(logit_dtype).min,
-            dtype=logit_dtype,
+            torch.finfo(dtype).min,
+            dtype=dtype,
             device=device,
         )
-        final_unmatched_probs = torch.zeros((batch_size, num_patches), dtype=logit_dtype, device=device)
+        final_unmatched_probs = torch.zeros((batch_size, num_patches), dtype=dtype, device=device)
 
         if default_tokens is None:
             default_tokens = patch_values
@@ -1097,7 +1096,7 @@ class PatchInpainting(nn.Module):
             batch_coarse_logits = coarse_logits[batch_idx, query_indices]
             batch_top_logits, batch_top_indices = torch.topk(batch_coarse_logits, k=top_m, dim=-1)
             coarse_top_indices[batch_idx, query_indices] = batch_top_indices
-            coarse_top_logits[batch_idx, query_indices] = batch_top_logits.to(dtype=coarse_top_logits.dtype)
+            coarse_top_logits[batch_idx, query_indices] = batch_top_logits
 
             batch_candidate_indices = bank_indices[batch_top_indices].reshape(query_indices.numel(), -1)
             batch_candidate_coords = bank_coords[batch_top_indices].reshape(query_indices.numel(), -1, 2)
@@ -1132,7 +1131,7 @@ class PatchInpainting(nn.Module):
             )
 
             local_candidate_indices[batch_idx, query_indices] = batch_candidate_indices
-            local_candidate_logits[batch_idx, query_indices] = candidate_logits.to(dtype=local_candidate_logits.dtype)
+            local_candidate_logits[batch_idx, query_indices] = candidate_logits
             local_candidate_valid_mask[batch_idx, query_indices] = batch_candidate_valid
 
             fallback_tokens = default_tokens[batch_idx, query_indices]
@@ -1168,7 +1167,7 @@ class PatchInpainting(nn.Module):
             replacement_rows.scatter_add_(1, batch_candidate_indices, candidate_probs.to(dtype=replacement_rows.dtype))
             mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
             dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
-            final_unmatched_probs[batch_idx, query_indices] = unmatched_probs.to(dtype=final_unmatched_probs.dtype)
+            final_unmatched_probs[batch_idx, query_indices] = unmatched_probs
 
         aux = {
             "coarse_cell_logits": coarse_logits,
