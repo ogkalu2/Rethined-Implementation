@@ -289,20 +289,6 @@ def format_train_metric_snapshot(metrics):
             f", rrh={metrics['candidate_rerank_teacher_in_topk']:.3f}"
             f", rrs={metrics['candidate_rerank_supervised_ratio']:.3f}"
         )
-    if "coarse_correspondence" in metrics:
-        summary += (
-            f", cc={metrics['coarse_correspondence']:.4f}"
-            f", cca={metrics['coarse_correspondence_accuracy']:.3f}"
-            f", ccs={metrics['coarse_correspondence_supervised_ratio']:.3f}"
-        )
-    if "local_correspondence" in metrics:
-        summary += (
-            f", lc={metrics['local_correspondence']:.4f}"
-            f", lca={metrics['local_correspondence_accuracy']:.3f}"
-            f", lcs={metrics['local_correspondence_supervised_ratio']:.3f}"
-        )
-    if "coordinate_consistency" in metrics:
-        summary += f", coord={metrics['coordinate_consistency']:.4f}"
     return summary
 
 
@@ -767,32 +753,6 @@ def train(cfg, args):
                     metrics["candidate_rerank_supervised_ratio"],
                     step,
                 )
-            if "coarse_correspondence" in metrics:
-                writer.add_scalar("loss/coarse_correspondence", metrics["coarse_correspondence"], step)
-                writer.add_scalar(
-                    "coarse_correspondence/accuracy",
-                    metrics["coarse_correspondence_accuracy"],
-                    step,
-                )
-                writer.add_scalar(
-                    "coarse_correspondence/supervised_ratio",
-                    metrics["coarse_correspondence_supervised_ratio"],
-                    step,
-                )
-            if "local_correspondence" in metrics:
-                writer.add_scalar("loss/local_correspondence", metrics["local_correspondence"], step)
-                writer.add_scalar(
-                    "local_correspondence/accuracy",
-                    metrics["local_correspondence_accuracy"],
-                    step,
-                )
-                writer.add_scalar(
-                    "local_correspondence/supervised_ratio",
-                    metrics["local_correspondence_supervised_ratio"],
-                    step,
-                )
-            if "coordinate_consistency" in metrics:
-                writer.add_scalar("loss/coordinate_consistency", metrics["coordinate_consistency"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -826,11 +786,6 @@ def train(cfg, args):
                     rrb=(f"{metrics['candidate_rerank_base_accuracy']:.3f}" if "candidate_rerank_base_accuracy" in metrics else "n/a"),
                     rrh=(f"{metrics['candidate_rerank_teacher_in_topk']:.3f}" if "candidate_rerank_teacher_in_topk" in metrics else "n/a"),
                     rrs=(f"{metrics['candidate_rerank_supervised_ratio']:.3f}" if "candidate_rerank_supervised_ratio" in metrics else "n/a"),
-                    cc=(f"{metrics['coarse_correspondence']:.4f}" if "coarse_correspondence" in metrics else "n/a"),
-                    cca=(f"{metrics['coarse_correspondence_accuracy']:.3f}" if "coarse_correspondence_accuracy" in metrics else "n/a"),
-                    lc=(f"{metrics['local_correspondence']:.4f}" if "local_correspondence" in metrics else "n/a"),
-                    lca=(f"{metrics['local_correspondence_accuracy']:.3f}" if "local_correspondence_accuracy" in metrics else "n/a"),
-                    coord=(f"{metrics['coordinate_consistency']:.4f}" if "coordinate_consistency" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,

@@ -193,7 +193,6 @@ class PatchInpainting(nn.Module):
         attention_warmup_selection: str | None = None,
         attention_warmup_steps: int = 0,
         attention_gumbel_hard_start_step: int = 0,
-        matching_mode: str = "dense_attention",
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
@@ -215,17 +214,6 @@ class PatchInpainting(nn.Module):
         query_context_residual_init: float = 0.0,
         key_coarse_rgb_residual_init: float = 0.0,
         key_feature_residual_init: float = 0.0,
-        coarse_to_fine_cell_stride: int = 4,
-        coarse_to_fine_top_m: int = 4,
-        coarse_to_fine_local_window: int = 7,
-        coarse_to_fine_temperature: float = 1.0,
-        coarse_to_fine_hidden_dim: int = 128,
-        coarse_to_fine_use_unmatched: bool = True,
-        coarse_to_fine_unmatched_bias: float = 0.0,
-        coarse_to_fine_hard_start_step: int = 0,
-        coarse_to_fine_hard_inference: bool = True,
-        coarse_to_fine_coord_iters: int = 2,
-        coarse_to_fine_coord_hidden_channels: int = 32,
         value_source: str = "rgb",
         fusion_mode: str = "replace",
         fusion_hidden_channels: int = 32,
@@ -258,9 +246,6 @@ class PatchInpainting(nn.Module):
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
-        self.matching_mode = str(matching_mode).lower()
-        if self.matching_mode not in {"dense_attention", "coarse_to_fine"}:
-            raise ValueError("matching_mode must be one of {'dense_attention', 'coarse_to_fine'}.")
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.normalize_matching_branches = bool(normalize_matching_branches)
@@ -281,17 +266,6 @@ class PatchInpainting(nn.Module):
         self.query_context_residual_init = float(query_context_residual_init)
         self.key_coarse_rgb_residual_init = float(key_coarse_rgb_residual_init)
         self.key_feature_residual_init = float(key_feature_residual_init)
-        self.coarse_to_fine_cell_stride = int(coarse_to_fine_cell_stride)
-        self.coarse_to_fine_top_m = int(coarse_to_fine_top_m)
-        self.coarse_to_fine_local_window = int(coarse_to_fine_local_window)
-        self.coarse_to_fine_temperature = float(coarse_to_fine_temperature)
-        self.coarse_to_fine_hidden_dim = int(coarse_to_fine_hidden_dim)
-        self.coarse_to_fine_use_unmatched = bool(coarse_to_fine_use_unmatched)
-        self.coarse_to_fine_unmatched_bias = float(coarse_to_fine_unmatched_bias)
-        self.coarse_to_fine_hard_start_step = max(0, int(coarse_to_fine_hard_start_step))
-        self.coarse_to_fine_hard_inference = bool(coarse_to_fine_hard_inference)
-        self.coarse_to_fine_coord_iters = max(0, int(coarse_to_fine_coord_iters))
-        self.coarse_to_fine_coord_hidden_channels = int(coarse_to_fine_coord_hidden_channels)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
         if self.candidate_reranker_hidden_dim <= 0:
@@ -306,8 +280,6 @@ class PatchInpainting(nn.Module):
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
             )
-        if self.matching_mode == "coarse_to_fine" and self.candidate_reranker:
-            raise ValueError("candidate_reranker is only supported with matching_mode='dense_attention'.")
         if self.separate_query_key_matching:
             if self.query_context_channels <= 0:
                 raise ValueError("query_context_channels must be positive when separate_query_key_matching=True.")
@@ -342,22 +314,6 @@ class PatchInpainting(nn.Module):
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
-        if self.coarse_to_fine_cell_stride <= 0:
-            raise ValueError("coarse_to_fine_cell_stride must be positive.")
-        if self.token_grid_size % self.coarse_to_fine_cell_stride != 0:
-            raise ValueError(
-                "coarse_to_fine_cell_stride must evenly divide the token grid size."
-            )
-        if self.coarse_to_fine_top_m <= 0:
-            raise ValueError("coarse_to_fine_top_m must be positive.")
-        if self.coarse_to_fine_local_window <= 0 or self.coarse_to_fine_local_window % 2 == 0:
-            raise ValueError("coarse_to_fine_local_window must be a positive odd integer.")
-        if self.coarse_to_fine_temperature <= 0:
-            raise ValueError("coarse_to_fine_temperature must be positive.")
-        if self.coarse_to_fine_hidden_dim <= 0:
-            raise ValueError("coarse_to_fine_hidden_dim must be positive.")
-        if self.coarse_to_fine_coord_hidden_channels <= 0:
-            raise ValueError("coarse_to_fine_coord_hidden_channels must be positive.")
         self.matching_input_dim = 0
         if self.match_coarse_rgb:
             self.matching_input_dim += self.query_patch_dim
@@ -408,10 +364,6 @@ class PatchInpainting(nn.Module):
         self.candidate_reranker_head = None
         self.candidate_query_context_encoder = None
         self.candidate_key_context_encoder = None
-        self.coarse_to_fine_local_match_head = None
-        self.coarse_to_fine_unmatched_head = None
-        self.coarse_to_fine_coord_refiner = None
-        self.coarse_to_fine_coord_bias_scale = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -495,51 +447,6 @@ class PatchInpainting(nn.Module):
             nn.init.zeros_(self.candidate_reranker_head[-1].weight)
             nn.init.zeros_(self.candidate_reranker_head[-1].bias)
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
-        if self.matching_mode == "coarse_to_fine":
-            self.coarse_to_fine_local_match_head = nn.Sequential(
-                nn.Linear((self.patch_token_dim * 4) + 2, self.coarse_to_fine_hidden_dim, bias=False),
-                nn.GELU(),
-                nn.Linear(self.coarse_to_fine_hidden_dim, 1),
-            )
-            self.coarse_to_fine_unmatched_head = (
-                nn.Linear(self.patch_token_dim, 1)
-                if self.coarse_to_fine_use_unmatched
-                else None
-            )
-            if self.coarse_to_fine_unmatched_head is not None:
-                nn.init.zeros_(self.coarse_to_fine_unmatched_head.weight)
-                nn.init.constant_(self.coarse_to_fine_unmatched_head.bias, self.coarse_to_fine_unmatched_bias)
-            self.coarse_to_fine_coord_refiner = nn.Sequential(
-                nn.Conv2d(
-                    7,
-                    self.coarse_to_fine_coord_hidden_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                    bias=False,
-                ),
-                nn.GELU(),
-                nn.Conv2d(
-                    self.coarse_to_fine_coord_hidden_channels,
-                    self.coarse_to_fine_coord_hidden_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                    bias=False,
-                ),
-                nn.GELU(),
-                nn.Conv2d(
-                    self.coarse_to_fine_coord_hidden_channels,
-                    3,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                ),
-            )
-            self.coarse_to_fine_coord_bias_scale = nn.Parameter(torch.tensor(1.0))
         self.positionalencoding = (
             nn.Parameter(
                 torch.zeros(
@@ -854,343 +761,6 @@ class PatchInpainting(nn.Module):
         if padding > 0:
             output = output[..., padding:-padding, padding:-padding]
         return output
-
-    def _hard_selection_from_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        selection = torch.zeros_like(logits)
-        top_indices = logits.argmax(dim=-1, keepdim=True)
-        selection.scatter_(-1, top_indices, 1.0)
-        return selection
-
-    def _should_harden_coarse_to_fine_selection(self) -> bool:
-        if not self.training:
-            return self.coarse_to_fine_hard_inference
-        return self.current_training_step >= self.coarse_to_fine_hard_start_step
-
-    def _selection_from_logits(
-        self,
-        logits: torch.Tensor,
-        *,
-        value_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        probs = F.softmax(logits, dim=-1).to(value_dtype)
-        if not self._should_harden_coarse_to_fine_selection():
-            return probs, probs
-
-        hard = self._hard_selection_from_logits(logits).to(value_dtype)
-        if self.training:
-            selection = hard - probs.detach() + probs
-        else:
-            selection = hard
-        return selection, probs
-
-    def _get_token_coordinate_map(
-        self,
-        token_hw: tuple[int, int],
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> torch.Tensor:
-        height, width = token_hw
-        ys = torch.linspace(0.0, 1.0, steps=height, dtype=dtype, device=device)
-        xs = torch.linspace(0.0, 1.0, steps=width, dtype=dtype, device=device)
-        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-        return torch.stack([grid_y, grid_x], dim=0).unsqueeze(0)
-
-    def _build_coarse_candidate_bank(
-        self,
-        token_hw: tuple[int, int],
-        *,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        height, width = token_hw
-        stride = self.coarse_to_fine_cell_stride
-        coarse_h = height // stride
-        coarse_w = width // stride
-        local_window = self.coarse_to_fine_local_window
-        radius = local_window // 2
-        candidate_count = local_window * local_window
-        cell_count = coarse_h * coarse_w
-
-        bank_indices = torch.zeros((cell_count, candidate_count), dtype=torch.long, device=device)
-        bank_valid = torch.zeros((cell_count, candidate_count), dtype=torch.bool, device=device)
-        bank_coords = torch.zeros((cell_count, candidate_count, 2), dtype=dtype, device=device)
-        cell_centers = torch.zeros((cell_count, 2), dtype=dtype, device=device)
-
-        cell_id = 0
-        height_denom = max(height - 1, 1)
-        width_denom = max(width - 1, 1)
-        for coarse_y in range(coarse_h):
-            center_y = min((coarse_y * stride) + (stride // 2), height - 1)
-            for coarse_x in range(coarse_w):
-                center_x = min((coarse_x * stride) + (stride // 2), width - 1)
-                cell_centers[cell_id, 0] = float(center_y) / float(height_denom)
-                cell_centers[cell_id, 1] = float(center_x) / float(width_denom)
-                candidate_id = 0
-                for offset_y in range(-radius, radius + 1):
-                    for offset_x in range(-radius, radius + 1):
-                        fine_y = center_y + offset_y
-                        fine_x = center_x + offset_x
-                        is_valid = 0 <= fine_y < height and 0 <= fine_x < width
-                        if is_valid:
-                            bank_indices[cell_id, candidate_id] = (fine_y * width) + fine_x
-                            bank_valid[cell_id, candidate_id] = True
-                            bank_coords[cell_id, candidate_id, 0] = float(fine_y) / float(height_denom)
-                            bank_coords[cell_id, candidate_id, 1] = float(fine_x) / float(width_denom)
-                        candidate_id += 1
-                cell_id += 1
-
-        return bank_indices, bank_valid, bank_coords, cell_centers
-
-    def _coarse_to_fine_match(
-        self,
-        query_tokens_full: torch.Tensor,
-        key_tokens_full: torch.Tensor,
-        patch_values: torch.Tensor,
-        query_mask_flat: torch.Tensor,
-        key_valid_flat: torch.Tensor,
-        token_hw: tuple[int, int],
-        coarse_composite: torch.Tensor,
-        default_tokens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        batch_size, num_patches, token_dim = query_tokens_full.shape
-        height, width = token_hw
-        device = patch_values.device
-        dtype = query_tokens_full.dtype
-        value_dtype = patch_values.dtype
-
-        mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
-        dense_attn = torch.eye(num_patches, device=device, dtype=value_dtype).unsqueeze(0).unsqueeze(0)
-        dense_attn = dense_attn.repeat(batch_size, 1, 1, 1)
-        masked_queries = query_mask_flat > 0.5
-
-        token_coord_map = self._get_token_coordinate_map(token_hw, dtype=dtype, device=device)
-        fine_coord_flat = token_coord_map.flatten(start_dim=2).transpose(1, 2)
-        fine_coord_flat = fine_coord_flat.expand(batch_size, -1, -1)
-
-        key_tokens_map = key_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
-        key_valid_map = key_valid_flat.view(batch_size, 1, height, width).to(dtype=dtype)
-        coarse_valid_scores = F.avg_pool2d(
-            key_valid_map,
-            kernel_size=self.coarse_to_fine_cell_stride,
-            stride=self.coarse_to_fine_cell_stride,
-        )
-        coarse_valid_mask = coarse_valid_scores > 0
-        coarse_key_den = coarse_valid_scores.clamp_min(1e-6)
-        coarse_key_map = F.avg_pool2d(
-            key_tokens_map * key_valid_map,
-            kernel_size=self.coarse_to_fine_cell_stride,
-            stride=self.coarse_to_fine_cell_stride,
-        ) / coarse_key_den
-        coarse_key_tokens = coarse_key_map.flatten(start_dim=2).transpose(1, 2)
-        coarse_valid_flat = coarse_valid_mask.flatten(start_dim=1)
-
-        coarse_logits = torch.matmul(query_tokens_full, coarse_key_tokens.transpose(1, 2).contiguous())
-        coarse_logits = coarse_logits / ((token_dim ** 0.5) * self.coarse_to_fine_temperature)
-        coarse_logits = coarse_logits.masked_fill(
-            ~coarse_valid_flat.unsqueeze(1),
-            torch.finfo(coarse_logits.dtype).min,
-        )
-
-        unmatched_logits = None
-        if self.coarse_to_fine_unmatched_head is not None:
-            unmatched_logits = self.coarse_to_fine_unmatched_head(query_tokens_full).squeeze(-1)
-
-        bank_indices, bank_valid, bank_coords, cell_centers = self._build_coarse_candidate_bank(
-            token_hw,
-            dtype=dtype,
-            device=device,
-        )
-        local_candidate_count = bank_indices.shape[-1]
-        top_m = min(self.coarse_to_fine_top_m, coarse_key_tokens.shape[1])
-        total_local_candidates = top_m * local_candidate_count
-
-        if unmatched_logits is not None:
-            coarse_distribution_logits = torch.cat([coarse_logits, unmatched_logits.unsqueeze(-1)], dim=-1)
-            coarse_distribution = F.softmax(coarse_distribution_logits, dim=-1)
-            unmatched_mass = coarse_distribution[..., -1]
-            matched_mass = (1.0 - unmatched_mass).clamp_min(1e-6)
-            conditional_coarse_probs = coarse_distribution[..., :-1] / matched_mass.unsqueeze(-1)
-            coarse_confidence = matched_mass * conditional_coarse_probs.max(dim=-1).values
-        else:
-            conditional_coarse_probs = F.softmax(coarse_logits, dim=-1)
-            unmatched_mass = torch.zeros(
-                (batch_size, num_patches),
-                dtype=conditional_coarse_probs.dtype,
-                device=device,
-            )
-            coarse_confidence = conditional_coarse_probs.max(dim=-1).values
-
-        coarse_centers = cell_centers.unsqueeze(0).expand(batch_size, -1, -1)
-        predicted_coords = torch.matmul(conditional_coarse_probs, coarse_centers)
-        predicted_coords = torch.where(
-            (1.0 - unmatched_mass).unsqueeze(-1) > 1e-4,
-            predicted_coords,
-            fine_coord_flat,
-        )
-
-        query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=dtype)
-        coord_map = predicted_coords.transpose(1, 2).contiguous().view(batch_size, 2, height, width)
-        coord_map = (coord_map * query_mask_map) + (token_coord_map * (1.0 - query_mask_map))
-        coarse_confidence_map = coarse_confidence.view(batch_size, 1, height, width)
-        coarse_confidence_map = (
-            (coarse_confidence_map * query_mask_map)
-            + ((1.0 - query_mask_map).to(dtype=coarse_confidence_map.dtype))
-        )
-        coarse_context_map = F.adaptive_avg_pool2d(coarse_composite, token_hw)
-        coord_bias_map = coarse_confidence_map.new_full(
-            (batch_size, 1, height, width),
-            F.softplus(self.coarse_to_fine_coord_bias_scale).item(),
-        )
-        for _ in range(self.coarse_to_fine_coord_iters):
-            refiner_input = torch.cat([coord_map, coarse_confidence_map, query_mask_map, coarse_context_map], dim=1)
-            refiner_output = self.coarse_to_fine_coord_refiner(refiner_input)
-            coord_delta = 0.125 * torch.tanh(refiner_output[:, :2])
-            coord_map = torch.clamp(coord_map + (coord_delta * query_mask_map), 0.0, 1.0)
-            coord_map = (coord_map * query_mask_map) + (token_coord_map * (1.0 - query_mask_map))
-            coord_bias_map = F.softplus(refiner_output[:, 2:3] + self.coarse_to_fine_coord_bias_scale)
-
-        refined_coord_flat = coord_map.flatten(start_dim=2).transpose(1, 2)
-        refined_bias_flat = coord_bias_map.flatten(start_dim=2).transpose(1, 2)
-        coarse_confidence_flat = coarse_confidence_map.flatten(start_dim=2).squeeze(1)
-
-        local_candidate_indices = torch.full(
-            (batch_size, num_patches, total_local_candidates),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
-        local_candidate_logits = torch.full(
-            (batch_size, num_patches, total_local_candidates),
-            torch.finfo(dtype).min,
-            dtype=dtype,
-            device=device,
-        )
-        local_candidate_valid_mask = torch.zeros(
-            (batch_size, num_patches, total_local_candidates),
-            dtype=torch.bool,
-            device=device,
-        )
-        coarse_top_indices = torch.full(
-            (batch_size, num_patches, top_m),
-            -1,
-            dtype=torch.long,
-            device=device,
-        )
-        coarse_top_logits = torch.full(
-            (batch_size, num_patches, top_m),
-            torch.finfo(dtype).min,
-            dtype=dtype,
-            device=device,
-        )
-        final_unmatched_probs = torch.zeros((batch_size, num_patches), dtype=dtype, device=device)
-
-        if default_tokens is None:
-            default_tokens = patch_values
-
-        for batch_idx in range(batch_size):
-            query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
-            if query_indices.numel() == 0:
-                continue
-
-            batch_coarse_logits = coarse_logits[batch_idx, query_indices]
-            batch_top_logits, batch_top_indices = torch.topk(batch_coarse_logits, k=top_m, dim=-1)
-            coarse_top_indices[batch_idx, query_indices] = batch_top_indices
-            coarse_top_logits[batch_idx, query_indices] = batch_top_logits
-
-            batch_candidate_indices = bank_indices[batch_top_indices].reshape(query_indices.numel(), -1)
-            batch_candidate_coords = bank_coords[batch_top_indices].reshape(query_indices.numel(), -1, 2)
-            batch_candidate_bank_valid = bank_valid[batch_top_indices].reshape(query_indices.numel(), -1)
-            batch_candidate_key_valid = key_valid_flat[batch_idx, batch_candidate_indices] > 0.5
-            batch_candidate_valid = batch_candidate_bank_valid & batch_candidate_key_valid
-
-            query_tokens = query_tokens_full[batch_idx, query_indices]
-            candidate_key_tokens = key_tokens_full[batch_idx, batch_candidate_indices]
-            candidate_values = patch_values[batch_idx, batch_candidate_indices]
-            refined_centers = refined_coord_flat[batch_idx, query_indices].unsqueeze(1)
-            rel_coords = batch_candidate_coords - refined_centers
-            query_tokens_expanded = query_tokens.unsqueeze(1).expand_as(candidate_key_tokens)
-            rerank_features = torch.cat(
-                [
-                    query_tokens_expanded,
-                    candidate_key_tokens,
-                    query_tokens_expanded - candidate_key_tokens,
-                    query_tokens_expanded * candidate_key_tokens,
-                    rel_coords,
-                ],
-                dim=-1,
-            )
-            local_delta = self.coarse_to_fine_local_match_head(rerank_features).squeeze(-1)
-            candidate_logits = batch_top_logits.unsqueeze(-1).expand(-1, -1, local_candidate_count)
-            candidate_logits = candidate_logits.reshape(query_indices.numel(), -1) + local_delta
-            coord_bias = refined_bias_flat[batch_idx, query_indices]
-            candidate_logits = candidate_logits - (coord_bias * rel_coords.pow(2).sum(dim=-1))
-            candidate_logits = candidate_logits.masked_fill(
-                ~batch_candidate_valid,
-                torch.finfo(candidate_logits.dtype).min,
-            )
-
-            local_candidate_indices[batch_idx, query_indices] = batch_candidate_indices
-            local_candidate_logits[batch_idx, query_indices] = candidate_logits
-            local_candidate_valid_mask[batch_idx, query_indices] = batch_candidate_valid
-
-            fallback_tokens = default_tokens[batch_idx, query_indices]
-            if unmatched_logits is not None:
-                unmatched_query_logits = unmatched_logits[batch_idx, query_indices].unsqueeze(-1)
-                final_logits = torch.cat([candidate_logits, unmatched_query_logits], dim=-1)
-                no_valid_candidates = ~batch_candidate_valid.any(dim=-1)
-                if no_valid_candidates.any():
-                    final_logits[no_valid_candidates, :-1] = torch.finfo(final_logits.dtype).min
-                selection, probs = self._selection_from_logits(final_logits, value_dtype=value_dtype)
-                candidate_selection = selection[:, :-1]
-                candidate_probs = probs[:, :-1]
-                unmatched_selection = selection[:, -1:].to(value_dtype)
-                unmatched_probs = probs[:, -1]
-            else:
-                has_valid_candidates = batch_candidate_valid.any(dim=-1)
-                if not has_valid_candidates.any():
-                    continue
-                selection, probs = self._selection_from_logits(
-                    candidate_logits[has_valid_candidates],
-                    value_dtype=value_dtype,
-                )
-                candidate_selection = candidate_logits.new_zeros(candidate_logits.shape, dtype=value_dtype)
-                candidate_probs = candidate_logits.new_zeros(candidate_logits.shape, dtype=value_dtype)
-                candidate_selection[has_valid_candidates] = selection
-                candidate_probs[has_valid_candidates] = probs
-                unmatched_selection = candidate_selection.new_zeros((candidate_selection.shape[0], 1))
-                unmatched_probs = candidate_probs.new_zeros(candidate_probs.shape[0])
-
-            mixed_queries = torch.einsum("qc,qcd->qd", candidate_selection, candidate_values)
-            mixed_queries = mixed_queries + (unmatched_selection * fallback_tokens)
-            replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
-            replacement_rows.scatter_add_(1, batch_candidate_indices, candidate_probs.to(dtype=replacement_rows.dtype))
-            mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
-            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
-            final_unmatched_probs[batch_idx, query_indices] = unmatched_probs
-
-        aux = {
-            "coarse_cell_logits": coarse_logits,
-            "coarse_cell_valid_mask": coarse_valid_flat,
-            "coarse_top_indices": coarse_top_indices,
-            "coarse_top_logits": coarse_top_logits,
-            "local_candidate_indices": local_candidate_indices,
-            "local_candidate_logits": local_candidate_logits,
-            "local_candidate_valid_mask": local_candidate_valid_mask,
-            "correspondence_unmatched_logits": unmatched_logits,
-            "correspondence_unmatched_prob": final_unmatched_probs,
-            "predicted_source_coords": refined_coord_flat,
-            "predicted_source_confidence": coarse_confidence_flat,
-            "coarse_grid_size": torch.tensor(
-                [height // self.coarse_to_fine_cell_stride, width // self.coarse_to_fine_cell_stride],
-                dtype=torch.long,
-                device=device,
-            ),
-            "token_grid_size_hw": torch.tensor([height, width], dtype=torch.long, device=device),
-            "coarse_cell_stride": torch.tensor(self.coarse_to_fine_cell_stride, dtype=torch.long, device=device),
-            "local_window_size": torch.tensor(self.coarse_to_fine_local_window, dtype=torch.long, device=device),
-        }
-        return mixed, dense_attn, aux
 
     def direct_patch_mix_masked_queries(
         self,
@@ -1550,29 +1120,10 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
-        fallback_patch_map, _ = self.extract_patches(
-            coarse_composite,
-            self.value_patch_size,
-            stride=self.kernel_size,
-            padding=self.value_patch_padding,
-        )
-        fallback_patch_values = fallback_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
-            fallback_patch_values = default_patch_values
         rerank_aux = None
-        if self.matching_mode == "coarse_to_fine":
-            mixed_patches_flat, masked_attention, rerank_aux = self._coarse_to_fine_match(
-                query_tokens,
-                key_tokens,
-                patch_values,
-                query_mask_flat,
-                key_valid_flat,
-                patch_map.shape[-2:],
-                coarse_composite,
-                default_tokens=fallback_patch_values,
-            )
-        elif self.attention_masking:
+        if self.attention_masking:
             mixed_patches_flat, masked_attention, rerank_aux = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
@@ -1624,7 +1175,6 @@ class PatchInpainting(nn.Module):
                 "kernel_size": self.kernel_size,
                 "value_patch_size": self.value_patch_size,
                 "value_patch_padding": self.value_patch_padding,
-                "matching_mode": self.matching_mode,
                 "matching_tokens": query_matching_tokens,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
