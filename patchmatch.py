@@ -199,7 +199,7 @@ class PatchInpainting(nn.Module):
         transport_offset_scale: float = 1.0,
         transport_refine_scale: float = 0.25,
         transport_self_supervision_ratio: float = 0.0,
-        transport_fallback_validity_threshold: float = 0.5,
+        transport_fallback_validity_threshold: float = 0.1,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
@@ -882,17 +882,16 @@ class PatchInpainting(nn.Module):
 
         sampled_values = self._sample_transport_map(source_patch_map, coords)
         sampled_validity = sampled_validity.clamp(0.0, 1.0)
-        sampled_values = torch.where(
+        normalized_values = torch.where(
             sampled_validity > 1e-3,
             sampled_values / sampled_validity.clamp_min(1e-3).to(dtype=sampled_values.dtype),
             torch.zeros_like(sampled_values),
         )
-        sampled_values_flat = sampled_values.flatten(start_dim=2).transpose(1, 2)
+        sampled_values_flat = normalized_values.flatten(start_dim=2).transpose(1, 2)
         sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
+        fallback_mask = sampled_validity_flat < self.transport_fallback_validity_threshold
         if default_tokens is not None:
-            valid_copy = (
-                sampled_validity_flat >= self.transport_fallback_validity_threshold
-            ).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
+            valid_copy = (~fallback_mask).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
         aux = {
             "copy_mode": self.copy_mode,
@@ -900,8 +899,10 @@ class PatchInpainting(nn.Module):
             "key_valid_flat": key_valid_flat,
             "transport_coords": coords.flatten(start_dim=2).transpose(1, 2),
             "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
+            "transport_copy_values": normalized_values.flatten(start_dim=2).transpose(1, 2),
             "transport_values": sampled_values_flat,
             "transport_validity": sampled_validity_flat,
+            "transport_fallback_mask": fallback_mask,
         }
         if confidence is not None:
             aux["transport_confidence"] = confidence.flatten(start_dim=2).transpose(1, 2).squeeze(-1)

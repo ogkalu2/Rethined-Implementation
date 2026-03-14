@@ -23,6 +23,7 @@ model:
     transport_offset_scale: 1.0
     transport_refine_scale: 0.25
     transport_self_supervision_ratio: 0.0
+    transport_fallback_validity_threshold: 0.1
     matching_descriptor_dim: 256
     match_coarse_rgb: true
     normalize_matching_branches: false
