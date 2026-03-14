@@ -113,13 +113,9 @@ class InpaintingLoss(nn.Module):
         patch_teacher_temperature: float = 0.1,
         patch_teacher_confidence_threshold: float = 0.2,
         patch_teacher_margin_threshold: float = 0.03,
-        direct_retriever_weight: float = 0.0,
-        direct_retriever_temperature: float = 0.1,
-        direct_retriever_teacher_top_k: int = 4,
-        direct_retriever_negative_top_k: int = 16,
-        direct_retriever_teacher_temperature: float = 0.2,
-        direct_retriever_confidence_threshold: float = 0.2,
-        direct_retriever_margin_threshold: float = 0.03,
+        coarse_global_matcher_weight: float = 0.0,
+        coarse_global_matcher_confidence_threshold: float = 0.2,
+        coarse_global_matcher_margin_threshold: float = 0.03,
         candidate_rerank_weight: float = 0.0,
         candidate_rerank_temperature: float = 1.0,
         candidate_rerank_confidence_threshold: float = 0.2,
@@ -142,13 +138,9 @@ class InpaintingLoss(nn.Module):
         self.patch_teacher_temperature = float(patch_teacher_temperature)
         self.patch_teacher_confidence_threshold = float(patch_teacher_confidence_threshold)
         self.patch_teacher_margin_threshold = float(patch_teacher_margin_threshold)
-        self.direct_retriever_weight = float(direct_retriever_weight)
-        self.direct_retriever_temperature = float(direct_retriever_temperature)
-        self.direct_retriever_teacher_top_k = max(1, int(direct_retriever_teacher_top_k))
-        self.direct_retriever_negative_top_k = max(0, int(direct_retriever_negative_top_k))
-        self.direct_retriever_teacher_temperature = float(direct_retriever_teacher_temperature)
-        self.direct_retriever_confidence_threshold = float(direct_retriever_confidence_threshold)
-        self.direct_retriever_margin_threshold = float(direct_retriever_margin_threshold)
+        self.coarse_global_matcher_weight = float(coarse_global_matcher_weight)
+        self.coarse_global_matcher_confidence_threshold = float(coarse_global_matcher_confidence_threshold)
+        self.coarse_global_matcher_margin_threshold = float(coarse_global_matcher_margin_threshold)
         self.candidate_rerank_weight = float(candidate_rerank_weight)
         self.candidate_rerank_temperature = float(candidate_rerank_temperature)
         self.candidate_rerank_confidence_threshold = float(candidate_rerank_confidence_threshold)
@@ -169,12 +161,8 @@ class InpaintingLoss(nn.Module):
             raise ValueError("patch_teacher_temperature must be positive.")
         if self.patch_teacher_weight < 0:
             raise ValueError("patch_teacher_weight must be non-negative.")
-        if self.direct_retriever_temperature <= 0:
-            raise ValueError("direct_retriever_temperature must be positive.")
-        if self.direct_retriever_teacher_temperature <= 0:
-            raise ValueError("direct_retriever_teacher_temperature must be positive.")
-        if self.direct_retriever_weight < 0:
-            raise ValueError("direct_retriever_weight must be non-negative.")
+        if self.coarse_global_matcher_weight < 0:
+            raise ValueError("coarse_global_matcher_weight must be non-negative.")
         if self.candidate_rerank_temperature <= 0:
             raise ValueError("candidate_rerank_temperature must be positive.")
         if self.candidate_rerank_weight < 0:
@@ -184,6 +172,18 @@ class InpaintingLoss(nn.Module):
         tokens = tokens.float()
         tokens = tokens - tokens.mean(dim=-1, keepdim=True)
         return F.normalize(tokens, dim=-1, eps=1e-6)
+
+    def _pool_patch_tokens(self, tokens: torch.Tensor, pool_size: int) -> torch.Tensor:
+        pool_size = max(1, int(pool_size))
+        if pool_size == 1:
+            return tokens
+        batch_size, num_tokens, token_dim = tokens.shape
+        grid_size = int(num_tokens ** 0.5)
+        if grid_size * grid_size != num_tokens:
+            raise ValueError(f"Expected square token grid, got {num_tokens} tokens.")
+        token_map = tokens.transpose(1, 2).reshape(batch_size, token_dim, grid_size, grid_size)
+        pooled_map = F.avg_pool2d(token_map, kernel_size=pool_size, stride=pool_size)
+        return pooled_map.flatten(start_dim=2).transpose(1, 2)
 
     def _extract_patch_tokens(
         self,
@@ -468,36 +468,41 @@ class InpaintingLoss(nn.Module):
         metrics["candidate_rerank_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
         return loss, metrics
 
-    def _direct_retriever_loss(
+    def _coarse_global_matcher_loss(
         self,
         refined_target: torch.Tensor,
         attention_aux: dict[str, object] | None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         zero = refined_target.new_zeros(())
         metrics = {
-            "direct_retriever": 0.0,
-            "direct_retriever_accuracy": 0.0,
-            "direct_retriever_supervised_ratio": 0.0,
+            "coarse_global_matcher": 0.0,
+            "coarse_global_matcher_accuracy": 0.0,
+            "coarse_global_matcher_supervised_ratio": 0.0,
+            "coarse_global_matcher_dustbin_ratio": 0.0,
         }
-        if self.direct_retriever_weight <= 0 or attention_aux is None:
+        if self.coarse_global_matcher_weight <= 0 or attention_aux is None:
             return zero, metrics
 
-        query_mask_flat = attention_aux.get("query_mask_flat")
-        key_valid_flat = attention_aux.get("key_valid_flat")
-        query_retrieval_tokens = attention_aux.get("candidate_query_retrieval_tokens")
-        key_retrieval_tokens = attention_aux.get("candidate_key_retrieval_tokens")
-        retrieval_scale = attention_aux.get("candidate_context_retrieval_scale")
+        coarse_query_tokens = attention_aux.get("coarse_global_query_tokens")
+        coarse_key_tokens = attention_aux.get("coarse_global_key_tokens")
+        coarse_query_mask_flat = attention_aux.get("coarse_query_mask_flat")
+        coarse_key_valid_flat = attention_aux.get("coarse_key_valid_flat")
+        coarse_dustbin_logits = attention_aux.get("coarse_global_dustbin_logits")
+        coarse_matcher_scale = attention_aux.get("coarse_global_matcher_scale")
         kernel_size = int(attention_aux.get("kernel_size", 0))
         value_patch_size = int(attention_aux.get("value_patch_size", 0))
         value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
+        coarse_pool_size = int(attention_aux.get("coarse_global_pool_size", 0))
         if (
-            query_mask_flat is None
-            or key_valid_flat is None
-            or query_retrieval_tokens is None
-            or key_retrieval_tokens is None
-            or retrieval_scale is None
+            coarse_query_tokens is None
+            or coarse_key_tokens is None
+            or coarse_query_mask_flat is None
+            or coarse_key_valid_flat is None
+            or coarse_dustbin_logits is None
+            or coarse_matcher_scale is None
             or kernel_size <= 0
             or value_patch_size <= 0
+            or coarse_pool_size <= 0
         ):
             return zero, metrics
 
@@ -508,74 +513,57 @@ class InpaintingLoss(nn.Module):
             padding=value_patch_padding,
         )
         teacher_patch_tokens = self._normalize_descriptors(target_patches.detach())
+        coarse_teacher_tokens = self._pool_patch_tokens(teacher_patch_tokens, coarse_pool_size)
 
         loss_terms = []
-        supervised_queries = 0
-        total_masked_queries = 0
-        positive_hits = 0
+        total_queries = 0
+        correct = 0
+        dustbin_targets = 0
 
-        for batch_idx in range(teacher_patch_tokens.shape[0]):
-            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            key_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            total_masked_queries += int(query_indices.numel())
+        for batch_idx in range(coarse_teacher_tokens.shape[0]):
+            query_indices = (coarse_query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            key_indices = (coarse_key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            total_queries += int(query_indices.numel())
             if query_indices.numel() == 0 or key_indices.numel() == 0:
                 continue
 
-            query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
-            key_patch_tokens = teacher_patch_tokens[batch_idx, key_indices]
-            teacher_scores = torch.matmul(query_patch_tokens, key_patch_tokens.transpose(0, 1))
-            teacher_best = teacher_scores.max(dim=-1).values
+            teacher_queries = coarse_teacher_tokens[batch_idx, query_indices]
+            teacher_keys = coarse_teacher_tokens[batch_idx, key_indices]
+            teacher_scores = torch.matmul(teacher_queries, teacher_keys.transpose(0, 1))
+            teacher_best_values, teacher_best_indices = teacher_scores.max(dim=-1)
             teacher_top2 = teacher_scores.topk(k=min(2, teacher_scores.shape[-1]), dim=-1).values
-            teacher_margin = torch.full_like(teacher_best, float("inf"))
+            teacher_margin = torch.full_like(teacher_best_values, float("inf"))
             if teacher_top2.shape[-1] > 1:
                 teacher_margin = teacher_top2[:, 0] - teacher_top2[:, 1]
-            valid_teacher = (
-                (teacher_best >= self.direct_retriever_confidence_threshold)
-                & (teacher_margin >= self.direct_retriever_margin_threshold)
+            has_match = (
+                (teacher_best_values >= self.coarse_global_matcher_confidence_threshold)
+                & (teacher_margin >= self.coarse_global_matcher_margin_threshold)
             )
-            if not valid_teacher.any():
-                continue
 
-            teacher_top_k = min(self.direct_retriever_teacher_top_k, teacher_scores.shape[-1])
-            top_teacher_values, top_teacher_indices = teacher_scores.topk(k=teacher_top_k, dim=-1)
-            top_teacher_values = top_teacher_values[valid_teacher] / self.direct_retriever_teacher_temperature
-            teacher_probs = F.softmax(top_teacher_values, dim=-1)
-            teacher_positive_indices = top_teacher_indices[valid_teacher]
+            student_queries = coarse_query_tokens[batch_idx, query_indices]
+            student_keys = coarse_key_tokens[batch_idx, key_indices]
+            logits = torch.matmul(student_queries, student_keys.transpose(0, 1))
+            logits = logits * coarse_matcher_scale.to(dtype=logits.dtype, device=logits.device)
+            dustbin_logits = coarse_dustbin_logits[batch_idx, query_indices].unsqueeze(-1).to(dtype=logits.dtype)
+            logits = torch.cat([logits, dustbin_logits], dim=-1)
 
-            query_tokens = query_retrieval_tokens[batch_idx, query_indices[valid_teacher]]
-            key_tokens = key_retrieval_tokens[batch_idx, key_indices]
-            logits = torch.matmul(query_tokens, key_tokens.transpose(0, 1))
-            logits = logits * retrieval_scale.to(dtype=logits.dtype, device=logits.device)
-            logits = logits / self.direct_retriever_temperature
-            candidate_logits = logits
-            candidate_positive_count = teacher_positive_indices.shape[-1]
-            if self.direct_retriever_negative_top_k > 0 and logits.shape[-1] > candidate_positive_count:
-                negative_count = min(
-                    self.direct_retriever_negative_top_k,
-                    logits.shape[-1] - candidate_positive_count,
-                )
-                negative_logits = logits.clone()
-                negative_logits.scatter_(1, teacher_positive_indices, float("-inf"))
-                _, hard_negative_indices = negative_logits.topk(k=negative_count, dim=-1)
-                candidate_indices = torch.cat([teacher_positive_indices, hard_negative_indices], dim=-1)
-                candidate_logits = logits.gather(1, candidate_indices)
-            log_probs = F.log_softmax(candidate_logits, dim=-1)
+            targets = teacher_best_indices.clone()
+            dustbin_index = key_indices.numel()
+            targets[~has_match] = dustbin_index
+            loss_terms.append(F.cross_entropy(logits, targets))
 
-            soft_targets = torch.zeros_like(candidate_logits)
-            soft_targets[:, :candidate_positive_count] = teacher_probs
-            loss_terms.append(-(soft_targets * log_probs).sum(dim=-1).mean())
-
-            predictions = candidate_logits.argmax(dim=-1)
-            positive_hits += int((predictions < candidate_positive_count).sum().item())
-            supervised_queries += int(valid_teacher.sum().item())
+            predictions = logits.argmax(dim=-1)
+            correct += int((predictions == targets).sum().item())
+            dustbin_targets += int((~has_match).sum().item())
 
         if not loss_terms:
             return zero, metrics
 
         loss = torch.stack(loss_terms).mean()
-        metrics["direct_retriever"] = loss.item()
-        metrics["direct_retriever_accuracy"] = positive_hits / max(supervised_queries, 1)
-        metrics["direct_retriever_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
+        metrics["coarse_global_matcher"] = loss.item()
+        metrics["coarse_global_matcher_accuracy"] = correct / max(total_queries, 1)
+        metrics["coarse_global_matcher_supervised_ratio"] = 1.0 if total_queries > 0 else 0.0
+        metrics["coarse_global_matcher_dustbin_ratio"] = dustbin_targets / max(total_queries, 1)
         return loss, metrics
 
     def generator_loss(
@@ -599,7 +587,7 @@ class InpaintingLoss(nn.Module):
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         patch_teacher_loss, patch_teacher_metrics = self._patch_teacher_loss(refined_target, attention_aux)
-        direct_retriever_loss, direct_retriever_metrics = self._direct_retriever_loss(
+        coarse_global_matcher_loss, coarse_global_matcher_metrics = self._coarse_global_matcher_loss(
             refined_target,
             attention_aux,
         )
@@ -629,7 +617,7 @@ class InpaintingLoss(nn.Module):
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + self.patch_teacher_weight * patch_teacher_loss
-            + self.direct_retriever_weight * direct_retriever_loss
+            + self.coarse_global_matcher_weight * coarse_global_matcher_loss
             + self.candidate_rerank_weight * candidate_rerank_loss
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
@@ -645,9 +633,10 @@ class InpaintingLoss(nn.Module):
             "patch_teacher": patch_teacher_metrics["patch_teacher"],
             "patch_teacher_accuracy": patch_teacher_metrics["patch_teacher_accuracy"],
             "patch_teacher_supervised_ratio": patch_teacher_metrics["patch_teacher_supervised_ratio"],
-            "direct_retriever": direct_retriever_metrics["direct_retriever"],
-            "direct_retriever_accuracy": direct_retriever_metrics["direct_retriever_accuracy"],
-            "direct_retriever_supervised_ratio": direct_retriever_metrics["direct_retriever_supervised_ratio"],
+            "coarse_global_matcher": coarse_global_matcher_metrics["coarse_global_matcher"],
+            "coarse_global_matcher_accuracy": coarse_global_matcher_metrics["coarse_global_matcher_accuracy"],
+            "coarse_global_matcher_supervised_ratio": coarse_global_matcher_metrics["coarse_global_matcher_supervised_ratio"],
+            "coarse_global_matcher_dustbin_ratio": coarse_global_matcher_metrics["coarse_global_matcher_dustbin_ratio"],
             "candidate_rerank": candidate_rerank_metrics["candidate_rerank"],
             "candidate_rerank_accuracy": candidate_rerank_metrics["candidate_rerank_accuracy"],
             "candidate_rerank_base_accuracy": candidate_rerank_metrics["candidate_rerank_base_accuracy"],

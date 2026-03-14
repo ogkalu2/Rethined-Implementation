@@ -29,6 +29,12 @@ model:
     candidate_context_retrieval_scale_init: 2.0
     candidate_context_retrieval_start_step: 1000
     candidate_context_retrieval_ramp_steps: 1000
+    coarse_global_matcher: true
+    coarse_global_matcher_pool: 4
+    coarse_global_matcher_top_k: 2
+    coarse_global_matcher_window_radius: 0
+    coarse_global_matcher_start_step: 1000
+    coarse_global_matcher_dustbin_init: 0.0
     candidate_rerank_selection: true
     candidate_rerank_selection_max_alpha: 1.0
     candidate_rerank_selection_start_step: 1000
@@ -93,13 +99,9 @@ loss:
   patch_teacher_temperature: 0.1
   patch_teacher_confidence_threshold: 0.2
   patch_teacher_margin_threshold: 0.03
-  direct_retriever_weight: 0.1
-  direct_retriever_temperature: 0.1
-  direct_retriever_teacher_top_k: 4
-  direct_retriever_negative_top_k: 16
-  direct_retriever_teacher_temperature: 0.2
-  direct_retriever_confidence_threshold: 0.2
-  direct_retriever_margin_threshold: 0.03
+  coarse_global_matcher_weight: 0.1
+  coarse_global_matcher_confidence_threshold: 0.2
+  coarse_global_matcher_margin_threshold: 0.03
   candidate_rerank_weight: 0.1
   candidate_rerank_temperature: 1.0
   candidate_rerank_confidence_threshold: 0.2
