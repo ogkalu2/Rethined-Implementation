@@ -40,14 +40,8 @@ class PatchmatchHelpersMixin:
         self,
         branch: torch.Tensor,
         *,
-        norm: nn.Module | None,
-        scale: torch.Tensor | None,
         drop_prob: float,
     ) -> torch.Tensor:
-        if norm is not None:
-            branch = norm(branch)
-        if scale is not None:
-            branch = branch * scale.to(dtype=branch.dtype, device=branch.device)
         return self._apply_branch_dropout(branch, drop_prob)
 
     def _build_context_encoder(self, in_channels: int, out_channels: int) -> nn.Sequential:

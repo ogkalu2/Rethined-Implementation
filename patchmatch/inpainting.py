@@ -28,8 +28,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
-        normalize_matching_branches: bool = False,
-        learnable_matching_branch_scales: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
         query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
@@ -73,8 +71,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         )
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
-        self.normalize_matching_branches = bool(normalize_matching_branches)
-        self.learnable_matching_branch_scales = bool(learnable_matching_branch_scales)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
         self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
@@ -171,18 +167,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.key_coarse_rgb_scale = None
         self.key_feature_scale = None
         self.shared_query_key_descriptor_head = None
-        self.coarse_rgb_branch_norm = None
-        if self.match_coarse_rgb and self.normalize_matching_branches:
-            self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
-        self.feature_branch_norm = None
-        if self.concat_features and self.normalize_matching_branches:
-            self.feature_branch_norm = nn.GroupNorm(1, self.feature_dim)
-        self.coarse_rgb_branch_scale = None
-        if self.match_coarse_rgb and self.learnable_matching_branch_scales:
-            self.coarse_rgb_branch_scale = nn.Parameter(torch.tensor(1.0))
-        self.feature_branch_scale = None
-        if self.concat_features and self.learnable_matching_branch_scales:
-            self.feature_branch_scale = nn.Parameter(torch.tensor(1.0))
         self.query_descriptor_head = None
         self.key_descriptor_head = None
         self.matching_descriptor_head = None
@@ -363,8 +347,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
                 coarse_match_map = self._prepare_matching_branch(
                     coarse_match_map,
-                    norm=self.coarse_rgb_branch_norm,
-                    scale=self.coarse_rgb_branch_scale,
                     drop_prob=self.coarse_rgb_branch_dropout,
                 )
                 query_token_inputs.append(coarse_match_map)
@@ -377,8 +359,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 )
                 coarse_features = self._prepare_matching_branch(
                     coarse_features,
-                    norm=self.feature_branch_norm,
-                    scale=self.feature_branch_scale,
                     drop_prob=0.0,
                 )
                 query_token_inputs.append(coarse_features)
@@ -406,8 +386,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
                 coarse_match_map = self._prepare_matching_branch(
                     coarse_match_map,
-                    norm=self.coarse_rgb_branch_norm,
-                    scale=self.coarse_rgb_branch_scale,
                     drop_prob=self.coarse_rgb_branch_dropout,
                 )
                 token_inputs.append(coarse_match_map)
@@ -420,8 +398,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 )
                 coarse_features = self._prepare_matching_branch(
                     coarse_features,
-                    norm=self.feature_branch_norm,
-                    scale=self.feature_branch_scale,
                     drop_prob=0.0,
                 )
                 token_inputs.append(coarse_features)
