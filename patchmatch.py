@@ -226,7 +226,6 @@ class PatchInpainting(nn.Module):
         coarse_to_fine_hard_inference: bool = True,
         coarse_to_fine_coord_iters: int = 2,
         coarse_to_fine_coord_hidden_channels: int = 32,
-        coarse_to_fine_query_chunk_size: int = 128,
         value_source: str = "rgb",
         fusion_mode: str = "replace",
         fusion_hidden_channels: int = 32,
@@ -293,7 +292,6 @@ class PatchInpainting(nn.Module):
         self.coarse_to_fine_hard_inference = bool(coarse_to_fine_hard_inference)
         self.coarse_to_fine_coord_iters = max(0, int(coarse_to_fine_coord_iters))
         self.coarse_to_fine_coord_hidden_channels = int(coarse_to_fine_coord_hidden_channels)
-        self.coarse_to_fine_query_chunk_size = int(coarse_to_fine_query_chunk_size)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
         if self.candidate_reranker_hidden_dim <= 0:
@@ -360,8 +358,6 @@ class PatchInpainting(nn.Module):
             raise ValueError("coarse_to_fine_hidden_dim must be positive.")
         if self.coarse_to_fine_coord_hidden_channels <= 0:
             raise ValueError("coarse_to_fine_coord_hidden_channels must be positive.")
-        if self.coarse_to_fine_query_chunk_size <= 0:
-            raise ValueError("coarse_to_fine_query_chunk_size must be positive.")
         self.matching_input_dim = 0
         if self.match_coarse_rgb:
             self.matching_input_dim += self.query_patch_dim
@@ -1093,100 +1089,86 @@ class PatchInpainting(nn.Module):
         if default_tokens is None:
             default_tokens = patch_values
 
-        chunk_size = self.coarse_to_fine_query_chunk_size
         for batch_idx in range(batch_size):
             query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
             if query_indices.numel() == 0:
                 continue
 
-            for chunk_start in range(0, query_indices.numel(), chunk_size):
-                chunk_query_indices = query_indices[chunk_start : chunk_start + chunk_size]
-                batch_coarse_logits = coarse_logits[batch_idx, chunk_query_indices]
-                batch_top_logits, batch_top_indices = torch.topk(batch_coarse_logits, k=top_m, dim=-1)
-                coarse_top_indices[batch_idx, chunk_query_indices] = batch_top_indices
-                coarse_top_logits[batch_idx, chunk_query_indices] = batch_top_logits.to(
-                    dtype=coarse_top_logits.dtype
-                )
+            batch_coarse_logits = coarse_logits[batch_idx, query_indices]
+            batch_top_logits, batch_top_indices = torch.topk(batch_coarse_logits, k=top_m, dim=-1)
+            coarse_top_indices[batch_idx, query_indices] = batch_top_indices
+            coarse_top_logits[batch_idx, query_indices] = batch_top_logits.to(dtype=coarse_top_logits.dtype)
 
-                chunk_query_count = chunk_query_indices.numel()
-                batch_candidate_indices = bank_indices[batch_top_indices].reshape(chunk_query_count, -1)
-                batch_candidate_coords = bank_coords[batch_top_indices].reshape(chunk_query_count, -1, 2)
-                batch_candidate_bank_valid = bank_valid[batch_top_indices].reshape(chunk_query_count, -1)
-                batch_candidate_key_valid = key_valid_flat[batch_idx, batch_candidate_indices] > 0.5
-                batch_candidate_valid = batch_candidate_bank_valid & batch_candidate_key_valid
+            batch_candidate_indices = bank_indices[batch_top_indices].reshape(query_indices.numel(), -1)
+            batch_candidate_coords = bank_coords[batch_top_indices].reshape(query_indices.numel(), -1, 2)
+            batch_candidate_bank_valid = bank_valid[batch_top_indices].reshape(query_indices.numel(), -1)
+            batch_candidate_key_valid = key_valid_flat[batch_idx, batch_candidate_indices] > 0.5
+            batch_candidate_valid = batch_candidate_bank_valid & batch_candidate_key_valid
 
-                query_tokens = query_tokens_full[batch_idx, chunk_query_indices]
-                candidate_key_tokens = key_tokens_full[batch_idx, batch_candidate_indices]
-                candidate_values = patch_values[batch_idx, batch_candidate_indices]
-                refined_centers = refined_coord_flat[batch_idx, chunk_query_indices].unsqueeze(1)
-                rel_coords = batch_candidate_coords - refined_centers
-                query_tokens_expanded = query_tokens.unsqueeze(1).expand_as(candidate_key_tokens)
-                rerank_features = torch.cat(
-                    [
-                        query_tokens_expanded,
-                        candidate_key_tokens,
-                        query_tokens_expanded - candidate_key_tokens,
-                        query_tokens_expanded * candidate_key_tokens,
-                        rel_coords,
-                    ],
-                    dim=-1,
-                )
-                local_delta = self.coarse_to_fine_local_match_head(rerank_features).squeeze(-1)
-                candidate_logits = batch_top_logits.unsqueeze(-1).expand(-1, -1, local_candidate_count)
-                candidate_logits = candidate_logits.reshape(chunk_query_count, -1) + local_delta
-                coord_bias = refined_bias_flat[batch_idx, chunk_query_indices]
-                candidate_logits = candidate_logits - (coord_bias * rel_coords.pow(2).sum(dim=-1))
-                candidate_logits = candidate_logits.masked_fill(
-                    ~batch_candidate_valid,
-                    torch.finfo(candidate_logits.dtype).min,
-                )
+            query_tokens = query_tokens_full[batch_idx, query_indices]
+            candidate_key_tokens = key_tokens_full[batch_idx, batch_candidate_indices]
+            candidate_values = patch_values[batch_idx, batch_candidate_indices]
+            refined_centers = refined_coord_flat[batch_idx, query_indices].unsqueeze(1)
+            rel_coords = batch_candidate_coords - refined_centers
+            query_tokens_expanded = query_tokens.unsqueeze(1).expand_as(candidate_key_tokens)
+            rerank_features = torch.cat(
+                [
+                    query_tokens_expanded,
+                    candidate_key_tokens,
+                    query_tokens_expanded - candidate_key_tokens,
+                    query_tokens_expanded * candidate_key_tokens,
+                    rel_coords,
+                ],
+                dim=-1,
+            )
+            local_delta = self.coarse_to_fine_local_match_head(rerank_features).squeeze(-1)
+            candidate_logits = batch_top_logits.unsqueeze(-1).expand(-1, -1, local_candidate_count)
+            candidate_logits = candidate_logits.reshape(query_indices.numel(), -1) + local_delta
+            coord_bias = refined_bias_flat[batch_idx, query_indices]
+            candidate_logits = candidate_logits - (coord_bias * rel_coords.pow(2).sum(dim=-1))
+            candidate_logits = candidate_logits.masked_fill(
+                ~batch_candidate_valid,
+                torch.finfo(candidate_logits.dtype).min,
+            )
 
-                local_candidate_indices[batch_idx, chunk_query_indices] = batch_candidate_indices
-                local_candidate_logits[batch_idx, chunk_query_indices] = candidate_logits.to(
-                    dtype=local_candidate_logits.dtype
-                )
-                local_candidate_valid_mask[batch_idx, chunk_query_indices] = batch_candidate_valid
+            local_candidate_indices[batch_idx, query_indices] = batch_candidate_indices
+            local_candidate_logits[batch_idx, query_indices] = candidate_logits.to(dtype=local_candidate_logits.dtype)
+            local_candidate_valid_mask[batch_idx, query_indices] = batch_candidate_valid
 
-                fallback_tokens = default_tokens[batch_idx, chunk_query_indices]
-                if unmatched_logits is not None:
-                    unmatched_query_logits = unmatched_logits[batch_idx, chunk_query_indices].unsqueeze(-1)
-                    final_logits = torch.cat([candidate_logits, unmatched_query_logits], dim=-1)
-                    no_valid_candidates = ~batch_candidate_valid.any(dim=-1)
-                    if no_valid_candidates.any():
-                        final_logits[no_valid_candidates, :-1] = torch.finfo(final_logits.dtype).min
-                    selection, probs = self._selection_from_logits(final_logits, value_dtype=value_dtype)
-                    candidate_selection = selection[:, :-1]
-                    candidate_probs = probs[:, :-1]
-                    unmatched_selection = selection[:, -1:].to(value_dtype)
-                    unmatched_probs = probs[:, -1]
-                else:
-                    has_valid_candidates = batch_candidate_valid.any(dim=-1)
-                    if not has_valid_candidates.any():
-                        continue
-                    selection, probs = self._selection_from_logits(
-                        candidate_logits[has_valid_candidates],
-                        value_dtype=value_dtype,
-                    )
-                    candidate_selection = candidate_logits.new_zeros(candidate_logits.shape, dtype=value_dtype)
-                    candidate_probs = candidate_logits.new_zeros(candidate_logits.shape, dtype=value_dtype)
-                    candidate_selection[has_valid_candidates] = selection
-                    candidate_probs[has_valid_candidates] = probs
-                    unmatched_selection = candidate_selection.new_zeros((candidate_selection.shape[0], 1))
-                    unmatched_probs = candidate_probs.new_zeros(candidate_probs.shape[0])
+            fallback_tokens = default_tokens[batch_idx, query_indices]
+            if unmatched_logits is not None:
+                unmatched_query_logits = unmatched_logits[batch_idx, query_indices].unsqueeze(-1)
+                final_logits = torch.cat([candidate_logits, unmatched_query_logits], dim=-1)
+                no_valid_candidates = ~batch_candidate_valid.any(dim=-1)
+                if no_valid_candidates.any():
+                    final_logits[no_valid_candidates, :-1] = torch.finfo(final_logits.dtype).min
+                selection, probs = self._selection_from_logits(final_logits, value_dtype=value_dtype)
+                candidate_selection = selection[:, :-1]
+                candidate_probs = probs[:, :-1]
+                unmatched_selection = selection[:, -1:].to(value_dtype)
+                unmatched_probs = probs[:, -1]
+            else:
+                has_valid_candidates = batch_candidate_valid.any(dim=-1)
+                if not has_valid_candidates.any():
+                    continue
+                selection, probs = self._selection_from_logits(
+                    candidate_logits[has_valid_candidates],
+                    value_dtype=value_dtype,
+                )
+                candidate_selection = candidate_logits.new_zeros(candidate_logits.shape, dtype=value_dtype)
+                candidate_probs = candidate_logits.new_zeros(candidate_logits.shape, dtype=value_dtype)
+                candidate_selection[has_valid_candidates] = selection
+                candidate_probs[has_valid_candidates] = probs
+                unmatched_selection = candidate_selection.new_zeros((candidate_selection.shape[0], 1))
+                unmatched_probs = candidate_probs.new_zeros(candidate_probs.shape[0])
 
-                mixed_queries = torch.einsum("qc,qcd->qd", candidate_selection, candidate_values)
-                mixed_queries = mixed_queries + (unmatched_selection * fallback_tokens)
-                replacement_rows = patch_values.new_zeros((chunk_query_count, num_patches))
-                replacement_rows.scatter_add_(
-                    1,
-                    batch_candidate_indices,
-                    candidate_probs.to(dtype=replacement_rows.dtype),
-                )
-                mixed[batch_idx].index_copy_(0, chunk_query_indices, mixed_queries)
-                dense_attn[batch_idx, 0].index_copy_(0, chunk_query_indices, replacement_rows)
-                final_unmatched_probs[batch_idx, chunk_query_indices] = unmatched_probs.to(
-                    dtype=final_unmatched_probs.dtype
-                )
+            mixed_queries = torch.einsum("qc,qcd->qd", candidate_selection, candidate_values)
+            mixed_queries = mixed_queries + (unmatched_selection * fallback_tokens)
+            replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
+            replacement_rows.scatter_add_(1, batch_candidate_indices, candidate_probs.to(dtype=replacement_rows.dtype))
+            mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
+            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
+            final_unmatched_probs[batch_idx, query_indices] = unmatched_probs.to(dtype=final_unmatched_probs.dtype)
 
         aux = {
             "coarse_cell_logits": coarse_logits,
