@@ -710,26 +710,6 @@ def train(cfg, args):
         if step_has_nonfinite:
             optimizer_g.zero_grad(set_to_none=True)
             optimizer_d.zero_grad(set_to_none=True)
-            last_batch_views = None
-            last_coarse = None
-            last_refined = None
-            batch_views = None
-            image = None
-            mask = None
-            masked_image = None
-            refine_target = None
-            refined_raw = None
-            attn_map = None
-            coarse_raw = None
-            attention_aux = None
-            refined_vis = None
-            coarse_vis = None
-            real_logits = None
-            fake_logits_d = None
-            d_loss = None
-            fake_logits_g = None
-            g_loss = None
-            empty_device_cache(device)
             progress_bar.write(f"Skipping non-finite step {step}")
             continue
 
