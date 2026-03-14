@@ -101,6 +101,16 @@ class FocalFrequencyLoss(nn.Module):
 class InpaintingLoss(nn.Module):
     """Paper-aligned generator and discriminator losses."""
 
+    SCHEDULED_WEIGHT_NAMES = (
+        "retrieval_loss_weight",
+        "boundary_identity_weight",
+        "coordinate_loss_weight",
+        "coherence_loss_weight",
+        "frequency_weight",
+        "perceptual_weight",
+        "adversarial_weight",
+    )
+
     def __init__(
         self,
         coarse_l2_weight: float = 1.0,
@@ -115,6 +125,15 @@ class InpaintingLoss(nn.Module):
         boundary_identity_weight: float = 0.0,
         coordinate_loss_weight: float = 0.0,
         coherence_loss_weight: float = 0.0,
+        loss_schedule_focus_steps: int = 0,
+        loss_schedule_transition_steps: int = 0,
+        retrieval_loss_weight_start: float | None = None,
+        boundary_identity_weight_start: float | None = None,
+        coordinate_loss_weight_start: float | None = None,
+        coherence_loss_weight_start: float | None = None,
+        frequency_weight_start: float | None = None,
+        perceptual_weight_start: float | None = None,
+        adversarial_weight_start: float | None = None,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.02,
@@ -135,6 +154,8 @@ class InpaintingLoss(nn.Module):
         self.boundary_identity_weight = float(boundary_identity_weight)
         self.coordinate_loss_weight = float(coordinate_loss_weight)
         self.coherence_loss_weight = float(coherence_loss_weight)
+        self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
+        self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -149,6 +170,68 @@ class InpaintingLoss(nn.Module):
         self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
         self.coarse_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
+        self.current_training_step = 0
+        self._base_weight_values = {
+            name: float(getattr(self, name))
+            for name in self.SCHEDULED_WEIGHT_NAMES
+        }
+        self._focus_weight_values = {
+            "retrieval_loss_weight": (
+                self._base_weight_values["retrieval_loss_weight"]
+                if retrieval_loss_weight_start is None
+                else float(retrieval_loss_weight_start)
+            ),
+            "boundary_identity_weight": (
+                self._base_weight_values["boundary_identity_weight"]
+                if boundary_identity_weight_start is None
+                else float(boundary_identity_weight_start)
+            ),
+            "coordinate_loss_weight": (
+                self._base_weight_values["coordinate_loss_weight"]
+                if coordinate_loss_weight_start is None
+                else float(coordinate_loss_weight_start)
+            ),
+            "coherence_loss_weight": (
+                self._base_weight_values["coherence_loss_weight"]
+                if coherence_loss_weight_start is None
+                else float(coherence_loss_weight_start)
+            ),
+            "frequency_weight": (
+                self._base_weight_values["frequency_weight"]
+                if frequency_weight_start is None
+                else float(frequency_weight_start)
+            ),
+            "perceptual_weight": (
+                self._base_weight_values["perceptual_weight"]
+                if perceptual_weight_start is None
+                else float(perceptual_weight_start)
+            ),
+            "adversarial_weight": (
+                self._base_weight_values["adversarial_weight"]
+                if adversarial_weight_start is None
+                else float(adversarial_weight_start)
+            ),
+        }
+
+    def set_training_step(self, step: int):
+        self.current_training_step = max(0, int(step))
+
+    def _get_scheduled_weight(self, name: str) -> float:
+        base_weight = self._base_weight_values[name]
+        focus_weight = self._focus_weight_values[name]
+        if self.loss_schedule_focus_steps <= 0 and self.loss_schedule_transition_steps <= 0:
+            return base_weight
+        if self.current_training_step <= self.loss_schedule_focus_steps:
+            return focus_weight
+        if self.loss_schedule_transition_steps <= 0:
+            return base_weight
+
+        transition_progress = (
+            (self.current_training_step - self.loss_schedule_focus_steps)
+            / float(self.loss_schedule_transition_steps)
+        )
+        transition_progress = min(max(transition_progress, 0.0), 1.0)
+        return focus_weight + transition_progress * (base_weight - focus_weight)
 
     def _extract_patch_tokens(
         self,
@@ -466,6 +549,10 @@ class InpaintingLoss(nn.Module):
                 ]
             adversarial = torch.stack(scale_losses).mean()
 
+        scheduled_weights = {
+            name: self._get_scheduled_weight(name)
+            for name in self.SCHEDULED_WEIGHT_NAMES
+        }
         total = (
             self.coarse_l2_weight * coarse_l2
             + self.coarse_blur_l1_weight * coarse_blur_l1
@@ -473,13 +560,13 @@ class InpaintingLoss(nn.Module):
             + self.coarse_perceptual_weight * coarse_perceptual
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
-            + self.retrieval_loss_weight * attention_loss_terms["retrieval"]
-            + self.boundary_identity_weight * attention_loss_terms["boundary_identity"]
-            + self.coordinate_loss_weight * attention_loss_terms["coordinate"]
-            + self.coherence_loss_weight * attention_loss_terms["coherence"]
-            + self.frequency_weight * frequency
-            + self.perceptual_weight * perceptual
-            + self.adversarial_weight * adversarial
+            + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
+            + scheduled_weights["boundary_identity_weight"] * attention_loss_terms["boundary_identity"]
+            + scheduled_weights["coordinate_loss_weight"] * attention_loss_terms["coordinate"]
+            + scheduled_weights["coherence_loss_weight"] * attention_loss_terms["coherence"]
+            + scheduled_weights["frequency_weight"] * frequency
+            + scheduled_weights["perceptual_weight"] * perceptual
+            + scheduled_weights["adversarial_weight"] * adversarial
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
@@ -497,6 +584,10 @@ class InpaintingLoss(nn.Module):
             "adversarial_g": adversarial.item(),
             "generator_total": total.item(),
         }
+        loss_dict.update({
+            f"weight/{name.removesuffix('_weight')}": value
+            for name, value in scheduled_weights.items()
+        })
         loss_dict.update(attention_metrics)
         return total, loss_dict
 

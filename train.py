@@ -618,6 +618,7 @@ def train(cfg, args):
     for step_idx in progress_bar:
         step = step_idx + 1
         model.generator.set_training_step(step)
+        criterion.set_training_step(step)
         lr_g = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         lr_d = get_lr(
             step,
@@ -771,6 +772,20 @@ def train(cfg, args):
                 writer.add_scalar("retrieval/coord_error", metrics["retrieval_coord_error"], step)
             if "boundary_identity_acc" in metrics:
                 writer.add_scalar("retrieval/boundary_identity_acc", metrics["boundary_identity_acc"], step)
+            if "weight/retrieval_loss" in metrics:
+                writer.add_scalar("loss_weight/retrieval", metrics["weight/retrieval_loss"], step)
+            if "weight/boundary_identity" in metrics:
+                writer.add_scalar("loss_weight/boundary_identity", metrics["weight/boundary_identity"], step)
+            if "weight/coordinate" in metrics:
+                writer.add_scalar("loss_weight/coordinate", metrics["weight/coordinate"], step)
+            if "weight/coherence" in metrics:
+                writer.add_scalar("loss_weight/coherence", metrics["weight/coherence"], step)
+            if "weight/frequency" in metrics:
+                writer.add_scalar("loss_weight/frequency", metrics["weight/frequency"], step)
+            if "weight/perceptual" in metrics:
+                writer.add_scalar("loss_weight/perceptual", metrics["weight/perceptual"], step)
+            if "weight/adversarial" in metrics:
+                writer.add_scalar("loss_weight/adversarial", metrics["weight/adversarial"], step)
             writer.add_scalar("lr/generator", lr_g, step)
             writer.add_scalar("lr/discriminator", lr_d, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
