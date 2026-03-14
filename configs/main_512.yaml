@@ -33,6 +33,7 @@ model:
     coarse_to_fine_hard_inference: true
     coarse_to_fine_coord_iters: 2
     coarse_to_fine_coord_hidden_channels: 32
+    coarse_to_fine_query_chunk_size: 64
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
