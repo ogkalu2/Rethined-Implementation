@@ -281,12 +281,6 @@ def format_train_metric_snapshot(metrics):
             f", pta={metrics['patch_teacher_accuracy']:.3f}"
             f", pts={metrics['patch_teacher_supervised_ratio']:.3f}"
         )
-    if "direct_retriever" in metrics:
-        summary += (
-            f", ret={metrics['direct_retriever']:.4f}"
-            f", reta={metrics['direct_retriever_accuracy']:.3f}"
-            f", rets={metrics['direct_retriever_supervised_ratio']:.3f}"
-        )
     if "candidate_rerank" in metrics:
         summary += (
             f", rr={metrics['candidate_rerank']:.4f}"
@@ -741,14 +735,6 @@ def train(cfg, args):
                     metrics["patch_teacher_supervised_ratio"],
                     step,
                 )
-            if "direct_retriever" in metrics:
-                writer.add_scalar("loss/direct_retriever", metrics["direct_retriever"], step)
-                writer.add_scalar("direct_retriever/accuracy", metrics["direct_retriever_accuracy"], step)
-                writer.add_scalar(
-                    "direct_retriever/supervised_ratio",
-                    metrics["direct_retriever_supervised_ratio"],
-                    step,
-                )
             if "candidate_rerank" in metrics:
                 writer.add_scalar("loss/candidate_rerank", metrics["candidate_rerank"], step)
                 writer.add_scalar("candidate_rerank/accuracy", metrics["candidate_rerank_accuracy"], step)
@@ -795,9 +781,6 @@ def train(cfg, args):
                     pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
                     pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
-                    ret=(f"{metrics['direct_retriever']:.4f}" if "direct_retriever" in metrics else "n/a"),
-                    reta=(f"{metrics['direct_retriever_accuracy']:.3f}" if "direct_retriever_accuracy" in metrics else "n/a"),
-                    rets=(f"{metrics['direct_retriever_supervised_ratio']:.3f}" if "direct_retriever_supervised_ratio" in metrics else "n/a"),
                     rr=(f"{metrics['candidate_rerank']:.4f}" if "candidate_rerank" in metrics else "n/a"),
                     rra=(f"{metrics['candidate_rerank_accuracy']:.3f}" if "candidate_rerank_accuracy" in metrics else "n/a"),
                     rrb=(f"{metrics['candidate_rerank_base_accuracy']:.3f}" if "candidate_rerank_base_accuracy" in metrics else "n/a"),
