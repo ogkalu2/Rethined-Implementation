@@ -868,6 +868,7 @@ class PatchInpainting(nn.Module):
         token_hw: tuple[int, int],
         transport_state: dict[str, torch.Tensor | None],
         *,
+        default_tokens: torch.Tensor | None,
         return_diagnostics: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         coords = transport_state["coords"]
@@ -876,15 +877,25 @@ class PatchInpainting(nn.Module):
         confidence = transport_state["confidence"]
 
         sampled_values = self._sample_transport_map(source_patch_map, coords)
-        sampled_values = sampled_values * sampled_validity.to(dtype=sampled_values.dtype)
+        sampled_validity = sampled_validity.clamp(0.0, 1.0)
+        sampled_values = torch.where(
+            sampled_validity > 1e-3,
+            sampled_values / sampled_validity.clamp_min(1e-3).to(dtype=sampled_values.dtype),
+            torch.zeros_like(sampled_values),
+        )
+        sampled_values_flat = sampled_values.flatten(start_dim=2).transpose(1, 2)
+        sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
+        if default_tokens is not None:
+            blend = sampled_validity_flat.to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
+            sampled_values_flat = (blend * sampled_values_flat) + ((1.0 - blend) * default_tokens)
         aux = {
             "copy_mode": self.copy_mode,
             "query_mask_flat": query_mask_flat,
             "key_valid_flat": key_valid_flat,
             "transport_coords": coords.flatten(start_dim=2).transpose(1, 2),
             "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
-            "transport_values": sampled_values.flatten(start_dim=2).transpose(1, 2),
-            "transport_validity": sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1),
+            "transport_values": sampled_values_flat,
+            "transport_validity": sampled_validity_flat,
         }
         if confidence is not None:
             aux["transport_confidence"] = confidence.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
@@ -997,6 +1008,7 @@ class PatchInpainting(nn.Module):
             key_valid_flat,
             token_hw,
             transport_state,
+            default_tokens=default_tokens,
             return_diagnostics=return_diagnostics,
         )
         sampled_values_flat = aux["transport_values"]
@@ -1288,6 +1300,14 @@ class PatchInpainting(nn.Module):
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
+        elif self.copy_mode == "transport":
+            coarse_value_map, _ = self.extract_patches(
+                coarse_composite,
+                self.value_patch_size,
+                stride=self.kernel_size,
+                padding=self.value_patch_padding,
+            )
+            default_patch_values = coarse_value_map.flatten(start_dim=2).transpose(1, 2)
         if self.copy_mode == "transport":
             mixed_patches_flat, masked_attention, copy_aux = self.transport_patch_mix(
                 query_tokens,
@@ -1379,6 +1399,7 @@ class PatchInpainting(nn.Module):
                             transport_self_keys,
                             patch_map.shape[-2:],
                             self_transport_state,
+                            default_tokens=default_patch_values,
                             return_diagnostics=False,
                         )
                         aux["transport_self_aux"] = transport_self_aux
