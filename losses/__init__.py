@@ -118,6 +118,7 @@ class InpaintingLoss(nn.Module):
         direct_retriever_teacher_top_k: int = 4,
         direct_retriever_teacher_temperature: float = 0.2,
         direct_retriever_confidence_threshold: float = 0.2,
+        direct_retriever_margin_threshold: float = 0.03,
         candidate_rerank_weight: float = 0.0,
         candidate_rerank_temperature: float = 1.0,
         candidate_rerank_confidence_threshold: float = 0.2,
@@ -145,6 +146,7 @@ class InpaintingLoss(nn.Module):
         self.direct_retriever_teacher_top_k = max(1, int(direct_retriever_teacher_top_k))
         self.direct_retriever_teacher_temperature = float(direct_retriever_teacher_temperature)
         self.direct_retriever_confidence_threshold = float(direct_retriever_confidence_threshold)
+        self.direct_retriever_margin_threshold = float(direct_retriever_margin_threshold)
         self.candidate_rerank_weight = float(candidate_rerank_weight)
         self.candidate_rerank_temperature = float(candidate_rerank_temperature)
         self.candidate_rerank_confidence_threshold = float(candidate_rerank_confidence_threshold)
@@ -521,7 +523,14 @@ class InpaintingLoss(nn.Module):
             key_patch_tokens = teacher_patch_tokens[batch_idx, key_indices]
             teacher_scores = torch.matmul(query_patch_tokens, key_patch_tokens.transpose(0, 1))
             teacher_best = teacher_scores.max(dim=-1).values
-            valid_teacher = teacher_best >= self.direct_retriever_confidence_threshold
+            teacher_top2 = teacher_scores.topk(k=min(2, teacher_scores.shape[-1]), dim=-1).values
+            teacher_margin = torch.full_like(teacher_best, float("inf"))
+            if teacher_top2.shape[-1] > 1:
+                teacher_margin = teacher_top2[:, 0] - teacher_top2[:, 1]
+            valid_teacher = (
+                (teacher_best >= self.direct_retriever_confidence_threshold)
+                & (teacher_margin >= self.direct_retriever_margin_threshold)
+            )
             if not valid_teacher.any():
                 continue
 

@@ -204,6 +204,8 @@ class PatchInpainting(nn.Module):
         candidate_rerank_context_channels: int = 32,
         candidate_context_retrieval: bool = False,
         candidate_context_retrieval_scale_init: float = 2.0,
+        candidate_context_retrieval_start_step: int = 0,
+        candidate_context_retrieval_ramp_steps: int = 0,
         candidate_rerank_selection: bool = False,
         candidate_rerank_selection_max_alpha: float = 1.0,
         candidate_rerank_selection_start_step: int = 0,
@@ -258,6 +260,8 @@ class PatchInpainting(nn.Module):
         self.candidate_rerank_context_channels = int(candidate_rerank_context_channels)
         self.candidate_context_retrieval = bool(candidate_context_retrieval)
         self.candidate_context_retrieval_scale_init = float(candidate_context_retrieval_scale_init)
+        self.candidate_context_retrieval_start_step = max(0, int(candidate_context_retrieval_start_step))
+        self.candidate_context_retrieval_ramp_steps = max(0, int(candidate_context_retrieval_ramp_steps))
         self.candidate_rerank_selection = bool(candidate_rerank_selection)
         self.candidate_rerank_selection_max_alpha = float(candidate_rerank_selection_max_alpha)
         self.candidate_rerank_selection_start_step = max(0, int(candidate_rerank_selection_start_step))
@@ -584,6 +588,18 @@ class PatchInpainting(nn.Module):
         progress = max(0.0, min(float(progress), 1.0))
         return self.candidate_rerank_selection_max_alpha * progress
 
+    def _candidate_context_retrieval_alpha(self) -> float:
+        if not self.candidate_context_retrieval:
+            return 0.0
+        if self.current_training_step < self.candidate_context_retrieval_start_step:
+            return 0.0
+        if self.candidate_context_retrieval_ramp_steps <= 0:
+            return 1.0
+        progress = (
+            self.current_training_step - self.candidate_context_retrieval_start_step
+        ) / max(self.candidate_context_retrieval_ramp_steps, 1)
+        return max(0.0, min(float(progress), 1.0))
+
     def _project_candidate_retrieval_tokens(
         self,
         query_context_tokens: torch.Tensor,
@@ -891,7 +907,10 @@ class PatchInpainting(nn.Module):
                             key_retrieval_tokens,
                         )
                         if context_logits is not None:
-                            retrieval_logits = retrieval_logits + context_logits.to(dtype=retrieval_logits.dtype)
+                            context_alpha = self._candidate_context_retrieval_alpha()
+                            retrieval_logits = retrieval_logits + (
+                                context_alpha * context_logits.to(dtype=retrieval_logits.dtype)
+                            )
                     candidate_count = min(retrieval_logits.shape[-1], self.multihead_attention.attention_top_k)
                     base_candidate_logits, candidate_local_indices = torch.topk(
                         retrieval_logits,
