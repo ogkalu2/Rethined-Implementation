@@ -1025,6 +1025,31 @@ class PatchInpainting(nn.Module):
             key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
             replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
             if key_indices.numel() > 0:
+                batch_query_tokens_full = query_tokens_full[batch_idx, query_indices]
+                batch_key_tokens_full = key_tokens_full[batch_idx, key_indices]
+                batch_value_tokens_full = patch_values[batch_idx, key_indices]
+                batch_query_context_tokens_full = None
+                batch_key_context_tokens_full = None
+                batch_context_logits_full = None
+                batch_base_logits_full = None
+                if self.candidate_reranker:
+                    _, batch_base_logits_full = self.multihead_attention.compute_attention_logits(
+                        batch_query_tokens_full.unsqueeze(0),
+                        batch_key_tokens_full.unsqueeze(0),
+                    )
+                    batch_base_logits_full = batch_base_logits_full.squeeze(0).squeeze(0)
+                    if query_context_tokens_full is None or key_context_tokens_full is None:
+                        raise ValueError("candidate_reranker requires query/key context tokens.")
+                    batch_query_context_tokens_full = query_context_tokens_full[batch_idx, query_indices]
+                    batch_key_context_tokens_full = key_context_tokens_full[batch_idx, key_indices]
+                    if query_retrieval_tokens_full is not None and key_retrieval_tokens_full is not None:
+                        batch_query_retrieval_tokens_full = query_retrieval_tokens_full[batch_idx, query_indices]
+                        batch_key_retrieval_tokens_full = key_retrieval_tokens_full[batch_idx, key_indices]
+                        batch_context_logits_full = self._compute_candidate_context_logits(
+                            batch_query_retrieval_tokens_full,
+                            batch_key_retrieval_tokens_full,
+                        )
+
                 query_group_ids = query_indices.new_zeros(query_indices.shape, dtype=torch.long)
                 grouped_key_masks: dict[int, torch.Tensor] = {}
                 if coarse_matcher_active:
@@ -1073,38 +1098,34 @@ class PatchInpainting(nn.Module):
                     if group_key_indices.numel() == 0:
                         group_key_indices = key_indices
 
-                    query_tokens = query_tokens_full[batch_idx : batch_idx + 1, group_query_indices]
-                    key_tokens = key_tokens_full[batch_idx : batch_idx + 1, group_key_indices]
-                    value_tokens = patch_values[batch_idx : batch_idx + 1, group_key_indices]
+                    query_tokens_flat = batch_query_tokens_full[group_query_mask]
+                    key_tokens_flat = batch_key_tokens_full if allowed_key_mask is None else batch_key_tokens_full[allowed_key_mask]
+                    value_tokens_flat = batch_value_tokens_full if allowed_key_mask is None else batch_value_tokens_full[allowed_key_mask]
                     if self.candidate_reranker:
-                        _, base_logits = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
-                        base_logits = base_logits.squeeze(0).squeeze(0)
-                        if query_context_tokens_full is None or key_context_tokens_full is None:
-                            raise ValueError("candidate_reranker requires query/key context tokens.")
-                        query_context_tokens = query_context_tokens_full[batch_idx, group_query_indices]
-                        key_context_tokens = key_context_tokens_full[batch_idx, group_key_indices]
+                        base_logits = batch_base_logits_full[group_query_mask]
+                        if allowed_key_mask is not None:
+                            base_logits = base_logits[:, allowed_key_mask]
+                        query_context_tokens = batch_query_context_tokens_full[group_query_mask]
+                        key_context_tokens = (
+                            batch_key_context_tokens_full
+                            if allowed_key_mask is None
+                            else batch_key_context_tokens_full[allowed_key_mask]
+                        )
                         retrieval_logits = base_logits
-                        if query_retrieval_tokens_full is not None and key_retrieval_tokens_full is not None:
-                            query_retrieval_tokens = query_retrieval_tokens_full[batch_idx, group_query_indices]
-                            key_retrieval_tokens = key_retrieval_tokens_full[batch_idx, group_key_indices]
-                            context_logits = self._compute_candidate_context_logits(
-                                query_retrieval_tokens,
-                                key_retrieval_tokens,
+                        if batch_context_logits_full is not None:
+                            context_logits = batch_context_logits_full[group_query_mask]
+                            if allowed_key_mask is not None:
+                                context_logits = context_logits[:, allowed_key_mask]
+                            context_alpha = self._candidate_context_retrieval_alpha()
+                            retrieval_logits = retrieval_logits + (
+                                context_alpha * context_logits.to(dtype=retrieval_logits.dtype)
                             )
-                            if context_logits is not None:
-                                context_alpha = self._candidate_context_retrieval_alpha()
-                                retrieval_logits = retrieval_logits + (
-                                    context_alpha * context_logits.to(dtype=retrieval_logits.dtype)
-                                )
                         candidate_count = min(retrieval_logits.shape[-1], self.multihead_attention.attention_top_k)
                         base_candidate_logits, candidate_local_indices = torch.topk(
                             retrieval_logits,
                             k=candidate_count,
                             dim=-1,
                         )
-                        query_tokens_flat = query_tokens.squeeze(0)
-                        key_tokens_flat = key_tokens.squeeze(0)
-                        value_tokens_flat = value_tokens.squeeze(0)
                         query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
                         candidate_key_tokens = key_tokens_flat[candidate_local_indices]
                         candidate_value_tokens = value_tokens_flat[candidate_local_indices]
@@ -1157,6 +1178,9 @@ class PatchInpainting(nn.Module):
                         )
                         rerank_aux["candidate_valid_mask"][batch_idx, group_query_indices, :candidate_count] = True
                     else:
+                        query_tokens = query_tokens_flat.unsqueeze(0)
+                        key_tokens = key_tokens_flat.unsqueeze(0)
+                        value_tokens = value_tokens_flat.unsqueeze(0)
                         mixed_queries, masked_attention = self.multihead_attention(
                             query_tokens,
                             key_tokens,
@@ -1495,6 +1519,9 @@ class PatchInpainting(nn.Module):
                 aux["coarse_global_dustbin_logits"] = coarse_global_matcher_aux["dustbin_logits"]
                 aux["coarse_global_matcher_scale"] = self.coarse_global_matcher_scale
                 aux["coarse_global_pool_size"] = coarse_global_matcher_aux["coarse_pool_size"]
+                aux["coarse_global_matcher_active"] = refined.new_tensor(
+                    1.0 if self._coarse_global_matcher_active() else 0.0
+                )
             if rerank_aux is not None:
                 aux.update(rerank_aux)
             return refined, masked_attention, coarse_raw, aux

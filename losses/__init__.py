@@ -116,6 +116,7 @@ class InpaintingLoss(nn.Module):
         coarse_global_matcher_weight: float = 0.0,
         coarse_global_matcher_confidence_threshold: float = 0.2,
         coarse_global_matcher_margin_threshold: float = 0.03,
+        coarse_global_matcher_dustbin_threshold: float = 0.05,
         candidate_rerank_weight: float = 0.0,
         candidate_rerank_temperature: float = 1.0,
         candidate_rerank_confidence_threshold: float = 0.2,
@@ -141,6 +142,7 @@ class InpaintingLoss(nn.Module):
         self.coarse_global_matcher_weight = float(coarse_global_matcher_weight)
         self.coarse_global_matcher_confidence_threshold = float(coarse_global_matcher_confidence_threshold)
         self.coarse_global_matcher_margin_threshold = float(coarse_global_matcher_margin_threshold)
+        self.coarse_global_matcher_dustbin_threshold = float(coarse_global_matcher_dustbin_threshold)
         self.candidate_rerank_weight = float(candidate_rerank_weight)
         self.candidate_rerank_temperature = float(candidate_rerank_temperature)
         self.candidate_rerank_confidence_threshold = float(candidate_rerank_confidence_threshold)
@@ -489,6 +491,7 @@ class InpaintingLoss(nn.Module):
         coarse_key_valid_flat = attention_aux.get("coarse_key_valid_flat")
         coarse_dustbin_logits = attention_aux.get("coarse_global_dustbin_logits")
         coarse_matcher_scale = attention_aux.get("coarse_global_matcher_scale")
+        coarse_matcher_active = float(attention_aux.get("coarse_global_matcher_active", 0.0))
         kernel_size = int(attention_aux.get("kernel_size", 0))
         value_patch_size = int(attention_aux.get("value_patch_size", 0))
         value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
@@ -505,6 +508,8 @@ class InpaintingLoss(nn.Module):
             or coarse_pool_size <= 0
         ):
             return zero, metrics
+        if coarse_matcher_active < 0.5:
+            return zero, metrics
 
         target_patches = self._extract_patch_tokens(
             refined_target,
@@ -517,6 +522,7 @@ class InpaintingLoss(nn.Module):
 
         loss_terms = []
         total_queries = 0
+        supervised_queries = 0
         correct = 0
         dustbin_targets = 0
 
@@ -539,31 +545,36 @@ class InpaintingLoss(nn.Module):
                 (teacher_best_values >= self.coarse_global_matcher_confidence_threshold)
                 & (teacher_margin >= self.coarse_global_matcher_margin_threshold)
             )
+            is_dustbin = teacher_best_values < self.coarse_global_matcher_dustbin_threshold
+            supervised_mask = has_match | is_dustbin
+            if not supervised_mask.any():
+                continue
 
-            student_queries = coarse_query_tokens[batch_idx, query_indices]
+            student_queries = coarse_query_tokens[batch_idx, query_indices[supervised_mask]]
             student_keys = coarse_key_tokens[batch_idx, key_indices]
             logits = torch.matmul(student_queries, student_keys.transpose(0, 1))
             logits = logits * coarse_matcher_scale.to(dtype=logits.dtype, device=logits.device)
-            dustbin_logits = coarse_dustbin_logits[batch_idx, query_indices].unsqueeze(-1).to(dtype=logits.dtype)
+            dustbin_logits = coarse_dustbin_logits[batch_idx, query_indices[supervised_mask]].unsqueeze(-1).to(dtype=logits.dtype)
             logits = torch.cat([logits, dustbin_logits], dim=-1)
 
-            targets = teacher_best_indices.clone()
+            targets = teacher_best_indices[supervised_mask].clone()
             dustbin_index = key_indices.numel()
-            targets[~has_match] = dustbin_index
+            targets[is_dustbin[supervised_mask]] = dustbin_index
             loss_terms.append(F.cross_entropy(logits, targets))
 
             predictions = logits.argmax(dim=-1)
             correct += int((predictions == targets).sum().item())
-            dustbin_targets += int((~has_match).sum().item())
+            supervised_queries += int(supervised_mask.sum().item())
+            dustbin_targets += int(is_dustbin.sum().item())
 
         if not loss_terms:
             return zero, metrics
 
         loss = torch.stack(loss_terms).mean()
         metrics["coarse_global_matcher"] = loss.item()
-        metrics["coarse_global_matcher_accuracy"] = correct / max(total_queries, 1)
-        metrics["coarse_global_matcher_supervised_ratio"] = 1.0 if total_queries > 0 else 0.0
-        metrics["coarse_global_matcher_dustbin_ratio"] = dustbin_targets / max(total_queries, 1)
+        metrics["coarse_global_matcher_accuracy"] = correct / max(supervised_queries, 1)
+        metrics["coarse_global_matcher_supervised_ratio"] = supervised_queries / max(total_queries, 1)
+        metrics["coarse_global_matcher_dustbin_ratio"] = dustbin_targets / max(supervised_queries, 1)
         return loss, metrics
 
     def generator_loss(
