@@ -9,6 +9,7 @@ model:
     kernel_size: 8
     value_patch_size: 8
     value_source: "rgb"
+    matching_mode: "coarse_to_fine"
     attention_temperature: 0.5
     attention_top_k: 32
     attention_selection: "gumbel"
@@ -21,6 +22,17 @@ model:
     normalize_matching_branches: false
     learnable_matching_branch_scales: false
     coarse_rgb_branch_dropout: 0
+    coarse_to_fine_cell_stride: 4
+    coarse_to_fine_top_m: 4
+    coarse_to_fine_local_window: 7
+    coarse_to_fine_temperature: 1.0
+    coarse_to_fine_hidden_dim: 128
+    coarse_to_fine_use_unmatched: true
+    coarse_to_fine_unmatched_bias: 0.0
+    coarse_to_fine_hard_start_step: 12000
+    coarse_to_fine_hard_inference: true
+    coarse_to_fine_coord_iters: 2
+    coarse_to_fine_coord_hidden_channels: 32
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
@@ -73,6 +85,16 @@ loss:
   patch_teacher_temperature: 0.1
   patch_teacher_confidence_threshold: 0.2
   patch_teacher_margin_threshold: 0.03
+  coarse_correspondence_weight: 0.2
+  coarse_correspondence_temperature: 1.0
+  coarse_correspondence_teacher_temperature: 0.1
+  coarse_correspondence_confidence_threshold: 0.18
+  local_correspondence_weight: 0.2
+  local_correspondence_temperature: 1.0
+  local_correspondence_teacher_temperature: 0.1
+  local_correspondence_confidence_threshold: 0.18
+  coordinate_consistency_weight: 0.05
+  coordinate_consistency_edge_scale: 5.0
   frequency_weight: 0.5
   perceptual_weight: 0.1
   adversarial_weight: 0.02

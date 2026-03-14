@@ -117,6 +117,16 @@ class InpaintingLoss(nn.Module):
         candidate_rerank_temperature: float = 1.0,
         candidate_rerank_confidence_threshold: float = 0.2,
         candidate_rerank_margin_threshold: float = 0.03,
+        coarse_correspondence_weight: float = 0.0,
+        coarse_correspondence_temperature: float = 1.0,
+        coarse_correspondence_teacher_temperature: float = 0.1,
+        coarse_correspondence_confidence_threshold: float = 0.2,
+        local_correspondence_weight: float = 0.0,
+        local_correspondence_temperature: float = 1.0,
+        local_correspondence_teacher_temperature: float = 0.1,
+        local_correspondence_confidence_threshold: float = 0.2,
+        coordinate_consistency_weight: float = 0.0,
+        coordinate_consistency_edge_scale: float = 5.0,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.02,
@@ -139,6 +149,16 @@ class InpaintingLoss(nn.Module):
         self.candidate_rerank_temperature = float(candidate_rerank_temperature)
         self.candidate_rerank_confidence_threshold = float(candidate_rerank_confidence_threshold)
         self.candidate_rerank_margin_threshold = float(candidate_rerank_margin_threshold)
+        self.coarse_correspondence_weight = float(coarse_correspondence_weight)
+        self.coarse_correspondence_temperature = float(coarse_correspondence_temperature)
+        self.coarse_correspondence_teacher_temperature = float(coarse_correspondence_teacher_temperature)
+        self.coarse_correspondence_confidence_threshold = float(coarse_correspondence_confidence_threshold)
+        self.local_correspondence_weight = float(local_correspondence_weight)
+        self.local_correspondence_temperature = float(local_correspondence_temperature)
+        self.local_correspondence_teacher_temperature = float(local_correspondence_teacher_temperature)
+        self.local_correspondence_confidence_threshold = float(local_correspondence_confidence_threshold)
+        self.coordinate_consistency_weight = float(coordinate_consistency_weight)
+        self.coordinate_consistency_edge_scale = float(coordinate_consistency_edge_scale)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -159,6 +179,22 @@ class InpaintingLoss(nn.Module):
             raise ValueError("candidate_rerank_temperature must be positive.")
         if self.candidate_rerank_weight < 0:
             raise ValueError("candidate_rerank_weight must be non-negative.")
+        if self.coarse_correspondence_temperature <= 0:
+            raise ValueError("coarse_correspondence_temperature must be positive.")
+        if self.coarse_correspondence_teacher_temperature <= 0:
+            raise ValueError("coarse_correspondence_teacher_temperature must be positive.")
+        if self.coarse_correspondence_weight < 0:
+            raise ValueError("coarse_correspondence_weight must be non-negative.")
+        if self.local_correspondence_temperature <= 0:
+            raise ValueError("local_correspondence_temperature must be positive.")
+        if self.local_correspondence_teacher_temperature <= 0:
+            raise ValueError("local_correspondence_teacher_temperature must be positive.")
+        if self.local_correspondence_weight < 0:
+            raise ValueError("local_correspondence_weight must be non-negative.")
+        if self.coordinate_consistency_weight < 0:
+            raise ValueError("coordinate_consistency_weight must be non-negative.")
+        if self.coordinate_consistency_edge_scale < 0:
+            raise ValueError("coordinate_consistency_edge_scale must be non-negative.")
 
     def _normalize_descriptors(self, tokens: torch.Tensor) -> torch.Tensor:
         tokens = tokens.float()
@@ -177,6 +213,45 @@ class InpaintingLoss(nn.Module):
             image = F.pad(image, (padding, padding, padding, padding), mode="reflect")
         patches = F.unfold(image, kernel_size=patch_size, stride=stride)
         return patches.transpose(1, 2).contiguous()
+
+    def _aux_int(self, value: object | None, default: int = 0) -> int:
+        if value is None:
+            return int(default)
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return int(default)
+            return int(value.reshape(-1)[0].item())
+        return int(value)
+
+    def _get_teacher_patch_tokens(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor | None, int, int, int]:
+        if attention_aux is None:
+            return None, 0, 0, 0
+
+        kernel_size = self._aux_int(attention_aux.get("kernel_size"), 0)
+        value_patch_size = self._aux_int(attention_aux.get("value_patch_size"), 0)
+        value_patch_padding = self._aux_int(attention_aux.get("value_patch_padding"), 0)
+        if kernel_size <= 0 or value_patch_size <= 0:
+            return None, kernel_size, value_patch_size, value_patch_padding
+
+        target_patches = self._extract_patch_tokens(
+            refined_target,
+            patch_size=value_patch_size,
+            stride=kernel_size,
+            padding=value_patch_padding,
+        )
+        return self._normalize_descriptors(target_patches.detach()), kernel_size, value_patch_size, value_patch_padding
+
+    def _soft_cross_entropy(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+    ) -> torch.Tensor:
+        log_probs = F.log_softmax(logits, dim=-1)
+        return -(targets * log_probs).sum(dim=-1).mean()
 
     def _query_patch_l1_loss(
         self,
@@ -448,6 +523,285 @@ class InpaintingLoss(nn.Module):
         metrics["candidate_rerank_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
         return loss, metrics
 
+    def _coarse_correspondence_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {
+            "coarse_correspondence": 0.0,
+            "coarse_correspondence_accuracy": 0.0,
+            "coarse_correspondence_supervised_ratio": 0.0,
+        }
+        if self.coarse_correspondence_weight <= 0 or attention_aux is None:
+            return zero, metrics
+        if attention_aux.get("matching_mode") != "coarse_to_fine":
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        key_valid_flat = attention_aux.get("key_valid_flat")
+        coarse_cell_logits = attention_aux.get("coarse_cell_logits")
+        coarse_cell_valid_mask = attention_aux.get("coarse_cell_valid_mask")
+        unmatched_logits = attention_aux.get("correspondence_unmatched_logits")
+        token_grid_hw = attention_aux.get("token_grid_size_hw")
+        cell_stride = self._aux_int(attention_aux.get("coarse_cell_stride"), 0)
+        if (
+            query_mask_flat is None
+            or key_valid_flat is None
+            or coarse_cell_logits is None
+            or coarse_cell_valid_mask is None
+            or token_grid_hw is None
+            or cell_stride <= 0
+        ):
+            return zero, metrics
+
+        teacher_patch_tokens, _, value_patch_size, _ = self._get_teacher_patch_tokens(refined_target, attention_aux)
+        if teacher_patch_tokens is None or value_patch_size <= 0:
+            return zero, metrics
+
+        token_grid_h = self._aux_int(token_grid_hw[0], 0) if isinstance(token_grid_hw, torch.Tensor) else int(token_grid_hw[0])
+        token_grid_w = self._aux_int(token_grid_hw[1], 0) if isinstance(token_grid_hw, torch.Tensor) else int(token_grid_hw[1])
+        if token_grid_h <= 0 or token_grid_w <= 0:
+            return zero, metrics
+        coarse_grid_w = token_grid_w // cell_stride
+        cell_count = coarse_cell_logits.shape[-1]
+
+        loss_terms = []
+        supervised_queries = 0
+        total_masked_queries = 0
+        correct_matches = 0
+
+        for batch_idx in range(teacher_patch_tokens.shape[0]):
+            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            key_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            total_masked_queries += int(query_indices.numel())
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                continue
+
+            query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
+            key_patch_tokens = teacher_patch_tokens[batch_idx, key_indices]
+            teacher_scores = torch.matmul(query_patch_tokens, key_patch_tokens.transpose(0, 1))
+            best_teacher = teacher_scores.max(dim=-1).values
+
+            teacher_key_probs = F.softmax(
+                teacher_scores / self.coarse_correspondence_teacher_temperature,
+                dim=-1,
+            )
+            key_y = torch.div(key_indices, token_grid_w, rounding_mode="floor")
+            key_x = key_indices % token_grid_w
+            key_cell_ids = (torch.div(key_y, cell_stride, rounding_mode="floor") * coarse_grid_w) + torch.div(
+                key_x,
+                cell_stride,
+                rounding_mode="floor",
+            )
+
+            coarse_targets = teacher_scores.new_zeros((query_indices.numel(), cell_count))
+            for cell_id in range(cell_count):
+                cell_mask = key_cell_ids == cell_id
+                if cell_mask.any():
+                    coarse_targets[:, cell_id] = teacher_key_probs[:, cell_mask].sum(dim=-1)
+
+            logits = coarse_cell_logits[batch_idx, query_indices] / self.coarse_correspondence_temperature
+            valid_mask = coarse_cell_valid_mask[batch_idx].unsqueeze(0)
+            logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
+
+            matched_teacher = best_teacher >= self.coarse_correspondence_confidence_threshold
+            if unmatched_logits is not None:
+                unmatched_targets = (~matched_teacher).to(dtype=coarse_targets.dtype).unsqueeze(-1)
+                coarse_targets = coarse_targets * matched_teacher.unsqueeze(-1).to(dtype=coarse_targets.dtype)
+                logits = torch.cat(
+                    [logits, unmatched_logits[batch_idx, query_indices].unsqueeze(-1)],
+                    dim=-1,
+                )
+                targets = torch.cat([coarse_targets, unmatched_targets], dim=-1)
+                supervised_mask = matched_teacher | (~matched_teacher)
+            else:
+                targets = coarse_targets
+                supervised_mask = matched_teacher
+
+            if not supervised_mask.any():
+                continue
+
+            loss_terms.append(self._soft_cross_entropy(logits[supervised_mask], targets[supervised_mask]))
+            predictions = logits.argmax(dim=-1)
+            teacher_labels = targets.argmax(dim=-1)
+            supervised_queries += int(supervised_mask.sum().item())
+            correct_matches += int((predictions[supervised_mask] == teacher_labels[supervised_mask]).sum().item())
+
+        if not loss_terms:
+            return zero, metrics
+
+        loss = torch.stack(loss_terms).mean()
+        metrics["coarse_correspondence"] = loss.item()
+        metrics["coarse_correspondence_accuracy"] = correct_matches / max(supervised_queries, 1)
+        metrics["coarse_correspondence_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
+        return loss, metrics
+
+    def _local_correspondence_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {
+            "local_correspondence": 0.0,
+            "local_correspondence_accuracy": 0.0,
+            "local_correspondence_supervised_ratio": 0.0,
+        }
+        if self.local_correspondence_weight <= 0 or attention_aux is None:
+            return zero, metrics
+        if attention_aux.get("matching_mode") != "coarse_to_fine":
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        local_candidate_indices = attention_aux.get("local_candidate_indices")
+        local_candidate_logits = attention_aux.get("local_candidate_logits")
+        local_candidate_valid_mask = attention_aux.get("local_candidate_valid_mask")
+        unmatched_logits = attention_aux.get("correspondence_unmatched_logits")
+        if (
+            query_mask_flat is None
+            or local_candidate_indices is None
+            or local_candidate_logits is None
+            or local_candidate_valid_mask is None
+        ):
+            return zero, metrics
+
+        teacher_patch_tokens, _, value_patch_size, _ = self._get_teacher_patch_tokens(refined_target, attention_aux)
+        if teacher_patch_tokens is None or value_patch_size <= 0:
+            return zero, metrics
+
+        loss_terms = []
+        supervised_queries = 0
+        total_masked_queries = 0
+        correct_matches = 0
+
+        for batch_idx in range(teacher_patch_tokens.shape[0]):
+            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            total_masked_queries += int(query_indices.numel())
+            if query_indices.numel() == 0:
+                continue
+
+            batch_candidate_indices = local_candidate_indices[batch_idx, query_indices]
+            batch_candidate_logits = local_candidate_logits[batch_idx, query_indices]
+            batch_candidate_valid = local_candidate_valid_mask[batch_idx, query_indices]
+            if not batch_candidate_valid.any():
+                continue
+
+            query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
+            safe_candidate_indices = batch_candidate_indices.clamp_min(0)
+            candidate_patch_tokens = teacher_patch_tokens[batch_idx, safe_candidate_indices]
+            teacher_scores = (query_patch_tokens.unsqueeze(1) * candidate_patch_tokens).sum(dim=-1)
+            teacher_scores = teacher_scores.masked_fill(
+                ~batch_candidate_valid,
+                torch.finfo(teacher_scores.dtype).min,
+            )
+            best_teacher = teacher_scores.max(dim=-1).values
+            candidate_targets = F.softmax(
+                teacher_scores / self.local_correspondence_teacher_temperature,
+                dim=-1,
+            )
+
+            logits = batch_candidate_logits / self.local_correspondence_temperature
+            logits = logits.masked_fill(~batch_candidate_valid, torch.finfo(logits.dtype).min)
+            matched_teacher = (
+                batch_candidate_valid.any(dim=-1)
+                & (best_teacher >= self.local_correspondence_confidence_threshold)
+            )
+            if unmatched_logits is not None:
+                unmatched_targets = (~matched_teacher).to(dtype=candidate_targets.dtype).unsqueeze(-1)
+                candidate_targets = candidate_targets * matched_teacher.unsqueeze(-1).to(dtype=candidate_targets.dtype)
+                logits = torch.cat(
+                    [logits, unmatched_logits[batch_idx, query_indices].unsqueeze(-1)],
+                    dim=-1,
+                )
+                targets = torch.cat([candidate_targets, unmatched_targets], dim=-1)
+                supervised_mask = matched_teacher | (~matched_teacher)
+            else:
+                targets = candidate_targets
+                supervised_mask = matched_teacher
+
+            if not supervised_mask.any():
+                continue
+
+            loss_terms.append(self._soft_cross_entropy(logits[supervised_mask], targets[supervised_mask]))
+            predictions = logits.argmax(dim=-1)
+            teacher_labels = targets.argmax(dim=-1)
+            supervised_queries += int(supervised_mask.sum().item())
+            correct_matches += int((predictions[supervised_mask] == teacher_labels[supervised_mask]).sum().item())
+
+        if not loss_terms:
+            return zero, metrics
+
+        loss = torch.stack(loss_terms).mean()
+        metrics["local_correspondence"] = loss.item()
+        metrics["local_correspondence_accuracy"] = correct_matches / max(supervised_queries, 1)
+        metrics["local_correspondence_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
+        return loss, metrics
+
+    def _coordinate_consistency_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {"coordinate_consistency": 0.0}
+        if self.coordinate_consistency_weight <= 0 or attention_aux is None:
+            return zero, metrics
+        if attention_aux.get("matching_mode") != "coarse_to_fine":
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        predicted_source_coords = attention_aux.get("predicted_source_coords")
+        predicted_source_confidence = attention_aux.get("predicted_source_confidence")
+        token_grid_hw = attention_aux.get("token_grid_size_hw")
+        if (
+            query_mask_flat is None
+            or predicted_source_coords is None
+            or predicted_source_confidence is None
+            or token_grid_hw is None
+        ):
+            return zero, metrics
+
+        token_grid_h = self._aux_int(token_grid_hw[0], 0) if isinstance(token_grid_hw, torch.Tensor) else int(token_grid_hw[0])
+        token_grid_w = self._aux_int(token_grid_hw[1], 0) if isinstance(token_grid_hw, torch.Tensor) else int(token_grid_hw[1])
+        if token_grid_h <= 0 or token_grid_w <= 0:
+            return zero, metrics
+
+        coord_map = predicted_source_coords.transpose(1, 2).contiguous().view(
+            predicted_source_coords.shape[0],
+            2,
+            token_grid_h,
+            token_grid_w,
+        )
+        confidence_map = predicted_source_confidence.view(predicted_source_coords.shape[0], 1, token_grid_h, token_grid_w)
+        query_mask_map = query_mask_flat.view(predicted_source_coords.shape[0], 1, token_grid_h, token_grid_w).to(
+            dtype=coord_map.dtype
+        )
+        token_target = F.adaptive_avg_pool2d(refined_target, (token_grid_h, token_grid_w))
+        image_edge_x = torch.exp(
+            -self.coordinate_consistency_edge_scale
+            * (token_target[:, :, :, 1:] - token_target[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+        )
+        image_edge_y = torch.exp(
+            -self.coordinate_consistency_edge_scale
+            * (token_target[:, :, 1:, :] - token_target[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+        )
+
+        mask_x = query_mask_map[:, :, :, 1:] * query_mask_map[:, :, :, :-1]
+        mask_y = query_mask_map[:, :, 1:, :] * query_mask_map[:, :, :-1, :]
+        conf_x = 0.5 * (confidence_map[:, :, :, 1:] + confidence_map[:, :, :, :-1])
+        conf_y = 0.5 * (confidence_map[:, :, 1:, :] + confidence_map[:, :, :-1, :])
+        diff_x = (coord_map[:, :, :, 1:] - coord_map[:, :, :, :-1]).abs().sum(dim=1, keepdim=True)
+        diff_y = (coord_map[:, :, 1:, :] - coord_map[:, :, :-1, :]).abs().sum(dim=1, keepdim=True)
+        weighted_x = diff_x * mask_x * conf_x * image_edge_x
+        weighted_y = diff_y * mask_y * conf_y * image_edge_y
+        denom_x = (mask_x * conf_x * image_edge_x).sum().clamp_min(1e-6)
+        denom_y = (mask_y * conf_y * image_edge_y).sum().clamp_min(1e-6)
+        loss = 0.5 * ((weighted_x.sum() / denom_x) + (weighted_y.sum() / denom_y))
+        metrics["coordinate_consistency"] = loss.item()
+        return loss, metrics
+
     def generator_loss(
         self,
         coarse_raw: torch.Tensor,
@@ -470,6 +824,18 @@ class InpaintingLoss(nn.Module):
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         patch_teacher_loss, patch_teacher_metrics = self._patch_teacher_loss(refined_target, attention_aux)
         candidate_rerank_loss, candidate_rerank_metrics = self._candidate_rerank_loss(
+            refined_target,
+            attention_aux,
+        )
+        coarse_correspondence_loss, coarse_correspondence_metrics = self._coarse_correspondence_loss(
+            refined_target,
+            attention_aux,
+        )
+        local_correspondence_loss, local_correspondence_metrics = self._local_correspondence_loss(
+            refined_target,
+            attention_aux,
+        )
+        coordinate_consistency_loss, coordinate_consistency_metrics = self._coordinate_consistency_loss(
             refined_target,
             attention_aux,
         )
@@ -496,6 +862,9 @@ class InpaintingLoss(nn.Module):
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + self.patch_teacher_weight * patch_teacher_loss
             + self.candidate_rerank_weight * candidate_rerank_loss
+            + self.coarse_correspondence_weight * coarse_correspondence_loss
+            + self.local_correspondence_weight * local_correspondence_loss
+            + self.coordinate_consistency_weight * coordinate_consistency_loss
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
@@ -515,6 +884,13 @@ class InpaintingLoss(nn.Module):
             "candidate_rerank_base_accuracy": candidate_rerank_metrics["candidate_rerank_base_accuracy"],
             "candidate_rerank_teacher_in_topk": candidate_rerank_metrics["candidate_rerank_teacher_in_topk"],
             "candidate_rerank_supervised_ratio": candidate_rerank_metrics["candidate_rerank_supervised_ratio"],
+            "coarse_correspondence": coarse_correspondence_metrics["coarse_correspondence"],
+            "coarse_correspondence_accuracy": coarse_correspondence_metrics["coarse_correspondence_accuracy"],
+            "coarse_correspondence_supervised_ratio": coarse_correspondence_metrics["coarse_correspondence_supervised_ratio"],
+            "local_correspondence": local_correspondence_metrics["local_correspondence"],
+            "local_correspondence_accuracy": local_correspondence_metrics["local_correspondence_accuracy"],
+            "local_correspondence_supervised_ratio": local_correspondence_metrics["local_correspondence_supervised_ratio"],
+            "coordinate_consistency": coordinate_consistency_metrics["coordinate_consistency"],
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),
