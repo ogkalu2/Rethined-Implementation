@@ -113,6 +113,11 @@ class InpaintingLoss(nn.Module):
         patch_teacher_temperature: float = 0.1,
         patch_teacher_confidence_threshold: float = 0.2,
         patch_teacher_margin_threshold: float = 0.03,
+        direct_retriever_weight: float = 0.0,
+        direct_retriever_temperature: float = 0.1,
+        direct_retriever_teacher_top_k: int = 4,
+        direct_retriever_teacher_temperature: float = 0.2,
+        direct_retriever_confidence_threshold: float = 0.2,
         candidate_rerank_weight: float = 0.0,
         candidate_rerank_temperature: float = 1.0,
         candidate_rerank_confidence_threshold: float = 0.2,
@@ -135,6 +140,11 @@ class InpaintingLoss(nn.Module):
         self.patch_teacher_temperature = float(patch_teacher_temperature)
         self.patch_teacher_confidence_threshold = float(patch_teacher_confidence_threshold)
         self.patch_teacher_margin_threshold = float(patch_teacher_margin_threshold)
+        self.direct_retriever_weight = float(direct_retriever_weight)
+        self.direct_retriever_temperature = float(direct_retriever_temperature)
+        self.direct_retriever_teacher_top_k = max(1, int(direct_retriever_teacher_top_k))
+        self.direct_retriever_teacher_temperature = float(direct_retriever_teacher_temperature)
+        self.direct_retriever_confidence_threshold = float(direct_retriever_confidence_threshold)
         self.candidate_rerank_weight = float(candidate_rerank_weight)
         self.candidate_rerank_temperature = float(candidate_rerank_temperature)
         self.candidate_rerank_confidence_threshold = float(candidate_rerank_confidence_threshold)
@@ -155,6 +165,12 @@ class InpaintingLoss(nn.Module):
             raise ValueError("patch_teacher_temperature must be positive.")
         if self.patch_teacher_weight < 0:
             raise ValueError("patch_teacher_weight must be non-negative.")
+        if self.direct_retriever_temperature <= 0:
+            raise ValueError("direct_retriever_temperature must be positive.")
+        if self.direct_retriever_teacher_temperature <= 0:
+            raise ValueError("direct_retriever_teacher_temperature must be positive.")
+        if self.direct_retriever_weight < 0:
+            raise ValueError("direct_retriever_weight must be non-negative.")
         if self.candidate_rerank_temperature <= 0:
             raise ValueError("candidate_rerank_temperature must be positive.")
         if self.candidate_rerank_weight < 0:
@@ -448,6 +464,97 @@ class InpaintingLoss(nn.Module):
         metrics["candidate_rerank_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
         return loss, metrics
 
+    def _direct_retriever_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {
+            "direct_retriever": 0.0,
+            "direct_retriever_accuracy": 0.0,
+            "direct_retriever_supervised_ratio": 0.0,
+        }
+        if self.direct_retriever_weight <= 0 or attention_aux is None:
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        key_valid_flat = attention_aux.get("key_valid_flat")
+        query_retrieval_tokens = attention_aux.get("candidate_query_retrieval_tokens")
+        key_retrieval_tokens = attention_aux.get("candidate_key_retrieval_tokens")
+        retrieval_scale = attention_aux.get("candidate_context_retrieval_scale")
+        kernel_size = int(attention_aux.get("kernel_size", 0))
+        value_patch_size = int(attention_aux.get("value_patch_size", 0))
+        value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
+        if (
+            query_mask_flat is None
+            or key_valid_flat is None
+            or query_retrieval_tokens is None
+            or key_retrieval_tokens is None
+            or retrieval_scale is None
+            or kernel_size <= 0
+            or value_patch_size <= 0
+        ):
+            return zero, metrics
+
+        target_patches = self._extract_patch_tokens(
+            refined_target,
+            patch_size=value_patch_size,
+            stride=kernel_size,
+            padding=value_patch_padding,
+        )
+        teacher_patch_tokens = self._normalize_descriptors(target_patches.detach())
+
+        loss_terms = []
+        supervised_queries = 0
+        total_masked_queries = 0
+        positive_hits = 0
+
+        for batch_idx in range(teacher_patch_tokens.shape[0]):
+            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            key_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            total_masked_queries += int(query_indices.numel())
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                continue
+
+            query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
+            key_patch_tokens = teacher_patch_tokens[batch_idx, key_indices]
+            teacher_scores = torch.matmul(query_patch_tokens, key_patch_tokens.transpose(0, 1))
+            teacher_best = teacher_scores.max(dim=-1).values
+            valid_teacher = teacher_best >= self.direct_retriever_confidence_threshold
+            if not valid_teacher.any():
+                continue
+
+            teacher_top_k = min(self.direct_retriever_teacher_top_k, teacher_scores.shape[-1])
+            top_teacher_values, top_teacher_indices = teacher_scores.topk(k=teacher_top_k, dim=-1)
+            top_teacher_values = top_teacher_values[valid_teacher] / self.direct_retriever_teacher_temperature
+            teacher_probs = F.softmax(top_teacher_values, dim=-1)
+            teacher_positive_indices = top_teacher_indices[valid_teacher]
+
+            query_tokens = query_retrieval_tokens[batch_idx, query_indices[valid_teacher]]
+            key_tokens = key_retrieval_tokens[batch_idx, key_indices]
+            logits = torch.matmul(query_tokens, key_tokens.transpose(0, 1))
+            logits = logits * retrieval_scale.to(dtype=logits.dtype, device=logits.device)
+            logits = logits / self.direct_retriever_temperature
+            log_probs = F.log_softmax(logits, dim=-1)
+
+            soft_targets = torch.zeros_like(log_probs)
+            soft_targets.scatter_(1, teacher_positive_indices, teacher_probs)
+            loss_terms.append(-(soft_targets * log_probs).sum(dim=-1).mean())
+
+            predictions = logits.argmax(dim=-1, keepdim=True)
+            positive_hits += int((predictions == teacher_positive_indices).any(dim=-1).sum().item())
+            supervised_queries += int(valid_teacher.sum().item())
+
+        if not loss_terms:
+            return zero, metrics
+
+        loss = torch.stack(loss_terms).mean()
+        metrics["direct_retriever"] = loss.item()
+        metrics["direct_retriever_accuracy"] = positive_hits / max(supervised_queries, 1)
+        metrics["direct_retriever_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
+        return loss, metrics
+
     def generator_loss(
         self,
         coarse_raw: torch.Tensor,
@@ -469,6 +576,10 @@ class InpaintingLoss(nn.Module):
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         patch_teacher_loss, patch_teacher_metrics = self._patch_teacher_loss(refined_target, attention_aux)
+        direct_retriever_loss, direct_retriever_metrics = self._direct_retriever_loss(
+            refined_target,
+            attention_aux,
+        )
         candidate_rerank_loss, candidate_rerank_metrics = self._candidate_rerank_loss(
             refined_target,
             attention_aux,
@@ -495,6 +606,7 @@ class InpaintingLoss(nn.Module):
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + self.patch_teacher_weight * patch_teacher_loss
+            + self.direct_retriever_weight * direct_retriever_loss
             + self.candidate_rerank_weight * candidate_rerank_loss
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
@@ -510,6 +622,9 @@ class InpaintingLoss(nn.Module):
             "patch_teacher": patch_teacher_metrics["patch_teacher"],
             "patch_teacher_accuracy": patch_teacher_metrics["patch_teacher_accuracy"],
             "patch_teacher_supervised_ratio": patch_teacher_metrics["patch_teacher_supervised_ratio"],
+            "direct_retriever": direct_retriever_metrics["direct_retriever"],
+            "direct_retriever_accuracy": direct_retriever_metrics["direct_retriever_accuracy"],
+            "direct_retriever_supervised_ratio": direct_retriever_metrics["direct_retriever_supervised_ratio"],
             "candidate_rerank": candidate_rerank_metrics["candidate_rerank"],
             "candidate_rerank_accuracy": candidate_rerank_metrics["candidate_rerank_accuracy"],
             "candidate_rerank_base_accuracy": candidate_rerank_metrics["candidate_rerank_base_accuracy"],

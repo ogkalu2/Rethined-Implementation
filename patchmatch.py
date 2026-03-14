@@ -584,6 +584,21 @@ class PatchInpainting(nn.Module):
         progress = max(0.0, min(float(progress), 1.0))
         return self.candidate_rerank_selection_max_alpha * progress
 
+    def _project_candidate_retrieval_tokens(
+        self,
+        query_context_tokens: torch.Tensor,
+        key_context_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
+        if not self.candidate_context_retrieval:
+            return None, None
+        if self.candidate_query_retrieval_head is None or self.candidate_key_retrieval_head is None:
+            raise ValueError("candidate_context_retrieval is enabled but retrieval heads are missing.")
+        query_context_proj = self.candidate_query_retrieval_head(query_context_tokens)
+        key_context_proj = self.candidate_key_retrieval_head(key_context_tokens)
+        query_context_proj = F.normalize(query_context_proj, dim=-1, eps=1e-6)
+        key_context_proj = F.normalize(key_context_proj, dim=-1, eps=1e-6)
+        return query_context_proj, key_context_proj
+
     def _compute_candidate_context_logits(
         self,
         query_context_tokens: torch.Tensor,
@@ -591,17 +606,9 @@ class PatchInpainting(nn.Module):
     ) -> torch.Tensor | None:
         if not self.candidate_context_retrieval:
             return None
-        if (
-            self.candidate_query_retrieval_head is None
-            or self.candidate_key_retrieval_head is None
-            or self.candidate_context_retrieval_scale is None
-        ):
-            raise ValueError("candidate_context_retrieval is enabled but retrieval heads are missing.")
-        query_context_proj = self.candidate_query_retrieval_head(query_context_tokens)
-        key_context_proj = self.candidate_key_retrieval_head(key_context_tokens)
-        query_context_proj = F.normalize(query_context_proj, dim=-1, eps=1e-6)
-        key_context_proj = F.normalize(key_context_proj, dim=-1, eps=1e-6)
-        context_logits = torch.matmul(query_context_proj, key_context_proj.transpose(0, 1))
+        if self.candidate_context_retrieval_scale is None:
+            raise ValueError("candidate_context_retrieval is enabled but retrieval scale is missing.")
+        context_logits = torch.matmul(query_context_tokens, key_context_tokens.transpose(0, 1))
         scale = self.candidate_context_retrieval_scale.to(
             dtype=context_logits.dtype,
             device=context_logits.device,
@@ -815,6 +822,8 @@ class PatchInpainting(nn.Module):
         key_tokens_full: torch.Tensor,
         query_context_tokens_full: torch.Tensor | None,
         key_context_tokens_full: torch.Tensor | None,
+        query_retrieval_tokens_full: torch.Tensor | None,
+        key_retrieval_tokens_full: torch.Tensor | None,
         patch_values: torch.Tensor,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
@@ -874,12 +883,15 @@ class PatchInpainting(nn.Module):
                     query_context_tokens = query_context_tokens_full[batch_idx, query_indices]
                     key_context_tokens = key_context_tokens_full[batch_idx, key_indices]
                     retrieval_logits = base_logits
-                    context_logits = self._compute_candidate_context_logits(
-                        query_context_tokens,
-                        key_context_tokens,
-                    )
-                    if context_logits is not None:
-                        retrieval_logits = retrieval_logits + context_logits.to(dtype=retrieval_logits.dtype)
+                    if query_retrieval_tokens_full is not None and key_retrieval_tokens_full is not None:
+                        query_retrieval_tokens = query_retrieval_tokens_full[batch_idx, query_indices]
+                        key_retrieval_tokens = key_retrieval_tokens_full[batch_idx, key_indices]
+                        context_logits = self._compute_candidate_context_logits(
+                            query_retrieval_tokens,
+                            key_retrieval_tokens,
+                        )
+                        if context_logits is not None:
+                            retrieval_logits = retrieval_logits + context_logits.to(dtype=retrieval_logits.dtype)
                     candidate_count = min(retrieval_logits.shape[-1], self.multihead_attention.attention_top_k)
                     base_candidate_logits, candidate_local_indices = torch.topk(
                         retrieval_logits,
@@ -1055,6 +1067,8 @@ class PatchInpainting(nn.Module):
         key_matching_tokens = None
         candidate_query_context_tokens = None
         candidate_key_context_tokens = None
+        candidate_query_retrieval_tokens = None
+        candidate_key_retrieval_tokens = None
         if self.candidate_reranker:
             candidate_query_context_map = self._pool_to_token_grid(
                 self.candidate_query_context_encoder(torch.cat([image, coarse_composite, mask], dim=1)),
@@ -1066,6 +1080,14 @@ class PatchInpainting(nn.Module):
             )
             candidate_query_context_tokens = candidate_query_context_map.flatten(start_dim=2).transpose(1, 2)
             candidate_key_context_tokens = candidate_key_context_map.flatten(start_dim=2).transpose(1, 2)
+            if self.candidate_context_retrieval:
+                (
+                    candidate_query_retrieval_tokens,
+                    candidate_key_retrieval_tokens,
+                ) = self._project_candidate_retrieval_tokens(
+                    candidate_query_context_tokens,
+                    candidate_key_context_tokens,
+                )
         if self.separate_query_key_matching:
             visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
             query_context_map = self._pool_to_token_grid(
@@ -1183,6 +1205,8 @@ class PatchInpainting(nn.Module):
                 key_tokens,
                 candidate_query_context_tokens,
                 candidate_key_context_tokens,
+                candidate_query_retrieval_tokens,
+                candidate_key_retrieval_tokens,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
@@ -1233,6 +1257,10 @@ class PatchInpainting(nn.Module):
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
             }
+            if candidate_query_retrieval_tokens is not None and candidate_key_retrieval_tokens is not None:
+                aux["candidate_query_retrieval_tokens"] = candidate_query_retrieval_tokens
+                aux["candidate_key_retrieval_tokens"] = candidate_key_retrieval_tokens
+                aux["candidate_context_retrieval_scale"] = self.candidate_context_retrieval_scale
             if rerank_aux is not None:
                 aux.update(rerank_aux)
             return refined, masked_attention, coarse_raw, aux

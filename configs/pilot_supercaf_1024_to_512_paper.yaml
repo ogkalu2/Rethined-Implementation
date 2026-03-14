@@ -91,6 +91,11 @@ loss:
   patch_teacher_temperature: 0.1
   patch_teacher_confidence_threshold: 0.2
   patch_teacher_margin_threshold: 0.03
+  direct_retriever_weight: 0.1
+  direct_retriever_temperature: 0.1
+  direct_retriever_teacher_top_k: 4
+  direct_retriever_teacher_temperature: 0.2
+  direct_retriever_confidence_threshold: 0.2
   candidate_rerank_weight: 0.1
   candidate_rerank_temperature: 1.0
   candidate_rerank_confidence_threshold: 0.2
