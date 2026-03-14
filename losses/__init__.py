@@ -50,19 +50,6 @@ def dilate_mask(mask: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
     return F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
 
 
-def erode_mask(mask: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-    if kernel_size <= 1:
-        return mask
-    return -F.max_pool2d(-mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
-
-
-def inner_boundary_band(mask: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
-    if kernel_size <= 1:
-        return mask
-    eroded = erode_mask(mask, kernel_size=kernel_size)
-    return (mask - eroded).clamp(0.0, 1.0)
-
-
 def masked_gradient_l1_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
@@ -84,30 +71,6 @@ def masked_gradient_l1_loss(
 
     dx_denom = mask_dx.sum(dim=(1, 2, 3)).clamp_min(eps)
     dy_denom = mask_dy.sum(dim=(1, 2, 3)).clamp_min(eps)
-    dx_mean = dx_loss.sum(dim=(1, 2, 3)) / dx_denom
-    dy_mean = dy_loss.sum(dim=(1, 2, 3)) / dy_denom
-    return 0.5 * (dx_mean.mean() + dy_mean.mean())
-
-
-def seam_gradient_l1_loss(
-    pred: torch.Tensor,
-    target: torch.Tensor,
-    mask: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    seam_dx = (mask[:, :, :, 1:] - mask[:, :, :, :-1]).abs()
-    seam_dy = (mask[:, :, 1:, :] - mask[:, :, :-1, :]).abs()
-
-    pred_dx = pred[:, :, :, 1:] - pred[:, :, :, :-1]
-    target_dx = target[:, :, :, 1:] - target[:, :, :, :-1]
-    pred_dy = pred[:, :, 1:, :] - pred[:, :, :-1, :]
-    target_dy = target[:, :, 1:, :] - target[:, :, :-1, :]
-
-    dx_loss = (pred_dx - target_dx).abs() * seam_dx
-    dy_loss = (pred_dy - target_dy).abs() * seam_dy
-
-    dx_denom = (seam_dx.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp_min(eps)
-    dy_denom = (seam_dy.sum(dim=(1, 2, 3)) * pred.shape[1]).clamp_min(eps)
     dx_mean = dx_loss.sum(dim=(1, 2, 3)) / dx_denom
     dy_mean = dy_loss.sum(dim=(1, 2, 3)) / dy_denom
     return 0.5 * (dx_mean.mean() + dy_mean.mean())
@@ -158,9 +121,6 @@ class InpaintingLoss(nn.Module):
         transport_cycle_consistency_weight: float = 0.0,
         transport_confidence_weight: float = 0.0,
         transport_offset_edge_scale: float = 5.0,
-        boundary_band_l1_weight: float = 0.0,
-        boundary_seam_gradient_weight: float = 0.0,
-        boundary_band_kernel_size: int = 5,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.02,
@@ -187,9 +147,6 @@ class InpaintingLoss(nn.Module):
         self.transport_cycle_consistency_weight = float(transport_cycle_consistency_weight)
         self.transport_confidence_weight = float(transport_confidence_weight)
         self.transport_offset_edge_scale = float(transport_offset_edge_scale)
-        self.boundary_band_l1_weight = float(boundary_band_l1_weight)
-        self.boundary_seam_gradient_weight = float(boundary_seam_gradient_weight)
-        self.boundary_band_kernel_size = int(boundary_band_kernel_size)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -222,12 +179,6 @@ class InpaintingLoss(nn.Module):
             raise ValueError("transport_confidence_weight must be non-negative.")
         if self.transport_offset_edge_scale < 0:
             raise ValueError("transport_offset_edge_scale must be non-negative.")
-        if self.boundary_band_l1_weight < 0:
-            raise ValueError("boundary_band_l1_weight must be non-negative.")
-        if self.boundary_seam_gradient_weight < 0:
-            raise ValueError("boundary_seam_gradient_weight must be non-negative.")
-        if self.boundary_band_kernel_size <= 0:
-            raise ValueError("boundary_band_kernel_size must be positive.")
 
     def _normalize_descriptors(self, tokens: torch.Tensor) -> torch.Tensor:
         tokens = tokens.float()
@@ -738,47 +689,6 @@ class InpaintingLoss(nn.Module):
         metrics["transport_confidence"] = loss.item()
         return loss, metrics
 
-    def _boundary_band_l1_loss(
-        self,
-        refined: torch.Tensor,
-        refined_target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        zero = refined.new_zeros(())
-        metrics = {"boundary_band_l1": 0.0}
-        if self.boundary_band_l1_weight <= 0:
-            return zero, metrics
-
-        boundary_band = inner_boundary_band(mask, kernel_size=self.boundary_band_kernel_size)
-        if boundary_band.sum() <= 0:
-            return zero, metrics
-
-        loss = masked_l1_loss(refined, refined_target, boundary_band)
-        metrics["boundary_band_l1"] = loss.item()
-        return loss, metrics
-
-    def _boundary_seam_gradient_loss(
-        self,
-        refined: torch.Tensor,
-        refined_target: torch.Tensor,
-        mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        zero = refined.new_zeros(())
-        metrics = {"boundary_seam_gradient": 0.0}
-        if self.boundary_seam_gradient_weight <= 0:
-            return zero, metrics
-
-        seam_measure = (
-            (mask[:, :, :, 1:] - mask[:, :, :, :-1]).abs().sum()
-            + (mask[:, :, 1:, :] - mask[:, :, :-1, :]).abs().sum()
-        )
-        if seam_measure <= 0:
-            return zero, metrics
-
-        loss = seam_gradient_l1_loss(refined, refined_target, mask)
-        metrics["boundary_seam_gradient"] = loss.item()
-        return loss, metrics
-
     def generator_loss(
         self,
         coarse_raw: torch.Tensor,
@@ -821,16 +731,6 @@ class InpaintingLoss(nn.Module):
             refined_target,
             attention_aux,
         )
-        boundary_band_l1_loss, boundary_band_l1_metrics = self._boundary_band_l1_loss(
-            refined,
-            refined_target,
-            mask,
-        )
-        boundary_seam_gradient_loss, boundary_seam_gradient_metrics = self._boundary_seam_gradient_loss(
-            refined,
-            refined_target,
-            mask,
-        )
         frequency = self.frequency_loss(refined, refined_target)
         perceptual = self.perceptual_loss(refined, refined_target)
 
@@ -860,8 +760,6 @@ class InpaintingLoss(nn.Module):
             + self.transport_offset_smoothness_weight * transport_offset_smoothness_loss
             + self.transport_cycle_consistency_weight * transport_cycle_consistency_loss
             + self.transport_confidence_weight * transport_confidence_loss
-            + self.boundary_band_l1_weight * boundary_band_l1_loss
-            + self.boundary_seam_gradient_weight * boundary_seam_gradient_loss
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
@@ -889,8 +787,6 @@ class InpaintingLoss(nn.Module):
             "transport_cycle_error": transport_cycle_consistency_metrics["transport_cycle_error"],
             "transport_confidence": transport_confidence_metrics["transport_confidence"],
             "transport_confidence_mean": transport_confidence_metrics["transport_confidence_mean"],
-            "boundary_band_l1": boundary_band_l1_metrics["boundary_band_l1"],
-            "boundary_seam_gradient": boundary_seam_gradient_metrics["boundary_seam_gradient"],
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),
