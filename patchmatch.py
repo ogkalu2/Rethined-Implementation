@@ -1149,7 +1149,7 @@ class PatchInpainting(nn.Module):
                         selection_logits = base_candidate_logits + (selection_alpha * rerank_delta)
                         selection_attn, selection_probs = self.multihead_attention.attention_from_logits(
                             selection_logits,
-                            value_dtype=value_tokens_flat.dtype,
+                            value_dtype=value_tokens.dtype,
                             direct_patch_mixing=True,
                         )
                         mixed_queries = torch.einsum(
