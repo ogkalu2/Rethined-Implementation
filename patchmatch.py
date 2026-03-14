@@ -841,7 +841,6 @@ class PatchInpainting(nn.Module):
         key_token_map = key_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
         query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
         valid_key_map = key_valid_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
-        key_token_map = key_token_map * valid_key_map
         base_coords = self._get_normalized_token_coords(
             token_hw,
             dtype=query_token_map.dtype,
@@ -898,19 +897,13 @@ class PatchInpainting(nn.Module):
         confidence = transport_state["confidence"]
 
         sampled_validity = sampled_validity.clamp(0.0, 1.0)
-        valid_source_patch_map = source_patch_map * key_valid_flat.view(
-            coords.shape[0],
-            1,
-            token_hw[0],
-            token_hw[1],
-        ).to(dtype=source_patch_map.dtype)
         hard_validity = self._sample_transport_map(
             key_valid_flat.view(coords.shape[0], 1, token_hw[0], token_hw[1]).to(dtype=coords.dtype),
             coords,
             mode="nearest",
         ).clamp(0.0, 1.0)
         sharp_values, normalized_bilinear_values = self._sample_transport_source_values(
-            valid_source_patch_map,
+            source_patch_map,
             coords,
             sampled_validity,
         )
