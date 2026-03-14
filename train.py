@@ -286,6 +286,7 @@ def format_train_metric_snapshot(metrics):
             f", rr={metrics['candidate_rerank']:.4f}"
             f", rra={metrics['candidate_rerank_accuracy']:.3f}"
             f", rrb={metrics['candidate_rerank_base_accuracy']:.3f}"
+            f", rrh={metrics['candidate_rerank_teacher_in_topk']:.3f}"
             f", rrs={metrics['candidate_rerank_supervised_ratio']:.3f}"
         )
     return summary
@@ -743,6 +744,11 @@ def train(cfg, args):
                     step,
                 )
                 writer.add_scalar(
+                    "candidate_rerank/teacher_in_topk",
+                    metrics["candidate_rerank_teacher_in_topk"],
+                    step,
+                )
+                writer.add_scalar(
                     "candidate_rerank/supervised_ratio",
                     metrics["candidate_rerank_supervised_ratio"],
                     step,
@@ -778,6 +784,7 @@ def train(cfg, args):
                     rr=(f"{metrics['candidate_rerank']:.4f}" if "candidate_rerank" in metrics else "n/a"),
                     rra=(f"{metrics['candidate_rerank_accuracy']:.3f}" if "candidate_rerank_accuracy" in metrics else "n/a"),
                     rrb=(f"{metrics['candidate_rerank_base_accuracy']:.3f}" if "candidate_rerank_base_accuracy" in metrics else "n/a"),
+                    rrh=(f"{metrics['candidate_rerank_teacher_in_topk']:.3f}" if "candidate_rerank_teacher_in_topk" in metrics else "n/a"),
                     rrs=(f"{metrics['candidate_rerank_supervised_ratio']:.3f}" if "candidate_rerank_supervised_ratio" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",

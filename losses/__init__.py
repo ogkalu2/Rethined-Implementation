@@ -322,12 +322,14 @@ class InpaintingLoss(nn.Module):
             "candidate_rerank": 0.0,
             "candidate_rerank_accuracy": 0.0,
             "candidate_rerank_base_accuracy": 0.0,
+            "candidate_rerank_teacher_in_topk": 0.0,
             "candidate_rerank_supervised_ratio": 0.0,
         }
         if self.candidate_rerank_weight <= 0 or attention_aux is None:
             return zero, metrics
 
         query_mask_flat = attention_aux.get("query_mask_flat")
+        key_valid_flat = attention_aux.get("key_valid_flat")
         candidate_indices = attention_aux.get("candidate_indices")
         candidate_base_logits = attention_aux.get("candidate_base_logits")
         candidate_logits = attention_aux.get("candidate_logits")
@@ -337,6 +339,7 @@ class InpaintingLoss(nn.Module):
         value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
         if (
             query_mask_flat is None
+            or key_valid_flat is None
             or candidate_indices is None
             or candidate_base_logits is None
             or candidate_logits is None
@@ -359,6 +362,8 @@ class InpaintingLoss(nn.Module):
         total_masked_queries = 0
         correct_matches = 0
         base_correct_matches = 0
+        retrieval_supervised_queries = 0
+        retrieval_hits = 0
 
         for batch_idx in range(teacher_patch_tokens.shape[0]):
             query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
@@ -366,14 +371,38 @@ class InpaintingLoss(nn.Module):
             if query_indices.numel() == 0:
                 continue
 
+            key_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            if key_indices.numel() == 0:
+                continue
+
             batch_candidate_indices = candidate_indices[batch_idx, query_indices]
             batch_candidate_logits = candidate_logits[batch_idx, query_indices]
             batch_candidate_valid = candidate_valid_mask[batch_idx, query_indices]
+            query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
+            valid_key_patch_tokens = teacher_patch_tokens[batch_idx, key_indices]
+            global_teacher_scores = torch.matmul(query_patch_tokens, valid_key_patch_tokens.transpose(0, 1))
+            global_teacher_best, global_teacher_labels = global_teacher_scores.max(dim=-1)
+            global_teacher_top2 = global_teacher_scores.topk(k=min(2, global_teacher_scores.shape[-1]), dim=-1).values
+            global_teacher_margin = torch.full_like(global_teacher_best, float("inf"))
+            if global_teacher_top2.shape[-1] > 1:
+                global_teacher_margin = global_teacher_top2[:, 0] - global_teacher_top2[:, 1]
+            valid_global_teacher = (
+                (global_teacher_best >= self.candidate_rerank_confidence_threshold)
+                & (global_teacher_margin >= self.candidate_rerank_margin_threshold)
+            )
+            if valid_global_teacher.any():
+                teacher_absolute_indices = key_indices[global_teacher_labels[valid_global_teacher]]
+                teacher_hit_mask = (
+                    (batch_candidate_indices[valid_global_teacher] == teacher_absolute_indices.unsqueeze(-1))
+                    & batch_candidate_valid[valid_global_teacher]
+                ).any(dim=-1)
+                retrieval_supervised_queries += int(valid_global_teacher.sum().item())
+                retrieval_hits += int(teacher_hit_mask.sum().item())
+
             if not batch_candidate_valid.any():
                 continue
 
             safe_candidate_indices = batch_candidate_indices.clamp_min(0)
-            query_patch_tokens = teacher_patch_tokens[batch_idx, query_indices]
             candidate_patch_tokens = teacher_patch_tokens[batch_idx, safe_candidate_indices]
             teacher_scores = (query_patch_tokens.unsqueeze(1) * candidate_patch_tokens).sum(dim=-1)
             teacher_scores = teacher_scores.masked_fill(
@@ -408,6 +437,7 @@ class InpaintingLoss(nn.Module):
             correct_matches += int((predictions == teacher_labels).sum().item())
             base_correct_matches += int((base_predictions == teacher_labels).sum().item())
 
+        metrics["candidate_rerank_teacher_in_topk"] = retrieval_hits / max(retrieval_supervised_queries, 1)
         if not loss_terms:
             return zero, metrics
 
@@ -483,6 +513,7 @@ class InpaintingLoss(nn.Module):
             "candidate_rerank": candidate_rerank_metrics["candidate_rerank"],
             "candidate_rerank_accuracy": candidate_rerank_metrics["candidate_rerank_accuracy"],
             "candidate_rerank_base_accuracy": candidate_rerank_metrics["candidate_rerank_base_accuracy"],
+            "candidate_rerank_teacher_in_topk": candidate_rerank_metrics["candidate_rerank_teacher_in_topk"],
             "candidate_rerank_supervised_ratio": candidate_rerank_metrics["candidate_rerank_supervised_ratio"],
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),

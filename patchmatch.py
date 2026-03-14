@@ -120,6 +120,27 @@ class MultiHeadAttention(nn.Module):
         attn_logits = self._restrict_attention_logits(attn_logits_raw, query_mask_flat)
         return attn_logits_raw, attn_logits
 
+    def attention_from_logits(
+        self,
+        attn_logits: torch.Tensor,
+        *,
+        value_dtype: torch.dtype,
+        direct_patch_mixing: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        attn_probs = self._normalize_attention_logits(attn_logits).to(value_dtype)
+        attn = attn_probs
+        if direct_patch_mixing and self.training:
+            needs_straight_through_hardening = (
+                self.attention_selection == "softmax"
+                or (self.attention_selection == "gumbel" and not self.attention_gumbel_hard)
+            )
+            if needs_straight_through_hardening:
+                hard_attn = self._hard_attention_from_logits(attn_logits).to(value_dtype)
+                attn = hard_attn - attn_probs.detach() + attn_probs
+        if not direct_patch_mixing:
+            attn = self.dropout(attn)
+        return attn, attn_probs
+
     def forward(
         self,
         q: torch.Tensor,
@@ -145,23 +166,11 @@ class MultiHeadAttention(nn.Module):
             post_softmax_mask=post_softmax_mask,
             query_mask_flat=query_mask_flat,
         )
-        attn_probs = self._normalize_attention_logits(attn_logits).to(v.dtype)
-        attn = attn_probs
-        if direct_patch_mixing and self.training:
-            # For direct RGB patch mixing, soft attention averages unrelated patches and
-            # changes the task into patch blending. Use hard routing in the forward pass
-            # while preserving soft gradients during warmup.
-            needs_straight_through_hardening = (
-                self.attention_selection == "softmax"
-                or (self.attention_selection == "gumbel" and not self.attention_gumbel_hard)
-            )
-            if needs_straight_through_hardening:
-                hard_attn = self._hard_attention_from_logits(attn_logits).to(v.dtype)
-                attn = hard_attn - attn_probs.detach() + attn_probs
-        # Direct patch mixing behaves like weighted image reconstruction, so dropping
-        # sparse attention weights introduces random dark artifacts instead of useful regularization.
-        if not direct_patch_mixing:
-            attn = self.dropout(attn)
+        attn, attn_probs = self.attention_from_logits(
+            attn_logits,
+            value_dtype=v.dtype,
+            direct_patch_mixing=direct_patch_mixing,
+        )
 
         mixed = torch.matmul(attn, v_proj)
         output = mixed.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
@@ -193,6 +202,10 @@ class PatchInpainting(nn.Module):
         candidate_reranker: bool = False,
         candidate_reranker_hidden_dim: int = 128,
         candidate_rerank_context_channels: int = 32,
+        candidate_rerank_selection: bool = False,
+        candidate_rerank_selection_max_alpha: float = 1.0,
+        candidate_rerank_selection_start_step: int = 0,
+        candidate_rerank_selection_ramp_steps: int = 0,
         query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
         shared_query_key_descriptor: bool = False,
@@ -241,6 +254,10 @@ class PatchInpainting(nn.Module):
         self.candidate_reranker = bool(candidate_reranker)
         self.candidate_reranker_hidden_dim = int(candidate_reranker_hidden_dim)
         self.candidate_rerank_context_channels = int(candidate_rerank_context_channels)
+        self.candidate_rerank_selection = bool(candidate_rerank_selection)
+        self.candidate_rerank_selection_max_alpha = float(candidate_rerank_selection_max_alpha)
+        self.candidate_rerank_selection_start_step = max(0, int(candidate_rerank_selection_start_step))
+        self.candidate_rerank_selection_ramp_steps = max(0, int(candidate_rerank_selection_ramp_steps))
         self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
@@ -255,6 +272,10 @@ class PatchInpainting(nn.Module):
             raise ValueError("candidate_reranker_hidden_dim must be positive.")
         if self.candidate_rerank_context_channels <= 0:
             raise ValueError("candidate_rerank_context_channels must be positive.")
+        if self.candidate_rerank_selection_max_alpha < 0:
+            raise ValueError("candidate_rerank_selection_max_alpha must be non-negative.")
+        if self.candidate_rerank_selection and not self.candidate_reranker:
+            raise ValueError("candidate_rerank_selection requires candidate_reranker=True.")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -525,6 +546,21 @@ class PatchInpainting(nn.Module):
         else:
             self.multihead_attention.attention_gumbel_hard = True
 
+    def _candidate_rerank_selection_alpha(self) -> float:
+        if (not self.candidate_reranker) or (not self.candidate_rerank_selection):
+            return 0.0
+        if self.candidate_rerank_selection_max_alpha <= 0:
+            return 0.0
+        if self.current_training_step < self.candidate_rerank_selection_start_step:
+            return 0.0
+        if self.candidate_rerank_selection_ramp_steps <= 0:
+            return self.candidate_rerank_selection_max_alpha
+        progress = (
+            self.current_training_step - self.candidate_rerank_selection_start_step
+        ) / max(self.candidate_rerank_selection_ramp_steps, 1)
+        progress = max(0.0, min(float(progress), 1.0))
+        return self.candidate_rerank_selection_max_alpha * progress
+
     def _apply_branch_dropout(self, branch: torch.Tensor, drop_prob: float) -> torch.Tensor:
         if (not self.training) or drop_prob <= 0:
             return branch
@@ -746,6 +782,7 @@ class PatchInpainting(nn.Module):
         rerank_aux = None
         shortlist_k = self.multihead_attention.attention_top_k
         if self.candidate_reranker and shortlist_k is not None:
+            selection_alpha = self._candidate_rerank_selection_alpha()
             rerank_aux = {
                 "candidate_indices": torch.full(
                     (batch_size, num_patches, shortlist_k),
@@ -768,6 +805,7 @@ class PatchInpainting(nn.Module):
                     dtype=torch.bool,
                     device=query_tokens_full.device,
                 ),
+                "candidate_selection_alpha": query_tokens_full.new_tensor(selection_alpha),
             }
 
         for batch_idx in range(batch_size):
@@ -792,8 +830,10 @@ class PatchInpainting(nn.Module):
                     )
                     query_tokens_flat = query_tokens.squeeze(0)
                     key_tokens_flat = key_tokens.squeeze(0)
+                    value_tokens_flat = value_tokens.squeeze(0)
                     query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
                     candidate_key_tokens = key_tokens_flat[candidate_local_indices]
+                    candidate_value_tokens = value_tokens_flat[candidate_local_indices]
                     if query_context_tokens_full is None or key_context_tokens_full is None:
                         raise ValueError("candidate_reranker requires query/key context tokens.")
                     query_context_tokens = query_context_tokens_full[batch_idx, query_indices]
@@ -815,14 +855,23 @@ class PatchInpainting(nn.Module):
                     )
                     rerank_delta = self.candidate_reranker_head(rerank_features).squeeze(-1)
                     rerank_logits = base_candidate_logits + rerank_delta
-                    mixed_queries, masked_attention = self.multihead_attention(
-                        query_tokens,
-                        key_tokens,
-                        value_tokens,
+                    selection_logits = base_candidate_logits + (selection_alpha * rerank_delta)
+                    selection_attn, selection_probs = self.multihead_attention.attention_from_logits(
+                        selection_logits,
+                        value_dtype=value_tokens.dtype,
                         direct_patch_mixing=True,
                     )
-                    mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
-                    masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
+                    mixed_queries = torch.einsum(
+                        "qk,qkd->qd",
+                        selection_attn,
+                        candidate_value_tokens,
+                    ).to(dtype=mixed.dtype)
+                    masked_attention = replacement_rows.new_zeros((query_indices.numel(), key_indices.numel()))
+                    masked_attention.scatter_(
+                        1,
+                        candidate_local_indices,
+                        selection_probs.to(dtype=masked_attention.dtype),
+                    )
                     candidate_absolute_indices = key_indices[candidate_local_indices]
                     replacement_rows[:, key_indices] = masked_attention
                     rerank_aux["candidate_indices"][batch_idx, query_indices, :candidate_count] = candidate_absolute_indices
