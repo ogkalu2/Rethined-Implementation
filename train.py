@@ -285,16 +285,21 @@ def format_train_metric_snapshot(metrics):
         f"train g={metrics['generator_total']:.4f}, "
         f"d={metrics['discriminator_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
-        f"a1={metrics['attention_top1']:.3f}, "
         f"ff={metrics['frequency']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
     if "refined_query_patch_l1" in metrics:
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
+    if "retrieval_recall1" in metrics:
+        summary += f", r1={metrics['retrieval_recall1']:.3f}"
+    if "retrieval_recall8" in metrics:
+        summary += f", r8={metrics['retrieval_recall8']:.3f}"
     if "retrieval_recall32" in metrics:
         summary += f", r32={metrics['retrieval_recall32']:.3f}"
     if "retrieval_coord_error" in metrics:
         summary += f", coord={metrics['retrieval_coord_error']:.3f}"
+    if "boundary_identity_acc" in metrics:
+        summary += f", bia={metrics['boundary_identity_acc']:.3f}"
     return summary
 
 
@@ -778,8 +783,9 @@ def train(cfg, args):
                     d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
                     qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
-                    a1=f"{metrics['attention_top1']:.3f}",
+                    r8=(f"{metrics['retrieval_recall8']:.3f}" if "retrieval_recall8" in metrics else "n/a"),
                     r32=(f"{metrics['retrieval_recall32']:.3f}" if "retrieval_recall32" in metrics else "n/a"),
+                    coord=(f"{metrics['retrieval_coord_error']:.3f}" if "retrieval_coord_error" in metrics else "n/a"),
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,
                 )

@@ -27,6 +27,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_warmup_top_k: int | None = None,
         attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
+        matching_hidden_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
@@ -71,6 +72,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
+        self.matching_hidden_dim = None if matching_hidden_dim is None else int(matching_hidden_dim)
+        if self.matching_hidden_dim is not None and self.matching_hidden_dim <= 0:
+            self.matching_hidden_dim = None
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
@@ -190,21 +194,24 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 self.shared_query_key_descriptor_head = self._build_matching_descriptor_head(
                     self.query_matching_input_dim,
                     self.patch_token_dim,
-                    hidden_dim=max(self.matching_input_dim, self.patch_token_dim),
+                    hidden_dim=self.matching_hidden_dim,
                 )
             else:
                 self.query_descriptor_head = self._build_matching_descriptor_head(
                     self.query_matching_input_dim,
                     self.patch_token_dim,
+                    hidden_dim=self.matching_hidden_dim,
                 )
                 self.key_descriptor_head = self._build_matching_descriptor_head(
                     self.key_matching_input_dim,
                     self.patch_token_dim,
+                    hidden_dim=self.matching_hidden_dim,
                 )
         elif self.matching_descriptor_dim is not None:
             self.matching_descriptor_head = self._build_matching_descriptor_head(
                 self.matching_input_dim,
                 self.matching_descriptor_dim,
+                hidden_dim=self.matching_hidden_dim,
             )
         if self.query_image_context_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)

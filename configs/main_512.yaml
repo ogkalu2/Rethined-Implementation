@@ -18,6 +18,7 @@ model:
     attention_warmup_top_k: null
     attention_gumbel_hard_start_step: 9000
     matching_descriptor_dim: 256
+    matching_hidden_dim: 384
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
     query_image_context_matching: false
