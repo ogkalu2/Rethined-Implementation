@@ -688,10 +688,13 @@ def train(cfg, args):
 
             scaler.scale(g_loss / grad_accum).backward()
 
-            attn_metrics = model.generator.summarize_attention(
-                attn_map.detach(),
-                model.generator.flatten_query_mask(mask).detach(),
-            )
+            if attention_aux is not None and "attention_summary" in attention_aux:
+                attn_metrics = attention_aux["attention_summary"]
+            else:
+                attn_metrics = model.generator.summarize_attention(
+                    attn_map.detach(),
+                    model.generator.flatten_query_mask(mask).detach(),
+                )
 
             for key, value in g_metrics.items():
                 metric_sums[key] += value

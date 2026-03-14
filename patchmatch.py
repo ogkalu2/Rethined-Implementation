@@ -980,14 +980,21 @@ class PatchInpainting(nn.Module):
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
+        return_dense_attention: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
         batch_size, num_patches, _ = query_tokens_full.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
-        eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
-        dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        dense_attn = None
+        if return_dense_attention:
+            eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
+            dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
         valid_keys = key_valid_flat > 0.5
         rerank_aux = None
+        attention_top1_sum = 0.0
+        attention_top4_sum = 0.0
+        attention_entropy_sum = 0.0
+        attention_query_count = 0
         shortlist_k = self.multihead_attention.attention_top_k
         if self.candidate_reranker and shortlist_k is not None:
             selection_alpha = self._candidate_rerank_selection_alpha()
@@ -1023,7 +1030,9 @@ class PatchInpainting(nn.Module):
                 continue
 
             key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
-            replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
+            replacement_rows = None
+            if return_dense_attention:
+                replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
             if key_indices.numel() > 0:
                 batch_query_tokens_full = query_tokens_full[batch_idx, query_indices]
                 batch_key_tokens_full = key_tokens_full[batch_idx, key_indices]
@@ -1152,20 +1161,32 @@ class PatchInpainting(nn.Module):
                             value_dtype=value_tokens_flat.dtype,
                             direct_patch_mixing=True,
                         )
+                        probs_for_metrics = selection_probs.float()
+                        attention_top1_sum += probs_for_metrics.max(dim=-1).values.sum().item()
+                        top4_k = min(4, probs_for_metrics.shape[-1])
+                        attention_top4_sum += probs_for_metrics.topk(k=top4_k, dim=-1).values.sum(dim=-1).sum().item()
+                        attention_entropy_sum += (
+                            -(probs_for_metrics.clamp_min(1e-8) * probs_for_metrics.clamp_min(1e-8).log())
+                            .sum(dim=-1)
+                            .sum()
+                            .item()
+                        )
+                        attention_query_count += probs_for_metrics.shape[0]
                         mixed_queries = torch.einsum(
                             "qk,qkd->qd",
                             selection_attn,
                             candidate_value_tokens,
                         ).to(dtype=mixed.dtype)
-                        group_rows = replacement_rows[group_query_mask]
-                        masked_attention = group_rows.new_zeros((group_query_indices.numel(), group_key_indices.numel()))
-                        masked_attention.scatter_(
-                            1,
-                            candidate_local_indices,
-                            selection_probs.to(dtype=masked_attention.dtype),
-                        )
-                        group_rows[:, group_key_indices] = masked_attention
-                        replacement_rows[group_query_mask] = group_rows
+                        if return_dense_attention and replacement_rows is not None:
+                            group_rows = replacement_rows[group_query_mask]
+                            masked_attention = group_rows.new_zeros((group_query_indices.numel(), group_key_indices.numel()))
+                            masked_attention.scatter_(
+                                1,
+                                candidate_local_indices,
+                                selection_probs.to(dtype=masked_attention.dtype),
+                            )
+                            group_rows[:, group_key_indices] = masked_attention
+                            replacement_rows[group_query_mask] = group_rows
                         candidate_absolute_indices = group_key_indices[candidate_local_indices]
                         rerank_aux["candidate_indices"][batch_idx, group_query_indices, :candidate_count] = (
                             candidate_absolute_indices
@@ -1188,16 +1209,41 @@ class PatchInpainting(nn.Module):
                             direct_patch_mixing=True,
                         )
                         mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
-                        masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
-                        group_rows = replacement_rows[group_query_mask]
-                        group_rows[:, group_key_indices] = masked_attention
-                        replacement_rows[group_query_mask] = group_rows
+                        target_dtype = patch_values.dtype if replacement_rows is None else replacement_rows.dtype
+                        masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=target_dtype)
+                        probs_for_metrics = masked_attention.float()
+                        attention_top1_sum += probs_for_metrics.max(dim=-1).values.sum().item()
+                        top4_k = min(4, probs_for_metrics.shape[-1])
+                        attention_top4_sum += probs_for_metrics.topk(k=top4_k, dim=-1).values.sum(dim=-1).sum().item()
+                        attention_entropy_sum += (
+                            -(probs_for_metrics.clamp_min(1e-8) * probs_for_metrics.clamp_min(1e-8).log())
+                            .sum(dim=-1)
+                            .sum()
+                            .item()
+                        )
+                        attention_query_count += probs_for_metrics.shape[0]
+                        if return_dense_attention and replacement_rows is not None:
+                            group_rows = replacement_rows[group_query_mask]
+                            group_rows[:, group_key_indices] = masked_attention
+                            replacement_rows[group_query_mask] = group_rows
                     mixed_queries_groups.append((group_query_indices, mixed_queries))
 
                 for group_query_indices, group_mixed_queries in mixed_queries_groups:
                     mixed[batch_idx].index_copy_(0, group_query_indices, group_mixed_queries)
 
-            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
+            if return_dense_attention and dense_attn is not None and replacement_rows is not None:
+                dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
+
+        if not return_dense_attention:
+            attention_summary = {
+                "attention_top1": attention_top1_sum / max(attention_query_count, 1),
+                "attention_top4": attention_top4_sum / max(attention_query_count, 1),
+                "attention_entropy": attention_entropy_sum / max(attention_query_count, 1),
+                "attention_masked_ratio": masked_queries.float().mean().item(),
+            }
+            if rerank_aux is None:
+                rerank_aux = {}
+            rerank_aux["attention_summary"] = attention_summary
 
         return mixed, dense_attn, rerank_aux
 
@@ -1461,6 +1507,7 @@ class PatchInpainting(nn.Module):
                 query_mask_flat,
                 key_valid_flat,
                 default_tokens=default_patch_values,
+                return_dense_attention=not return_aux,
             )
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(
