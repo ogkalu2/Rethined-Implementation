@@ -771,15 +771,32 @@ class PatchInpainting(nn.Module):
         self,
         feature_map: torch.Tensor,
         coords: torch.Tensor,
+        *,
+        mode: str = "bilinear",
     ) -> torch.Tensor:
         grid = coords.permute(0, 2, 3, 1).contiguous()
         return F.grid_sample(
             feature_map,
             grid,
-            mode="bilinear",
+            mode=mode,
             padding_mode="zeros",
             align_corners=True,
         )
+
+    def _sample_transport_source_values(
+        self,
+        source_patch_map: torch.Tensor,
+        coords: torch.Tensor,
+        sampled_validity: torch.Tensor,
+    ) -> torch.Tensor:
+        bilinear_values = self._sample_transport_map(source_patch_map, coords, mode="bilinear")
+        nearest_values = self._sample_transport_map(source_patch_map, coords, mode="nearest")
+        normalized_bilinear = torch.where(
+            sampled_validity > 1e-3,
+            bilinear_values / sampled_validity.clamp_min(1e-3).to(dtype=bilinear_values.dtype),
+            torch.zeros_like(bilinear_values),
+        )
+        return normalized_bilinear + (nearest_values - normalized_bilinear).detach()
 
     def _sample_transport_self_mask(
         self,
@@ -880,16 +897,17 @@ class PatchInpainting(nn.Module):
         sampled_validity = transport_state["sampled_validity"]
         confidence = transport_state["confidence"]
 
-        sampled_values = self._sample_transport_map(source_patch_map, coords)
         sampled_validity = sampled_validity.clamp(0.0, 1.0)
-        normalized_values = torch.where(
-            sampled_validity > 1e-3,
-            sampled_values / sampled_validity.clamp_min(1e-3).to(dtype=sampled_values.dtype),
-            torch.zeros_like(sampled_values),
-        )
+        hard_validity = self._sample_transport_map(
+            key_valid_flat.view(coords.shape[0], 1, token_hw[0], token_hw[1]).to(dtype=coords.dtype),
+            coords,
+            mode="nearest",
+        ).clamp(0.0, 1.0)
+        normalized_values = self._sample_transport_source_values(source_patch_map, coords, sampled_validity)
         sampled_values_flat = normalized_values.flatten(start_dim=2).transpose(1, 2)
         sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
-        fallback_mask = sampled_validity_flat < self.transport_fallback_validity_threshold
+        hard_validity_flat = hard_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
+        fallback_mask = hard_validity_flat < self.transport_fallback_validity_threshold
         if default_tokens is not None:
             valid_copy = (~fallback_mask).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
@@ -902,6 +920,7 @@ class PatchInpainting(nn.Module):
             "transport_copy_values": normalized_values.flatten(start_dim=2).transpose(1, 2),
             "transport_values": sampled_values_flat,
             "transport_validity": sampled_validity_flat,
+            "transport_hard_validity": hard_validity_flat,
             "transport_fallback_mask": fallback_mask,
         }
         if confidence is not None:
@@ -917,7 +936,7 @@ class PatchInpainting(nn.Module):
             )
             cycle_back_coords = self._sample_transport_map(backward_state["coords"], coords)
             aux["transport_cycle_back_coords"] = cycle_back_coords.flatten(start_dim=2).transpose(1, 2)
-        return sampled_values, aux
+        return normalized_values, aux
 
     def _build_transport_attention(
         self,
