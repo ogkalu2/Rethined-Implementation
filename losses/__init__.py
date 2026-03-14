@@ -321,6 +321,7 @@ class InpaintingLoss(nn.Module):
         metrics = {
             "candidate_rerank": 0.0,
             "candidate_rerank_accuracy": 0.0,
+            "candidate_rerank_base_accuracy": 0.0,
             "candidate_rerank_supervised_ratio": 0.0,
         }
         if self.candidate_rerank_weight <= 0 or attention_aux is None:
@@ -328,6 +329,7 @@ class InpaintingLoss(nn.Module):
 
         query_mask_flat = attention_aux.get("query_mask_flat")
         candidate_indices = attention_aux.get("candidate_indices")
+        candidate_base_logits = attention_aux.get("candidate_base_logits")
         candidate_logits = attention_aux.get("candidate_logits")
         candidate_valid_mask = attention_aux.get("candidate_valid_mask")
         kernel_size = int(attention_aux.get("kernel_size", 0))
@@ -336,6 +338,7 @@ class InpaintingLoss(nn.Module):
         if (
             query_mask_flat is None
             or candidate_indices is None
+            or candidate_base_logits is None
             or candidate_logits is None
             or candidate_valid_mask is None
             or kernel_size <= 0
@@ -355,6 +358,7 @@ class InpaintingLoss(nn.Module):
         supervised_queries = 0
         total_masked_queries = 0
         correct_matches = 0
+        base_correct_matches = 0
 
         for batch_idx in range(teacher_patch_tokens.shape[0]):
             query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
@@ -392,13 +396,17 @@ class InpaintingLoss(nn.Module):
                 continue
 
             logits = batch_candidate_logits[valid_teacher] / self.candidate_rerank_temperature
+            base_logits = candidate_base_logits[batch_idx, query_indices][valid_teacher] / self.candidate_rerank_temperature
             valid_mask = batch_candidate_valid[valid_teacher]
             logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
+            base_logits = base_logits.masked_fill(~valid_mask, torch.finfo(base_logits.dtype).min)
             teacher_labels = teacher_scores[valid_teacher].argmax(dim=-1)
             loss_terms.append(F.cross_entropy(logits, teacher_labels))
             predictions = logits.argmax(dim=-1)
+            base_predictions = base_logits.argmax(dim=-1)
             supervised_queries += int(valid_teacher.sum().item())
             correct_matches += int((predictions == teacher_labels).sum().item())
+            base_correct_matches += int((base_predictions == teacher_labels).sum().item())
 
         if not loss_terms:
             return zero, metrics
@@ -406,6 +414,7 @@ class InpaintingLoss(nn.Module):
         loss = torch.stack(loss_terms).mean()
         metrics["candidate_rerank"] = loss.item()
         metrics["candidate_rerank_accuracy"] = correct_matches / max(supervised_queries, 1)
+        metrics["candidate_rerank_base_accuracy"] = base_correct_matches / max(supervised_queries, 1)
         metrics["candidate_rerank_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
         return loss, metrics
 
@@ -473,6 +482,7 @@ class InpaintingLoss(nn.Module):
             "patch_teacher_supervised_ratio": patch_teacher_metrics["patch_teacher_supervised_ratio"],
             "candidate_rerank": candidate_rerank_metrics["candidate_rerank"],
             "candidate_rerank_accuracy": candidate_rerank_metrics["candidate_rerank_accuracy"],
+            "candidate_rerank_base_accuracy": candidate_rerank_metrics["candidate_rerank_base_accuracy"],
             "candidate_rerank_supervised_ratio": candidate_rerank_metrics["candidate_rerank_supervised_ratio"],
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),

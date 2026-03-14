@@ -192,6 +192,7 @@ class PatchInpainting(nn.Module):
         coarse_rgb_branch_dropout: float = 0.0,
         candidate_reranker: bool = False,
         candidate_reranker_hidden_dim: int = 128,
+        candidate_rerank_context_channels: int = 32,
         query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
         shared_query_key_descriptor: bool = False,
@@ -239,6 +240,7 @@ class PatchInpainting(nn.Module):
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
         self.candidate_reranker = bool(candidate_reranker)
         self.candidate_reranker_hidden_dim = int(candidate_reranker_hidden_dim)
+        self.candidate_rerank_context_channels = int(candidate_rerank_context_channels)
         self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
@@ -251,6 +253,8 @@ class PatchInpainting(nn.Module):
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
         if self.candidate_reranker_hidden_dim <= 0:
             raise ValueError("candidate_reranker_hidden_dim must be positive.")
+        if self.candidate_rerank_context_channels <= 0:
+            raise ValueError("candidate_rerank_context_channels must be positive.")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -337,6 +341,8 @@ class PatchInpainting(nn.Module):
         self.key_feature_scale = None
         self.shared_query_key_descriptor_head = None
         self.candidate_reranker_head = None
+        self.candidate_query_context_encoder = None
+        self.candidate_key_context_encoder = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -403,7 +409,15 @@ class PatchInpainting(nn.Module):
                 raise ValueError("candidate_reranker requires attention_top_k to be set.")
             if not self.attention_masking:
                 raise ValueError("candidate_reranker currently requires attention_masking=True.")
-            rerank_input_dim = self.patch_token_dim * 4
+            self.candidate_query_context_encoder = self._build_context_encoder(
+                7,
+                self.candidate_rerank_context_channels,
+            )
+            self.candidate_key_context_encoder = self._build_context_encoder(
+                3,
+                self.candidate_rerank_context_channels,
+            )
+            rerank_input_dim = (self.patch_token_dim * 4) + (self.candidate_rerank_context_channels * 4)
             self.candidate_reranker_head = nn.Sequential(
                 nn.Linear(rerank_input_dim, self.candidate_reranker_hidden_dim, bias=False),
                 nn.GELU(),
@@ -716,6 +730,8 @@ class PatchInpainting(nn.Module):
         self,
         query_tokens_full: torch.Tensor,
         key_tokens_full: torch.Tensor,
+        query_context_tokens_full: torch.Tensor | None,
+        key_context_tokens_full: torch.Tensor | None,
         patch_values: torch.Tensor,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
@@ -736,6 +752,11 @@ class PatchInpainting(nn.Module):
                     -1,
                     dtype=torch.long,
                     device=patch_values.device,
+                ),
+                "candidate_base_logits": torch.zeros(
+                    (batch_size, num_patches, shortlist_k),
+                    dtype=query_tokens_full.dtype,
+                    device=query_tokens_full.device,
                 ),
                 "candidate_logits": torch.zeros(
                     (batch_size, num_patches, shortlist_k),
@@ -769,48 +790,43 @@ class PatchInpainting(nn.Module):
                         k=candidate_count,
                         dim=-1,
                     )
-                    key_tokens_flat = key_tokens.squeeze(0)
-                    value_tokens_flat = value_tokens.squeeze(0)
-                    candidate_key_tokens = key_tokens_flat[candidate_local_indices]
-                    candidate_value_tokens = value_tokens_flat[candidate_local_indices]
                     query_tokens_flat = query_tokens.squeeze(0)
+                    key_tokens_flat = key_tokens.squeeze(0)
                     query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
+                    candidate_key_tokens = key_tokens_flat[candidate_local_indices]
+                    if query_context_tokens_full is None or key_context_tokens_full is None:
+                        raise ValueError("candidate_reranker requires query/key context tokens.")
+                    query_context_tokens = query_context_tokens_full[batch_idx, query_indices]
+                    key_context_tokens = key_context_tokens_full[batch_idx, key_indices]
+                    query_context_expanded = query_context_tokens.unsqueeze(1).expand(-1, candidate_count, -1)
+                    candidate_key_context_tokens = key_context_tokens[candidate_local_indices]
                     rerank_features = torch.cat(
                         [
                             query_expanded,
                             candidate_key_tokens,
                             query_expanded - candidate_key_tokens,
                             query_expanded * candidate_key_tokens,
+                            query_context_expanded,
+                            candidate_key_context_tokens,
+                            query_context_expanded - candidate_key_context_tokens,
+                            query_context_expanded * candidate_key_context_tokens,
                         ],
                         dim=-1,
                     )
                     rerank_delta = self.candidate_reranker_head(rerank_features).squeeze(-1)
                     rerank_logits = base_candidate_logits + rerank_delta
-                    rerank_logits_4d = rerank_logits.unsqueeze(0).unsqueeze(0)
-                    masked_attention = self.multihead_attention._normalize_attention_logits(rerank_logits_4d)
-                    masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
-                    selected_attention = masked_attention
-                    needs_straight_through_hardening = (
-                        self.training
-                        and (
-                            self.multihead_attention.attention_selection == "softmax"
-                            or (
-                                self.multihead_attention.attention_selection == "gumbel"
-                                and not self.multihead_attention.attention_gumbel_hard
-                            )
-                        )
+                    mixed_queries, masked_attention = self.multihead_attention(
+                        query_tokens,
+                        key_tokens,
+                        value_tokens,
+                        direct_patch_mixing=True,
                     )
-                    if needs_straight_through_hardening:
-                        hard_attention = self.multihead_attention._hard_attention_from_logits(rerank_logits_4d)
-                        hard_attention = hard_attention.squeeze(0).squeeze(0).to(dtype=masked_attention.dtype)
-                        selected_attention = hard_attention - masked_attention.detach() + masked_attention
-                    mixed_queries = (
-                        selected_attention.unsqueeze(-1) * candidate_value_tokens.to(dtype=selected_attention.dtype)
-                    ).sum(dim=1)
-                    mixed_queries = mixed_queries.to(dtype=mixed.dtype)
+                    mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
+                    masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
                     candidate_absolute_indices = key_indices[candidate_local_indices]
-                    replacement_rows.scatter_(1, candidate_absolute_indices, masked_attention)
+                    replacement_rows[:, key_indices] = masked_attention
                     rerank_aux["candidate_indices"][batch_idx, query_indices, :candidate_count] = candidate_absolute_indices
+                    rerank_aux["candidate_base_logits"][batch_idx, query_indices, :candidate_count] = base_candidate_logits
                     rerank_aux["candidate_logits"][batch_idx, query_indices, :candidate_count] = rerank_logits
                     rerank_aux["candidate_valid_mask"][batch_idx, query_indices, :candidate_count] = True
                 else:
@@ -934,6 +950,19 @@ class PatchInpainting(nn.Module):
 
         query_matching_tokens = None
         key_matching_tokens = None
+        candidate_query_context_tokens = None
+        candidate_key_context_tokens = None
+        if self.candidate_reranker:
+            candidate_query_context_map = self._pool_to_token_grid(
+                self.candidate_query_context_encoder(torch.cat([image, coarse_composite, mask], dim=1)),
+                patch_map.shape[-2:],
+            )
+            candidate_key_context_map = self._pool_to_token_grid(
+                self.candidate_key_context_encoder(known_image),
+                patch_map.shape[-2:],
+            )
+            candidate_query_context_tokens = candidate_query_context_map.flatten(start_dim=2).transpose(1, 2)
+            candidate_key_context_tokens = candidate_key_context_map.flatten(start_dim=2).transpose(1, 2)
         if self.separate_query_key_matching:
             visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
             query_context_map = self._pool_to_token_grid(
@@ -1049,6 +1078,8 @@ class PatchInpainting(nn.Module):
             mixed_patches_flat, masked_attention, rerank_aux = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
+                candidate_query_context_tokens,
+                candidate_key_context_tokens,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
