@@ -508,7 +508,6 @@ class InpaintingLoss(nn.Module):
         metrics = {
             "transport_validity": 0.0,
             "transport_valid_ratio": 0.0,
-            "transport_fallback_ratio": 0.0,
         }
         if attention_aux is None:
             return zero, metrics
@@ -517,7 +516,6 @@ class InpaintingLoss(nn.Module):
 
         query_mask_flat = attention_aux.get("query_mask_flat")
         transport_validity = attention_aux.get("transport_validity")
-        transport_fallback_mask = attention_aux.get("transport_fallback_mask")
         if query_mask_flat is None or transport_validity is None:
             return zero, metrics
 
@@ -527,8 +525,6 @@ class InpaintingLoss(nn.Module):
 
         valid_ratio = transport_validity[masked_queries].float().mean()
         metrics["transport_valid_ratio"] = valid_ratio.item()
-        if transport_fallback_mask is not None:
-            metrics["transport_fallback_ratio"] = transport_fallback_mask[masked_queries].float().mean().item()
         if self.transport_validity_weight <= 0:
             return zero, metrics
 
@@ -881,7 +877,6 @@ class InpaintingLoss(nn.Module):
             "transport_patch": transport_patch_metrics["transport_patch"],
             "transport_validity": transport_validity_metrics["transport_validity"],
             "transport_valid_ratio": transport_validity_metrics["transport_valid_ratio"],
-            "transport_fallback_ratio": transport_validity_metrics["transport_fallback_ratio"],
             "transport_self_patch": transport_self_patch_metrics["transport_self_patch"],
             "transport_self_validity": transport_self_validity_metrics["transport_self_validity"],
             "transport_self_valid_ratio": transport_self_validity_metrics["transport_self_valid_ratio"],

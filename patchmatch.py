@@ -199,7 +199,6 @@ class PatchInpainting(nn.Module):
         transport_offset_scale: float = 1.0,
         transport_refine_scale: float = 0.25,
         transport_self_supervision_ratio: float = 0.0,
-        transport_fallback_validity_threshold: float = 0.1,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
@@ -251,7 +250,6 @@ class PatchInpainting(nn.Module):
         self.transport_offset_scale = float(transport_offset_scale)
         self.transport_refine_scale = float(transport_refine_scale)
         self.transport_self_supervision_ratio = float(transport_self_supervision_ratio)
-        self.transport_fallback_validity_threshold = float(transport_fallback_validity_threshold)
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
@@ -278,8 +276,6 @@ class PatchInpainting(nn.Module):
             raise ValueError("transport_refine_scale must be non-negative.")
         if not 0.0 <= self.transport_self_supervision_ratio <= 1.0:
             raise ValueError("transport_self_supervision_ratio must be in [0, 1].")
-        if not 0.0 <= self.transport_fallback_validity_threshold <= 1.0:
-            raise ValueError("transport_fallback_validity_threshold must be in [0, 1].")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -788,7 +784,7 @@ class PatchInpainting(nn.Module):
         source_patch_map: torch.Tensor,
         coords: torch.Tensor,
         sampled_validity: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         bilinear_values = self._sample_transport_map(source_patch_map, coords, mode="bilinear")
         nearest_values = self._sample_transport_map(source_patch_map, coords, mode="nearest")
         normalized_bilinear = torch.where(
@@ -796,7 +792,8 @@ class PatchInpainting(nn.Module):
             bilinear_values / sampled_validity.clamp_min(1e-3).to(dtype=bilinear_values.dtype),
             torch.zeros_like(bilinear_values),
         )
-        return normalized_bilinear + (nearest_values - normalized_bilinear).detach()
+        sharp_values = normalized_bilinear + (nearest_values - normalized_bilinear).detach()
+        return sharp_values, normalized_bilinear
 
     def _sample_transport_self_mask(
         self,
@@ -889,7 +886,6 @@ class PatchInpainting(nn.Module):
         token_hw: tuple[int, int],
         transport_state: dict[str, torch.Tensor | None],
         *,
-        default_tokens: torch.Tensor | None,
         return_diagnostics: bool,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         coords = transport_state["coords"]
@@ -903,25 +899,27 @@ class PatchInpainting(nn.Module):
             coords,
             mode="nearest",
         ).clamp(0.0, 1.0)
-        normalized_values = self._sample_transport_source_values(source_patch_map, coords, sampled_validity)
-        sampled_values_flat = normalized_values.flatten(start_dim=2).transpose(1, 2)
+        sharp_values, normalized_bilinear_values = self._sample_transport_source_values(
+            source_patch_map,
+            coords,
+            sampled_validity,
+        )
+        copy_values = torch.where(
+            hard_validity > 0.5,
+            sharp_values,
+            normalized_bilinear_values,
+        )
+        sampled_values_flat = copy_values.flatten(start_dim=2).transpose(1, 2)
         sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
-        hard_validity_flat = hard_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
-        fallback_mask = sampled_validity_flat < self.transport_fallback_validity_threshold
-        if default_tokens is not None:
-            valid_copy = (~fallback_mask).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
-            sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
         aux = {
             "copy_mode": self.copy_mode,
             "query_mask_flat": query_mask_flat,
             "key_valid_flat": key_valid_flat,
             "transport_coords": coords.flatten(start_dim=2).transpose(1, 2),
             "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
-            "transport_copy_values": normalized_values.flatten(start_dim=2).transpose(1, 2),
+            "transport_copy_values": copy_values.flatten(start_dim=2).transpose(1, 2),
             "transport_values": sampled_values_flat,
             "transport_validity": sampled_validity_flat,
-            "transport_hard_validity": hard_validity_flat,
-            "transport_fallback_mask": fallback_mask,
         }
         if confidence is not None:
             aux["transport_confidence"] = confidence.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
@@ -936,7 +934,7 @@ class PatchInpainting(nn.Module):
             )
             cycle_back_coords = self._sample_transport_map(backward_state["coords"], coords)
             aux["transport_cycle_back_coords"] = cycle_back_coords.flatten(start_dim=2).transpose(1, 2)
-        return normalized_values, aux
+        return copy_values, aux
 
     def _build_transport_attention(
         self,
@@ -1014,7 +1012,6 @@ class PatchInpainting(nn.Module):
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         token_hw: tuple[int, int],
-        default_tokens: torch.Tensor | None = None,
         return_diagnostics: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         batch_size = query_tokens_full.shape[0]
@@ -1034,18 +1031,13 @@ class PatchInpainting(nn.Module):
             key_valid_flat,
             token_hw,
             transport_state,
-            default_tokens=default_tokens,
             return_diagnostics=return_diagnostics,
         )
         sampled_values_flat = aux["transport_values"]
         sampled_validity_flat = aux["transport_validity"]
         coords_flat = aux["transport_coords"]
 
-        mixed = source_patch_map.flatten(start_dim=2).transpose(1, 2)
-        if default_tokens is not None:
-            mixed = default_tokens.clone()
-        else:
-            mixed = mixed.clone()
+        mixed = source_patch_map.flatten(start_dim=2).transpose(1, 2).clone()
         for batch_idx in range(batch_size):
             query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
             if query_indices.numel() == 0:
@@ -1324,16 +1316,9 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
+        default_patch_values = None
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
-        elif self.copy_mode == "transport":
-            coarse_value_map, _ = self.extract_patches(
-                coarse_composite,
-                self.value_patch_size,
-                stride=self.kernel_size,
-                padding=self.value_patch_padding,
-            )
-            default_patch_values = coarse_value_map.flatten(start_dim=2).transpose(1, 2)
         if self.copy_mode == "transport":
             mixed_patches_flat, masked_attention, copy_aux = self.transport_patch_mix(
                 query_tokens,
@@ -1342,7 +1327,6 @@ class PatchInpainting(nn.Module):
                 query_mask_flat,
                 key_valid_flat,
                 patch_map.shape[-2:],
-                default_tokens=default_patch_values,
                 return_diagnostics=return_aux,
             )
         elif self.attention_masking:
@@ -1425,7 +1409,6 @@ class PatchInpainting(nn.Module):
                             transport_self_keys,
                             patch_map.shape[-2:],
                             self_transport_state,
-                            default_tokens=default_patch_values,
                             return_diagnostics=False,
                         )
                         aux["transport_self_aux"] = transport_self_aux
