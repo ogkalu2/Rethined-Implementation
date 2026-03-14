@@ -281,6 +281,13 @@ def format_train_metric_snapshot(metrics):
             f", pta={metrics['patch_teacher_accuracy']:.3f}"
             f", pts={metrics['patch_teacher_supervised_ratio']:.3f}"
         )
+    if "transport_patch" in metrics:
+        summary += (
+            f", tp={metrics['transport_patch']:.4f}"
+            f", tval={metrics['transport_validity']:.4f}"
+            f", tvr={metrics['transport_valid_ratio']:.3f}"
+            f", tsm={metrics['transport_offset_smoothness']:.4f}"
+        )
     return summary
 
 
@@ -728,6 +735,15 @@ def train(cfg, args):
                     metrics["patch_teacher_supervised_ratio"],
                     step,
                 )
+            if "transport_patch" in metrics:
+                writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
+                writer.add_scalar("loss/transport_validity", metrics["transport_validity"], step)
+                writer.add_scalar("transport/valid_ratio", metrics["transport_valid_ratio"], step)
+                writer.add_scalar(
+                    "loss/transport_offset_smoothness",
+                    metrics["transport_offset_smoothness"],
+                    step,
+                )
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -756,6 +772,9 @@ def train(cfg, args):
                     pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
                     pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
+                    tp=(f"{metrics['transport_patch']:.4f}" if "transport_patch" in metrics else "n/a"),
+                    tvr=(f"{metrics['transport_valid_ratio']:.3f}" if "transport_valid_ratio" in metrics else "n/a"),
+                    tsm=(f"{metrics['transport_offset_smoothness']:.4f}" if "transport_offset_smoothness" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,
