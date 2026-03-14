@@ -281,12 +281,11 @@ def format_train_metric_snapshot(metrics):
             f", pta={metrics['patch_teacher_accuracy']:.3f}"
             f", pts={metrics['patch_teacher_supervised_ratio']:.3f}"
         )
-    if "coarse_global_matcher" in metrics:
+    if "direct_retriever" in metrics:
         summary += (
-            f", cg={metrics['coarse_global_matcher']:.4f}"
-            f", cga={metrics['coarse_global_matcher_accuracy']:.3f}"
-            f", cgd={metrics['coarse_global_matcher_dustbin_ratio']:.3f}"
-            f", cgs={metrics['coarse_global_matcher_supervised_ratio']:.3f}"
+            f", ret={metrics['direct_retriever']:.4f}"
+            f", reta={metrics['direct_retriever_accuracy']:.3f}"
+            f", rets={metrics['direct_retriever_supervised_ratio']:.3f}"
         )
     if "candidate_rerank" in metrics:
         summary += (
@@ -742,21 +741,12 @@ def train(cfg, args):
                     metrics["patch_teacher_supervised_ratio"],
                     step,
                 )
-            if "coarse_global_matcher" in metrics:
-                writer.add_scalar("loss/coarse_global_matcher", metrics["coarse_global_matcher"], step)
+            if "direct_retriever" in metrics:
+                writer.add_scalar("loss/direct_retriever", metrics["direct_retriever"], step)
+                writer.add_scalar("direct_retriever/accuracy", metrics["direct_retriever_accuracy"], step)
                 writer.add_scalar(
-                    "coarse_global_matcher/accuracy",
-                    metrics["coarse_global_matcher_accuracy"],
-                    step,
-                )
-                writer.add_scalar(
-                    "coarse_global_matcher/dustbin_ratio",
-                    metrics["coarse_global_matcher_dustbin_ratio"],
-                    step,
-                )
-                writer.add_scalar(
-                    "coarse_global_matcher/supervised_ratio",
-                    metrics["coarse_global_matcher_supervised_ratio"],
+                    "direct_retriever/supervised_ratio",
+                    metrics["direct_retriever_supervised_ratio"],
                     step,
                 )
             if "candidate_rerank" in metrics:
@@ -805,10 +795,9 @@ def train(cfg, args):
                     pt=(f"{metrics['patch_teacher']:.4f}" if "patch_teacher" in metrics else "n/a"),
                     pta=(f"{metrics['patch_teacher_accuracy']:.3f}" if "patch_teacher_accuracy" in metrics else "n/a"),
                     pts=(f"{metrics['patch_teacher_supervised_ratio']:.3f}" if "patch_teacher_supervised_ratio" in metrics else "n/a"),
-                    cg=(f"{metrics['coarse_global_matcher']:.4f}" if "coarse_global_matcher" in metrics else "n/a"),
-                    cga=(f"{metrics['coarse_global_matcher_accuracy']:.3f}" if "coarse_global_matcher_accuracy" in metrics else "n/a"),
-                    cgd=(f"{metrics['coarse_global_matcher_dustbin_ratio']:.3f}" if "coarse_global_matcher_dustbin_ratio" in metrics else "n/a"),
-                    cgs=(f"{metrics['coarse_global_matcher_supervised_ratio']:.3f}" if "coarse_global_matcher_supervised_ratio" in metrics else "n/a"),
+                    ret=(f"{metrics['direct_retriever']:.4f}" if "direct_retriever" in metrics else "n/a"),
+                    reta=(f"{metrics['direct_retriever_accuracy']:.3f}" if "direct_retriever_accuracy" in metrics else "n/a"),
+                    rets=(f"{metrics['direct_retriever_supervised_ratio']:.3f}" if "direct_retriever_supervised_ratio" in metrics else "n/a"),
                     rr=(f"{metrics['candidate_rerank']:.4f}" if "candidate_rerank" in metrics else "n/a"),
                     rra=(f"{metrics['candidate_rerank_accuracy']:.3f}" if "candidate_rerank_accuracy" in metrics else "n/a"),
                     rrb=(f"{metrics['candidate_rerank_base_accuracy']:.3f}" if "candidate_rerank_base_accuracy" in metrics else "n/a"),

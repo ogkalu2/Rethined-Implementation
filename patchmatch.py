@@ -206,12 +206,6 @@ class PatchInpainting(nn.Module):
         candidate_context_retrieval_scale_init: float = 2.0,
         candidate_context_retrieval_start_step: int = 0,
         candidate_context_retrieval_ramp_steps: int = 0,
-        coarse_global_matcher: bool = False,
-        coarse_global_matcher_pool: int = 4,
-        coarse_global_matcher_top_k: int = 2,
-        coarse_global_matcher_window_radius: int = 0,
-        coarse_global_matcher_start_step: int = 0,
-        coarse_global_matcher_dustbin_init: float = 0.0,
         candidate_rerank_selection: bool = False,
         candidate_rerank_selection_max_alpha: float = 1.0,
         candidate_rerank_selection_start_step: int = 0,
@@ -268,12 +262,6 @@ class PatchInpainting(nn.Module):
         self.candidate_context_retrieval_scale_init = float(candidate_context_retrieval_scale_init)
         self.candidate_context_retrieval_start_step = max(0, int(candidate_context_retrieval_start_step))
         self.candidate_context_retrieval_ramp_steps = max(0, int(candidate_context_retrieval_ramp_steps))
-        self.coarse_global_matcher = bool(coarse_global_matcher)
-        self.coarse_global_matcher_pool = max(1, int(coarse_global_matcher_pool))
-        self.coarse_global_matcher_top_k = max(1, int(coarse_global_matcher_top_k))
-        self.coarse_global_matcher_window_radius = max(0, int(coarse_global_matcher_window_radius))
-        self.coarse_global_matcher_start_step = max(0, int(coarse_global_matcher_start_step))
-        self.coarse_global_matcher_dustbin_init = float(coarse_global_matcher_dustbin_init)
         self.candidate_rerank_selection = bool(candidate_rerank_selection)
         self.candidate_rerank_selection_max_alpha = float(candidate_rerank_selection_max_alpha)
         self.candidate_rerank_selection_start_step = max(0, int(candidate_rerank_selection_start_step))
@@ -294,8 +282,6 @@ class PatchInpainting(nn.Module):
             raise ValueError("candidate_rerank_context_channels must be positive.")
         if self.candidate_context_retrieval and not self.candidate_reranker:
             raise ValueError("candidate_context_retrieval requires candidate_reranker=True.")
-        if self.coarse_global_matcher and not self.candidate_context_retrieval:
-            raise ValueError("coarse_global_matcher requires candidate_context_retrieval=True.")
         if self.candidate_rerank_selection_max_alpha < 0:
             raise ValueError("candidate_rerank_selection_max_alpha must be non-negative.")
         if self.candidate_rerank_selection and not self.candidate_reranker:
@@ -336,9 +322,6 @@ class PatchInpainting(nn.Module):
             raise ValueError("value_patch_size - kernel_size must be even for centered overlap-add padding.")
         self.value_patch_padding = (self.value_patch_size - self.kernel_size) // 2
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
-        if self.token_grid_size % self.coarse_global_matcher_pool != 0:
-            raise ValueError("coarse_global_matcher_pool must divide the token grid size.")
-        self.coarse_global_grid_size = self.token_grid_size // self.coarse_global_matcher_pool
         self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
         self.matching_input_dim = 0
@@ -394,8 +377,6 @@ class PatchInpainting(nn.Module):
         self.candidate_query_retrieval_head = None
         self.candidate_key_retrieval_head = None
         self.candidate_context_retrieval_scale = None
-        self.coarse_global_dustbin_head = None
-        self.coarse_global_matcher_scale = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -484,14 +465,6 @@ class PatchInpainting(nn.Module):
                 self.candidate_context_retrieval_scale = nn.Parameter(
                     torch.tensor(self.candidate_context_retrieval_scale_init)
                 )
-            if self.coarse_global_matcher:
-                self.coarse_global_dustbin_head = nn.Linear(
-                    self.candidate_rerank_context_channels,
-                    1,
-                )
-                self.coarse_global_matcher_scale = nn.Parameter(torch.tensor(1.0))
-                nn.init.zeros_(self.coarse_global_dustbin_head.weight)
-                nn.init.constant_(self.coarse_global_dustbin_head.bias, self.coarse_global_matcher_dustbin_init)
             rerank_input_dim = (self.patch_token_dim * 4) + (self.candidate_rerank_context_channels * 4)
             self.candidate_reranker_head = nn.Sequential(
                 nn.Linear(rerank_input_dim, self.candidate_reranker_hidden_dim, bias=False),
@@ -657,114 +630,6 @@ class PatchInpainting(nn.Module):
             device=context_logits.device,
         )
         return context_logits * scale
-
-    def _tokens_to_feature_map(
-        self,
-        tokens: torch.Tensor,
-        *,
-        grid_size: int | None = None,
-    ) -> torch.Tensor:
-        grid_size = self.token_grid_size if grid_size is None else int(grid_size)
-        return tokens.transpose(1, 2).reshape(tokens.shape[0], tokens.shape[-1], grid_size, grid_size)
-
-    def _feature_map_to_tokens(self, feature_map: torch.Tensor) -> torch.Tensor:
-        return feature_map.flatten(start_dim=2).transpose(1, 2)
-
-    def _flat_mask_to_feature_map(
-        self,
-        flat_mask: torch.Tensor,
-        *,
-        grid_size: int | None = None,
-    ) -> torch.Tensor:
-        grid_size = self.token_grid_size if grid_size is None else int(grid_size)
-        return flat_mask.view(flat_mask.shape[0], 1, grid_size, grid_size)
-
-    def _coarse_global_matcher_active(self) -> bool:
-        if not self.coarse_global_matcher:
-            return False
-        return self.current_training_step >= self.coarse_global_matcher_start_step
-
-    def _compute_coarse_global_logits(
-        self,
-        query_tokens: torch.Tensor,
-        key_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.coarse_global_matcher_scale is None:
-            raise ValueError("coarse_global_matcher is enabled but matcher scale is missing.")
-        logits = torch.matmul(query_tokens, key_tokens.transpose(0, 1))
-        scale = self.coarse_global_matcher_scale.to(dtype=logits.dtype, device=logits.device)
-        return logits * scale
-
-    def _expand_coarse_indices(
-        self,
-        coarse_indices: torch.Tensor,
-        *,
-        grid_size: int,
-    ) -> torch.Tensor:
-        radius = self.coarse_global_matcher_window_radius
-        if radius <= 0 or coarse_indices.numel() == 0:
-            return coarse_indices
-        expanded: list[int] = []
-        for coarse_index in coarse_indices.tolist():
-            y = coarse_index // grid_size
-            x = coarse_index % grid_size
-            for dy in range(-radius, radius + 1):
-                for dx in range(-radius, radius + 1):
-                    yy = y + dy
-                    xx = x + dx
-                    if 0 <= yy < grid_size and 0 <= xx < grid_size:
-                        expanded.append(yy * grid_size + xx)
-        expanded_tensor = coarse_indices.new_tensor(expanded, dtype=torch.long)
-        return torch.unique(expanded_tensor, sorted=False)
-
-    def _build_coarse_global_matcher_state(
-        self,
-        query_retrieval_tokens: torch.Tensor,
-        key_retrieval_tokens: torch.Tensor,
-        query_mask_flat: torch.Tensor,
-        key_valid_flat: torch.Tensor,
-    ) -> dict[str, torch.Tensor] | None:
-        if not self.coarse_global_matcher:
-            return None
-        if self.coarse_global_dustbin_head is None:
-            raise ValueError("coarse_global_matcher is enabled but dustbin head is missing.")
-
-        pool = self.coarse_global_matcher_pool
-        query_map = self._tokens_to_feature_map(query_retrieval_tokens)
-        key_map = self._tokens_to_feature_map(key_retrieval_tokens)
-        coarse_query_map = F.avg_pool2d(query_map, kernel_size=pool, stride=pool)
-        coarse_key_map = F.avg_pool2d(key_map, kernel_size=pool, stride=pool)
-        coarse_query_tokens = F.normalize(self._feature_map_to_tokens(coarse_query_map), dim=-1, eps=1e-6)
-        coarse_key_tokens = F.normalize(self._feature_map_to_tokens(coarse_key_map), dim=-1, eps=1e-6)
-        coarse_query_mask = F.max_pool2d(
-            self._flat_mask_to_feature_map(query_mask_flat),
-            kernel_size=pool,
-            stride=pool,
-        )
-        coarse_key_valid = F.max_pool2d(
-            self._flat_mask_to_feature_map(key_valid_flat),
-            kernel_size=pool,
-            stride=pool,
-        )
-        coarse_dustbin_logits = self.coarse_global_dustbin_head(coarse_query_tokens).squeeze(-1)
-        coord_y, coord_x = torch.meshgrid(
-            torch.arange(self.token_grid_size, device=query_retrieval_tokens.device),
-            torch.arange(self.token_grid_size, device=query_retrieval_tokens.device),
-            indexing="ij",
-        )
-        fine_to_coarse_index = (
-            (coord_y // pool) * self.coarse_global_grid_size + (coord_x // pool)
-        ).reshape(-1)
-        return {
-            "query_tokens": coarse_query_tokens,
-            "key_tokens": coarse_key_tokens,
-            "query_mask_flat": coarse_query_mask.flatten(start_dim=1),
-            "key_valid_flat": coarse_key_valid.flatten(start_dim=1),
-            "dustbin_logits": coarse_dustbin_logits,
-            "fine_to_coarse_index": fine_to_coarse_index,
-            "coarse_grid_size": query_retrieval_tokens.new_tensor(self.coarse_global_grid_size, dtype=torch.long),
-            "coarse_pool_size": query_retrieval_tokens.new_tensor(pool, dtype=torch.long),
-        }
 
     def _apply_branch_dropout(self, branch: torch.Tensor, drop_prob: float) -> torch.Tensor:
         if (not self.training) or drop_prob <= 0:
@@ -975,7 +840,6 @@ class PatchInpainting(nn.Module):
         key_context_tokens_full: torch.Tensor | None,
         query_retrieval_tokens_full: torch.Tensor | None,
         key_retrieval_tokens_full: torch.Tensor | None,
-        coarse_global_aux: dict[str, torch.Tensor] | None,
         patch_values: torch.Tensor,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
@@ -1016,7 +880,6 @@ class PatchInpainting(nn.Module):
                 "candidate_selection_alpha": query_tokens_full.new_tensor(selection_alpha),
             }
 
-        coarse_matcher_active = coarse_global_aux is not None and self._coarse_global_matcher_active()
         for batch_idx in range(batch_size):
             query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
             if query_indices.numel() == 0:
@@ -1025,153 +888,92 @@ class PatchInpainting(nn.Module):
             key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
             replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
             if key_indices.numel() > 0:
-                query_group_ids = query_indices.new_zeros(query_indices.shape, dtype=torch.long)
-                grouped_key_masks: dict[int, torch.Tensor] = {}
-                if coarse_matcher_active:
-                    fine_to_coarse_index = coarse_global_aux["fine_to_coarse_index"].long()
-                    query_group_ids = fine_to_coarse_index[query_indices]
-                    key_group_ids = fine_to_coarse_index[key_indices]
-                    coarse_key_indices = (
-                        (coarse_global_aux["key_valid_flat"][batch_idx] > 0.5)
-                        .nonzero(as_tuple=False)
-                        .flatten()
+                query_tokens = query_tokens_full[batch_idx : batch_idx + 1, query_indices]
+                key_tokens = key_tokens_full[batch_idx : batch_idx + 1, key_indices]
+                value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
+                if self.candidate_reranker:
+                    _, base_logits = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
+                    base_logits = base_logits.squeeze(0).squeeze(0)
+                    if query_context_tokens_full is None or key_context_tokens_full is None:
+                        raise ValueError("candidate_reranker requires query/key context tokens.")
+                    query_context_tokens = query_context_tokens_full[batch_idx, query_indices]
+                    key_context_tokens = key_context_tokens_full[batch_idx, key_indices]
+                    retrieval_logits = base_logits
+                    if query_retrieval_tokens_full is not None and key_retrieval_tokens_full is not None:
+                        query_retrieval_tokens = query_retrieval_tokens_full[batch_idx, query_indices]
+                        key_retrieval_tokens = key_retrieval_tokens_full[batch_idx, key_indices]
+                        context_logits = self._compute_candidate_context_logits(
+                            query_retrieval_tokens,
+                            key_retrieval_tokens,
+                        )
+                        if context_logits is not None:
+                            context_alpha = self._candidate_context_retrieval_alpha()
+                            retrieval_logits = retrieval_logits + (
+                                context_alpha * context_logits.to(dtype=retrieval_logits.dtype)
+                            )
+                    candidate_count = min(retrieval_logits.shape[-1], self.multihead_attention.attention_top_k)
+                    base_candidate_logits, candidate_local_indices = torch.topk(
+                        retrieval_logits,
+                        k=candidate_count,
+                        dim=-1,
                     )
-                    if coarse_key_indices.numel() > 0:
-                        coarse_query_tokens = coarse_global_aux["query_tokens"][batch_idx]
-                        coarse_key_tokens = coarse_global_aux["key_tokens"][batch_idx, coarse_key_indices]
-                        coarse_logits = self._compute_coarse_global_logits(
-                            coarse_query_tokens,
-                            coarse_key_tokens,
-                        )
-                        coarse_dustbin_logits = coarse_global_aux["dustbin_logits"][batch_idx]
-                        coarse_grid_size = int(coarse_global_aux["coarse_grid_size"].item())
-                        for group_id in torch.unique(query_group_ids):
-                            coarse_row = coarse_logits[group_id]
-                            if coarse_row.numel() == 0:
-                                continue
-                            if coarse_dustbin_logits[group_id] >= coarse_row.max():
-                                continue
-                            coarse_candidate_count = min(self.coarse_global_matcher_top_k, coarse_row.shape[-1])
-                            selected_local = coarse_row.topk(k=coarse_candidate_count, dim=-1).indices
-                            selected_coarse = coarse_key_indices[selected_local]
-                            selected_coarse = self._expand_coarse_indices(
-                                selected_coarse,
-                                grid_size=coarse_grid_size,
-                            )
-                            allowed_mask = (key_group_ids.unsqueeze(0) == selected_coarse.unsqueeze(1)).any(dim=0)
-                            if allowed_mask.any():
-                                grouped_key_masks[int(group_id.item())] = allowed_mask
-
-                mixed_queries_groups = []
-                for group_id in torch.unique(query_group_ids):
-                    group_query_mask = query_group_ids == group_id
-                    group_query_indices = query_indices[group_query_mask]
-                    group_key_indices = key_indices
-                    allowed_key_mask = grouped_key_masks.get(int(group_id.item()))
-                    if allowed_key_mask is not None:
-                        group_key_indices = key_indices[allowed_key_mask]
-                    if group_key_indices.numel() == 0:
-                        group_key_indices = key_indices
-
-                    query_tokens = query_tokens_full[batch_idx : batch_idx + 1, group_query_indices]
-                    key_tokens = key_tokens_full[batch_idx : batch_idx + 1, group_key_indices]
-                    value_tokens = patch_values[batch_idx : batch_idx + 1, group_key_indices]
-                    if self.candidate_reranker:
-                        _, base_logits = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
-                        base_logits = base_logits.squeeze(0).squeeze(0)
-                        if query_context_tokens_full is None or key_context_tokens_full is None:
-                            raise ValueError("candidate_reranker requires query/key context tokens.")
-                        query_context_tokens = query_context_tokens_full[batch_idx, group_query_indices]
-                        key_context_tokens = key_context_tokens_full[batch_idx, group_key_indices]
-                        retrieval_logits = base_logits
-                        if query_retrieval_tokens_full is not None and key_retrieval_tokens_full is not None:
-                            query_retrieval_tokens = query_retrieval_tokens_full[batch_idx, group_query_indices]
-                            key_retrieval_tokens = key_retrieval_tokens_full[batch_idx, group_key_indices]
-                            context_logits = self._compute_candidate_context_logits(
-                                query_retrieval_tokens,
-                                key_retrieval_tokens,
-                            )
-                            if context_logits is not None:
-                                context_alpha = self._candidate_context_retrieval_alpha()
-                                retrieval_logits = retrieval_logits + (
-                                    context_alpha * context_logits.to(dtype=retrieval_logits.dtype)
-                                )
-                        candidate_count = min(retrieval_logits.shape[-1], self.multihead_attention.attention_top_k)
-                        base_candidate_logits, candidate_local_indices = torch.topk(
-                            retrieval_logits,
-                            k=candidate_count,
-                            dim=-1,
-                        )
-                        query_tokens_flat = query_tokens.squeeze(0)
-                        key_tokens_flat = key_tokens.squeeze(0)
-                        value_tokens_flat = value_tokens.squeeze(0)
-                        query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
-                        candidate_key_tokens = key_tokens_flat[candidate_local_indices]
-                        candidate_value_tokens = value_tokens_flat[candidate_local_indices]
-                        query_context_expanded = query_context_tokens.unsqueeze(1).expand(-1, candidate_count, -1)
-                        candidate_key_context_tokens = key_context_tokens[candidate_local_indices]
-                        rerank_features = torch.cat(
-                            [
-                                query_expanded,
-                                candidate_key_tokens,
-                                query_expanded - candidate_key_tokens,
-                                query_expanded * candidate_key_tokens,
-                                query_context_expanded,
-                                candidate_key_context_tokens,
-                                query_context_expanded - candidate_key_context_tokens,
-                                query_context_expanded * candidate_key_context_tokens,
-                            ],
-                            dim=-1,
-                        )
-                        rerank_delta = self.candidate_reranker_head(rerank_features).squeeze(-1)
-                        rerank_logits = base_candidate_logits + rerank_delta
-                        selection_logits = base_candidate_logits + (selection_alpha * rerank_delta)
-                        selection_attn, selection_probs = self.multihead_attention.attention_from_logits(
-                            selection_logits,
-                            value_dtype=value_tokens.dtype,
-                            direct_patch_mixing=True,
-                        )
-                        mixed_queries = torch.einsum(
-                            "qk,qkd->qd",
-                            selection_attn,
-                            candidate_value_tokens,
-                        ).to(dtype=mixed.dtype)
-                        group_rows = replacement_rows[group_query_mask]
-                        masked_attention = group_rows.new_zeros((group_query_indices.numel(), group_key_indices.numel()))
-                        masked_attention.scatter_(
-                            1,
-                            candidate_local_indices,
-                            selection_probs.to(dtype=masked_attention.dtype),
-                        )
-                        group_rows[:, group_key_indices] = masked_attention
-                        replacement_rows[group_query_mask] = group_rows
-                        candidate_absolute_indices = group_key_indices[candidate_local_indices]
-                        rerank_aux["candidate_indices"][batch_idx, group_query_indices, :candidate_count] = (
-                            candidate_absolute_indices
-                        )
-                        rerank_aux["candidate_base_logits"][batch_idx, group_query_indices, :candidate_count] = (
-                            base_candidate_logits
-                        )
-                        rerank_aux["candidate_logits"][batch_idx, group_query_indices, :candidate_count] = (
-                            rerank_logits
-                        )
-                        rerank_aux["candidate_valid_mask"][batch_idx, group_query_indices, :candidate_count] = True
-                    else:
-                        mixed_queries, masked_attention = self.multihead_attention(
-                            query_tokens,
-                            key_tokens,
-                            value_tokens,
-                            direct_patch_mixing=True,
-                        )
-                        mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
-                        masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
-                        group_rows = replacement_rows[group_query_mask]
-                        group_rows[:, group_key_indices] = masked_attention
-                        replacement_rows[group_query_mask] = group_rows
-                    mixed_queries_groups.append((group_query_indices, mixed_queries))
-
-                for group_query_indices, group_mixed_queries in mixed_queries_groups:
-                    mixed[batch_idx].index_copy_(0, group_query_indices, group_mixed_queries)
+                    query_tokens_flat = query_tokens.squeeze(0)
+                    key_tokens_flat = key_tokens.squeeze(0)
+                    value_tokens_flat = value_tokens.squeeze(0)
+                    query_expanded = query_tokens_flat.unsqueeze(1).expand(-1, candidate_count, -1)
+                    candidate_key_tokens = key_tokens_flat[candidate_local_indices]
+                    candidate_value_tokens = value_tokens_flat[candidate_local_indices]
+                    query_context_expanded = query_context_tokens.unsqueeze(1).expand(-1, candidate_count, -1)
+                    candidate_key_context_tokens = key_context_tokens[candidate_local_indices]
+                    rerank_features = torch.cat(
+                        [
+                            query_expanded,
+                            candidate_key_tokens,
+                            query_expanded - candidate_key_tokens,
+                            query_expanded * candidate_key_tokens,
+                            query_context_expanded,
+                            candidate_key_context_tokens,
+                            query_context_expanded - candidate_key_context_tokens,
+                            query_context_expanded * candidate_key_context_tokens,
+                        ],
+                        dim=-1,
+                    )
+                    rerank_delta = self.candidate_reranker_head(rerank_features).squeeze(-1)
+                    rerank_logits = base_candidate_logits + rerank_delta
+                    selection_logits = base_candidate_logits + (selection_alpha * rerank_delta)
+                    selection_attn, selection_probs = self.multihead_attention.attention_from_logits(
+                        selection_logits,
+                        value_dtype=value_tokens.dtype,
+                        direct_patch_mixing=True,
+                    )
+                    mixed_queries = torch.einsum(
+                        "qk,qkd->qd",
+                        selection_attn,
+                        candidate_value_tokens,
+                    ).to(dtype=mixed.dtype)
+                    masked_attention = replacement_rows.new_zeros((query_indices.numel(), key_indices.numel()))
+                    masked_attention.scatter_(
+                        1,
+                        candidate_local_indices,
+                        selection_probs.to(dtype=masked_attention.dtype),
+                    )
+                    candidate_absolute_indices = key_indices[candidate_local_indices]
+                    replacement_rows[:, key_indices] = masked_attention
+                    rerank_aux["candidate_indices"][batch_idx, query_indices, :candidate_count] = candidate_absolute_indices
+                    rerank_aux["candidate_base_logits"][batch_idx, query_indices, :candidate_count] = base_candidate_logits
+                    rerank_aux["candidate_logits"][batch_idx, query_indices, :candidate_count] = rerank_logits
+                    rerank_aux["candidate_valid_mask"][batch_idx, query_indices, :candidate_count] = True
+                else:
+                    mixed_queries, masked_attention = self.multihead_attention(
+                        query_tokens,
+                        key_tokens,
+                        value_tokens,
+                        direct_patch_mixing=True,
+                    )
+                    mixed_queries = mixed_queries.squeeze(0).to(dtype=mixed.dtype)
+                    masked_attention = masked_attention.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
+                    replacement_rows[:, key_indices] = masked_attention
+                mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
 
             dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
 
@@ -1286,7 +1088,6 @@ class PatchInpainting(nn.Module):
         candidate_key_context_tokens = None
         candidate_query_retrieval_tokens = None
         candidate_key_retrieval_tokens = None
-        coarse_global_matcher_aux = None
         if self.candidate_reranker:
             candidate_query_context_map = self._pool_to_token_grid(
                 self.candidate_query_context_encoder(torch.cat([image, coarse_composite, mask], dim=1)),
@@ -1306,13 +1107,6 @@ class PatchInpainting(nn.Module):
                     candidate_query_context_tokens,
                     candidate_key_context_tokens,
                 )
-                if self.coarse_global_matcher:
-                    coarse_global_matcher_aux = self._build_coarse_global_matcher_state(
-                        candidate_query_retrieval_tokens,
-                        candidate_key_retrieval_tokens,
-                        query_mask_flat,
-                        key_valid_flat,
-                    )
         if self.separate_query_key_matching:
             visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
             query_context_map = self._pool_to_token_grid(
@@ -1432,7 +1226,6 @@ class PatchInpainting(nn.Module):
                 candidate_key_context_tokens,
                 candidate_query_retrieval_tokens,
                 candidate_key_retrieval_tokens,
-                coarse_global_matcher_aux,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
@@ -1487,14 +1280,6 @@ class PatchInpainting(nn.Module):
                 aux["candidate_query_retrieval_tokens"] = candidate_query_retrieval_tokens
                 aux["candidate_key_retrieval_tokens"] = candidate_key_retrieval_tokens
                 aux["candidate_context_retrieval_scale"] = self.candidate_context_retrieval_scale
-            if coarse_global_matcher_aux is not None:
-                aux["coarse_global_query_tokens"] = coarse_global_matcher_aux["query_tokens"]
-                aux["coarse_global_key_tokens"] = coarse_global_matcher_aux["key_tokens"]
-                aux["coarse_query_mask_flat"] = coarse_global_matcher_aux["query_mask_flat"]
-                aux["coarse_key_valid_flat"] = coarse_global_matcher_aux["key_valid_flat"]
-                aux["coarse_global_dustbin_logits"] = coarse_global_matcher_aux["dustbin_logits"]
-                aux["coarse_global_matcher_scale"] = self.coarse_global_matcher_scale
-                aux["coarse_global_pool_size"] = coarse_global_matcher_aux["coarse_pool_size"]
             if rerank_aux is not None:
                 aux.update(rerank_aux)
             return refined, masked_attention, coarse_raw, aux
