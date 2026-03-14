@@ -199,6 +199,7 @@ class PatchInpainting(nn.Module):
         transport_offset_scale: float = 1.0,
         transport_refine_scale: float = 0.25,
         transport_self_supervision_ratio: float = 0.0,
+        transport_fallback_validity_threshold: float = 0.5,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
@@ -250,6 +251,7 @@ class PatchInpainting(nn.Module):
         self.transport_offset_scale = float(transport_offset_scale)
         self.transport_refine_scale = float(transport_refine_scale)
         self.transport_self_supervision_ratio = float(transport_self_supervision_ratio)
+        self.transport_fallback_validity_threshold = float(transport_fallback_validity_threshold)
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
@@ -276,6 +278,8 @@ class PatchInpainting(nn.Module):
             raise ValueError("transport_refine_scale must be non-negative.")
         if not 0.0 <= self.transport_self_supervision_ratio <= 1.0:
             raise ValueError("transport_self_supervision_ratio must be in [0, 1].")
+        if not 0.0 <= self.transport_fallback_validity_threshold <= 1.0:
+            raise ValueError("transport_fallback_validity_threshold must be in [0, 1].")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -886,8 +890,10 @@ class PatchInpainting(nn.Module):
         sampled_values_flat = sampled_values.flatten(start_dim=2).transpose(1, 2)
         sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
         if default_tokens is not None:
-            blend = sampled_validity_flat.to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
-            sampled_values_flat = (blend * sampled_values_flat) + ((1.0 - blend) * default_tokens)
+            valid_copy = (
+                sampled_validity_flat >= self.transport_fallback_validity_threshold
+            ).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
+            sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
         aux = {
             "copy_mode": self.copy_mode,
             "query_mask_flat": query_mask_flat,
