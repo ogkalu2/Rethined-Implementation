@@ -193,6 +193,15 @@ class PatchInpainting(nn.Module):
         attention_warmup_selection: str | None = None,
         attention_warmup_steps: int = 0,
         attention_gumbel_hard_start_step: int = 0,
+        copy_mode: str = "attention",
+        deformable_num_slots: int = 4,
+        deformable_hidden_channels: int = 128,
+        deformable_coarse_stride: int = 4,
+        deformable_base_offset_scale: float = 1.0,
+        deformable_residual_scale: float = 0.15,
+        deformable_use_unmatched: bool = True,
+        deformable_hard_start_step: int = 0,
+        deformable_hard_inference: bool = True,
         matching_descriptor_dim: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
@@ -243,6 +252,17 @@ class PatchInpainting(nn.Module):
         self.use_positional_encoding = bool(use_positional_encoding)
         self.feature_i = int(feature_i)
         self.feature_dim = int(feature_dim)
+        self.copy_mode = str(copy_mode).lower()
+        if self.copy_mode not in {"attention", "deformable_slots"}:
+            raise ValueError("copy_mode must be one of {'attention', 'deformable_slots'}.")
+        self.deformable_num_slots = int(deformable_num_slots)
+        self.deformable_hidden_channels = int(deformable_hidden_channels)
+        self.deformable_coarse_stride = int(deformable_coarse_stride)
+        self.deformable_base_offset_scale = float(deformable_base_offset_scale)
+        self.deformable_residual_scale = float(deformable_residual_scale)
+        self.deformable_use_unmatched = bool(deformable_use_unmatched)
+        self.deformable_hard_start_step = max(0, int(deformable_hard_start_step))
+        self.deformable_hard_inference = bool(deformable_hard_inference)
         self.matching_descriptor_dim = (
             None if matching_descriptor_dim is None else int(matching_descriptor_dim)
         )
@@ -276,6 +296,8 @@ class PatchInpainting(nn.Module):
             raise ValueError("candidate_rerank_selection_max_alpha must be non-negative.")
         if self.candidate_rerank_selection and not self.candidate_reranker:
             raise ValueError("candidate_rerank_selection requires candidate_reranker=True.")
+        if self.copy_mode == "deformable_slots" and self.candidate_reranker:
+            raise ValueError("candidate_reranker is only supported with copy_mode='attention'.")
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
@@ -314,6 +336,16 @@ class PatchInpainting(nn.Module):
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
+        if self.deformable_num_slots <= 0:
+            raise ValueError("deformable_num_slots must be positive.")
+        if self.deformable_hidden_channels <= 0:
+            raise ValueError("deformable_hidden_channels must be positive.")
+        if self.deformable_coarse_stride <= 0 or self.token_grid_size % self.deformable_coarse_stride != 0:
+            raise ValueError("deformable_coarse_stride must be positive and evenly divide the token grid size.")
+        if self.deformable_base_offset_scale < 0:
+            raise ValueError("deformable_base_offset_scale must be non-negative.")
+        if self.deformable_residual_scale < 0:
+            raise ValueError("deformable_residual_scale must be non-negative.")
         self.matching_input_dim = 0
         if self.match_coarse_rgb:
             self.matching_input_dim += self.query_patch_dim
@@ -364,6 +396,8 @@ class PatchInpainting(nn.Module):
         self.candidate_reranker_head = None
         self.candidate_query_context_encoder = None
         self.candidate_key_context_encoder = None
+        self.deformable_base_head = None
+        self.deformable_slot_head = None
         self.coarse_rgb_branch_norm = None
         if self.match_coarse_rgb and self.normalize_matching_branches:
             self.coarse_rgb_branch_norm = nn.GroupNorm(1, self.query_patch_dim)
@@ -447,6 +481,42 @@ class PatchInpainting(nn.Module):
             nn.init.zeros_(self.candidate_reranker_head[-1].weight)
             nn.init.zeros_(self.candidate_reranker_head[-1].bias)
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
+        if self.copy_mode == "deformable_slots":
+            base_in_channels = self.patch_token_dim + 1
+            slot_in_channels = self.patch_token_dim + 3
+            self.deformable_base_head = nn.Sequential(
+                nn.Conv2d(
+                    base_in_channels,
+                    self.deformable_hidden_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    padding_mode="reflect",
+                    bias=False,
+                ),
+                nn.GELU(),
+                nn.Conv2d(self.deformable_hidden_channels, 2, kernel_size=1, stride=1),
+            )
+            slot_out_channels = (self.deformable_num_slots * 3) + (1 if self.deformable_use_unmatched else 0)
+            self.deformable_slot_head = nn.Sequential(
+                nn.Conv2d(
+                    slot_in_channels,
+                    self.deformable_hidden_channels,
+                    kernel_size=3,
+                    stride=1,
+                    padding=1,
+                    padding_mode="reflect",
+                    bias=False,
+                ),
+                nn.GELU(),
+                nn.Conv2d(self.deformable_hidden_channels, slot_out_channels, kernel_size=1, stride=1),
+            )
+            nn.init.zeros_(self.deformable_base_head[-1].weight)
+            nn.init.zeros_(self.deformable_base_head[-1].bias)
+            nn.init.zeros_(self.deformable_slot_head[-1].weight)
+            nn.init.zeros_(self.deformable_slot_head[-1].bias)
+            if self.deformable_use_unmatched:
+                nn.init.constant_(self.deformable_slot_head[-1].bias[-1], -1.0)
         self.positionalencoding = (
             nn.Parameter(
                 torch.zeros(
@@ -761,6 +831,278 @@ class PatchInpainting(nn.Module):
         if padding > 0:
             output = output[..., padding:-padding, padding:-padding]
         return output
+
+    def _should_harden_deformable_copy(self) -> bool:
+        if not self.training:
+            return self.deformable_hard_inference
+        return self.current_training_step >= self.deformable_hard_start_step
+
+    def _selection_from_logits(
+        self,
+        logits: torch.Tensor,
+        *,
+        value_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        probs = F.softmax(logits, dim=-1).to(value_dtype)
+        if not self._should_harden_deformable_copy():
+            return probs, probs
+
+        hard = torch.zeros_like(probs)
+        hard.scatter_(-1, logits.argmax(dim=-1, keepdim=True), 1.0)
+        if self.training:
+            selection = hard - probs.detach() + probs
+        else:
+            selection = hard
+        return selection, probs
+
+    def _get_normalized_token_coords(
+        self,
+        token_hw: tuple[int, int],
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        height, width = token_hw
+        ys = torch.linspace(-1.0, 1.0, steps=height, dtype=dtype, device=device)
+        xs = torch.linspace(-1.0, 1.0, steps=width, dtype=dtype, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
+        return torch.stack([grid_x, grid_y], dim=0).unsqueeze(0)
+
+    def _sample_slots_from_map(
+        self,
+        feature_map: torch.Tensor,
+        slot_coords: torch.Tensor,
+    ) -> torch.Tensor:
+        sampled = []
+        for slot_idx in range(slot_coords.shape[1]):
+            grid = slot_coords[:, slot_idx].permute(0, 2, 3, 1).contiguous()
+            sampled.append(
+                F.grid_sample(
+                    feature_map,
+                    grid,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=True,
+                )
+            )
+        return torch.stack(sampled, dim=1)
+
+    def _build_sparse_slot_attention(
+        self,
+        slot_coords_flat: torch.Tensor,
+        slot_probs_flat: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+        *,
+        value_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        batch_size, num_patches, num_slots, _ = slot_coords_flat.shape
+        height, width = token_hw
+        dense_attn = torch.eye(num_patches, device=slot_coords_flat.device, dtype=value_dtype)
+        dense_attn = dense_attn.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        masked_queries = query_mask_flat > 0.5
+        width_scale = max(width - 1, 1)
+        height_scale = max(height - 1, 1)
+
+        for batch_idx in range(batch_size):
+            query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
+            if query_indices.numel() == 0:
+                continue
+
+            replacement_rows = dense_attn.new_zeros((query_indices.numel(), num_patches))
+            coords = slot_coords_flat[batch_idx, query_indices]
+            probs = slot_probs_flat[batch_idx, query_indices].to(dtype=replacement_rows.dtype)
+
+            x_pos = (coords[..., 0] + 1.0) * 0.5 * width_scale
+            y_pos = (coords[..., 1] + 1.0) * 0.5 * height_scale
+            x0 = x_pos.floor().long().clamp_(0, width - 1)
+            y0 = y_pos.floor().long().clamp_(0, height - 1)
+            x1 = (x0 + 1).clamp_(0, width - 1)
+            y1 = (y0 + 1).clamp_(0, height - 1)
+            wx1 = (x_pos - x0.to(dtype=x_pos.dtype)).clamp_(0.0, 1.0)
+            wy1 = (y_pos - y0.to(dtype=y_pos.dtype)).clamp_(0.0, 1.0)
+            wx0 = 1.0 - wx1
+            wy0 = 1.0 - wy1
+
+            candidate_indices = torch.stack(
+                [
+                    (y0 * width) + x0,
+                    (y0 * width) + x1,
+                    (y1 * width) + x0,
+                    (y1 * width) + x1,
+                ],
+                dim=-1,
+            )
+            bilinear_weights = torch.stack(
+                [
+                    wy0 * wx0,
+                    wy0 * wx1,
+                    wy1 * wx0,
+                    wy1 * wx1,
+                ],
+                dim=-1,
+            )
+            weighted_probs = (probs.unsqueeze(-1) * bilinear_weights).reshape(query_indices.numel(), -1)
+            replacement_rows.scatter_add_(
+                1,
+                candidate_indices.reshape(query_indices.numel(), -1),
+                weighted_probs,
+            )
+            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
+
+        return dense_attn
+
+    def _deformable_slot_copy(
+        self,
+        query_tokens_full: torch.Tensor,
+        key_tokens_full: torch.Tensor,
+        source_patch_map: torch.Tensor,
+        fallback_patch_map: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        batch_size, num_patches, token_dim = query_tokens_full.shape
+        height, width = token_hw
+        query_token_map = query_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
+        key_token_map = key_tokens_full.transpose(1, 2).contiguous().view(batch_size, token_dim, height, width)
+        query_mask_map = query_mask_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
+        valid_key_map = key_valid_flat.view(batch_size, 1, height, width).to(dtype=query_token_map.dtype)
+
+        base_head_input = torch.cat([query_token_map, query_mask_map], dim=1)
+        coarse_input = F.avg_pool2d(
+            base_head_input,
+            kernel_size=self.deformable_coarse_stride,
+            stride=self.deformable_coarse_stride,
+        )
+        base_offset_low = torch.tanh(self.deformable_base_head(coarse_input)) * self.deformable_base_offset_scale
+        base_offset_map = F.interpolate(
+            base_offset_low,
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        base_coords = torch.clamp(
+            self._get_normalized_token_coords(token_hw, dtype=query_token_map.dtype, device=query_token_map.device)
+            + base_offset_map,
+            -1.0,
+            1.0,
+        )
+        slot_head_input = torch.cat([query_token_map, query_mask_map, base_offset_map], dim=1)
+        slot_params = self.deformable_slot_head(slot_head_input)
+        slot_residual_channels = self.deformable_num_slots * 2
+        slot_bias_channels = self.deformable_num_slots
+        slot_residual = slot_params[:, :slot_residual_channels].view(
+            batch_size,
+            self.deformable_num_slots,
+            2,
+            height,
+            width,
+        )
+        slot_residual = torch.tanh(slot_residual) * self.deformable_residual_scale
+        slot_bias = slot_params[
+            :,
+            slot_residual_channels : slot_residual_channels + slot_bias_channels,
+        ].view(batch_size, self.deformable_num_slots, height, width)
+        unmatched_logits_map = None
+        if self.deformable_use_unmatched:
+            unmatched_logits_map = slot_params[:, -1:, :, :]
+
+        slot_coords = torch.clamp(base_coords.unsqueeze(1) + slot_residual, -1.0, 1.0)
+        sampled_values = self._sample_slots_from_map(source_patch_map, slot_coords)
+        sampled_key_tokens = self._sample_slots_from_map(key_token_map, slot_coords)
+        sampled_validity = self._sample_slots_from_map(valid_key_map, slot_coords).squeeze(2)
+
+        slot_logits = slot_bias + (
+            (query_token_map.unsqueeze(1) * sampled_key_tokens).sum(dim=2) / (token_dim ** 0.5)
+        )
+        slot_logits = slot_logits + torch.log(sampled_validity.clamp_min(1e-6))
+
+        slot_logits_flat = slot_logits.permute(0, 2, 3, 1).reshape(batch_size, num_patches, self.deformable_num_slots)
+        sampled_validity_flat = sampled_validity.permute(0, 2, 3, 1).reshape(
+            batch_size,
+            num_patches,
+            self.deformable_num_slots,
+        )
+        sampled_values_flat = sampled_values.permute(0, 3, 4, 1, 2).reshape(
+            batch_size,
+            num_patches,
+            self.deformable_num_slots,
+            self.value_patch_dim,
+        )
+        slot_coords_flat = slot_coords.permute(0, 3, 4, 1, 2).reshape(
+            batch_size,
+            num_patches,
+            self.deformable_num_slots,
+            2,
+        )
+        base_coords_flat = base_coords.permute(0, 2, 3, 1).reshape(batch_size, num_patches, 2)
+        base_offset_flat = base_offset_map.permute(0, 2, 3, 1).reshape(batch_size, num_patches, 2)
+        fallback_patch_flat = fallback_patch_map.flatten(start_dim=2).transpose(1, 2)
+
+        mixed = fallback_patch_flat.clone()
+        slot_probs_full = slot_logits_flat.new_zeros(slot_logits_flat.shape)
+        unmatched_probs_full = slot_logits_flat.new_zeros((batch_size, num_patches))
+        for batch_idx in range(batch_size):
+            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            if query_indices.numel() == 0:
+                continue
+
+            query_slot_logits = slot_logits_flat[batch_idx, query_indices]
+            if unmatched_logits_map is not None:
+                unmatched_logits = unmatched_logits_map.permute(0, 2, 3, 1).reshape(batch_size, num_patches)[
+                    batch_idx,
+                    query_indices,
+                ].unsqueeze(-1)
+                final_logits = torch.cat([query_slot_logits, unmatched_logits], dim=-1)
+                selection, probs = self._selection_from_logits(final_logits, value_dtype=source_patch_map.dtype)
+                slot_selection = selection[:, :-1]
+                slot_probs = probs[:, :-1]
+                unmatched_selection = selection[:, -1:].to(dtype=source_patch_map.dtype)
+                unmatched_probs = probs[:, -1]
+            else:
+                slot_selection, slot_probs = self._selection_from_logits(
+                    query_slot_logits,
+                    value_dtype=source_patch_map.dtype,
+                )
+                unmatched_selection = slot_selection.new_zeros((slot_selection.shape[0], 1))
+                unmatched_probs = slot_probs.new_zeros(slot_probs.shape[0])
+
+            mixed_queries = torch.einsum(
+                "qk,qkp->qp",
+                slot_selection,
+                sampled_values_flat[batch_idx, query_indices],
+            ).to(dtype=mixed.dtype)
+            mixed_queries = mixed_queries + (unmatched_selection * fallback_patch_flat[batch_idx, query_indices])
+            mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
+            slot_probs_full[batch_idx, query_indices] = slot_probs.to(dtype=slot_probs_full.dtype)
+            unmatched_probs_full[batch_idx, query_indices] = unmatched_probs.to(dtype=unmatched_probs_full.dtype)
+
+        dense_attn = self._build_sparse_slot_attention(
+            slot_coords_flat,
+            slot_probs_full,
+            query_mask_flat,
+            token_hw,
+            value_dtype=source_patch_map.dtype,
+        )
+        aux = {
+            "copy_mode": self.copy_mode,
+            "deformable_slot_logits": slot_logits_flat,
+            "deformable_slot_probs": slot_probs_full,
+            "deformable_slot_validity": sampled_validity_flat,
+            "deformable_slot_values": sampled_values_flat,
+            "deformable_slot_coords": slot_coords_flat,
+            "deformable_base_coords": base_coords_flat,
+            "deformable_base_offsets": base_offset_flat,
+            "deformable_unmatched_prob": unmatched_probs_full,
+        }
+        if unmatched_logits_map is not None:
+            aux["deformable_unmatched_logits"] = unmatched_logits_map.permute(0, 2, 3, 1).reshape(
+                batch_size,
+                num_patches,
+            )
+        return mixed, dense_attn, aux
 
     def direct_patch_mix_masked_queries(
         self,
@@ -1120,10 +1462,27 @@ class PatchInpainting(nn.Module):
 
         # The paper mixes source LR patches with attention learned from coarse tokens.
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
+        fallback_patch_map, _ = self.extract_patches(
+            coarse_composite,
+            self.value_patch_size,
+            stride=self.kernel_size,
+            padding=self.value_patch_padding,
+        )
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
+            fallback_patch_map = torch.zeros_like(source_patch_map)
         rerank_aux = None
-        if self.attention_masking:
+        if self.copy_mode == "deformable_slots":
+            mixed_patches_flat, masked_attention, rerank_aux = self._deformable_slot_copy(
+                query_tokens,
+                key_tokens,
+                source_patch_map,
+                fallback_patch_map,
+                query_mask_flat,
+                key_valid_flat,
+                patch_map.shape[-2:],
+            )
+        elif self.attention_masking:
             mixed_patches_flat, masked_attention, rerank_aux = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
@@ -1175,6 +1534,7 @@ class PatchInpainting(nn.Module):
                 "kernel_size": self.kernel_size,
                 "value_patch_size": self.value_patch_size,
                 "value_patch_padding": self.value_patch_padding,
+                "copy_mode": self.copy_mode,
                 "matching_tokens": query_matching_tokens,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,

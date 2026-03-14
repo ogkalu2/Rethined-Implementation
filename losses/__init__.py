@@ -117,6 +117,12 @@ class InpaintingLoss(nn.Module):
         candidate_rerank_temperature: float = 1.0,
         candidate_rerank_confidence_threshold: float = 0.2,
         candidate_rerank_margin_threshold: float = 0.03,
+        deformable_slot_teacher_weight: float = 0.0,
+        deformable_slot_teacher_temperature: float = 1.0,
+        deformable_slot_teacher_confidence_threshold: float = 0.2,
+        deformable_validity_weight: float = 0.0,
+        deformable_offset_smoothness_weight: float = 0.0,
+        deformable_offset_edge_scale: float = 5.0,
         frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
         adversarial_weight: float = 0.02,
@@ -139,6 +145,12 @@ class InpaintingLoss(nn.Module):
         self.candidate_rerank_temperature = float(candidate_rerank_temperature)
         self.candidate_rerank_confidence_threshold = float(candidate_rerank_confidence_threshold)
         self.candidate_rerank_margin_threshold = float(candidate_rerank_margin_threshold)
+        self.deformable_slot_teacher_weight = float(deformable_slot_teacher_weight)
+        self.deformable_slot_teacher_temperature = float(deformable_slot_teacher_temperature)
+        self.deformable_slot_teacher_confidence_threshold = float(deformable_slot_teacher_confidence_threshold)
+        self.deformable_validity_weight = float(deformable_validity_weight)
+        self.deformable_offset_smoothness_weight = float(deformable_offset_smoothness_weight)
+        self.deformable_offset_edge_scale = float(deformable_offset_edge_scale)
         self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
         self.adversarial_weight = float(adversarial_weight)
@@ -159,6 +171,16 @@ class InpaintingLoss(nn.Module):
             raise ValueError("candidate_rerank_temperature must be positive.")
         if self.candidate_rerank_weight < 0:
             raise ValueError("candidate_rerank_weight must be non-negative.")
+        if self.deformable_slot_teacher_temperature <= 0:
+            raise ValueError("deformable_slot_teacher_temperature must be positive.")
+        if self.deformable_slot_teacher_weight < 0:
+            raise ValueError("deformable_slot_teacher_weight must be non-negative.")
+        if self.deformable_validity_weight < 0:
+            raise ValueError("deformable_validity_weight must be non-negative.")
+        if self.deformable_offset_smoothness_weight < 0:
+            raise ValueError("deformable_offset_smoothness_weight must be non-negative.")
+        if self.deformable_offset_edge_scale < 0:
+            raise ValueError("deformable_offset_edge_scale must be non-negative.")
 
     def _normalize_descriptors(self, tokens: torch.Tensor) -> torch.Tensor:
         tokens = tokens.float()
@@ -177,6 +199,26 @@ class InpaintingLoss(nn.Module):
             image = F.pad(image, (padding, padding, padding, padding), mode="reflect")
         patches = F.unfold(image, kernel_size=patch_size, stride=stride)
         return patches.transpose(1, 2).contiguous()
+
+    def _teacher_patch_tokens(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor | None, int, int, int]:
+        if attention_aux is None:
+            return None, 0, 0, 0
+        kernel_size = int(attention_aux.get("kernel_size", 0))
+        value_patch_size = int(attention_aux.get("value_patch_size", 0))
+        value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
+        if kernel_size <= 0 or value_patch_size <= 0:
+            return None, kernel_size, value_patch_size, value_patch_padding
+        target_patches = self._extract_patch_tokens(
+            refined_target,
+            patch_size=value_patch_size,
+            stride=kernel_size,
+            padding=value_patch_padding,
+        )
+        return self._normalize_descriptors(target_patches.detach()), kernel_size, value_patch_size, value_patch_padding
 
     def _query_patch_l1_loss(
         self,
@@ -448,6 +490,156 @@ class InpaintingLoss(nn.Module):
         metrics["candidate_rerank_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
         return loss, metrics
 
+    def _deformable_slot_teacher_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {
+            "deformable_slot_teacher": 0.0,
+            "deformable_slot_teacher_accuracy": 0.0,
+            "deformable_slot_teacher_supervised_ratio": 0.0,
+        }
+        if self.deformable_slot_teacher_weight <= 0 or attention_aux is None:
+            return zero, metrics
+        if attention_aux.get("copy_mode") != "deformable_slots":
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        slot_logits = attention_aux.get("deformable_slot_logits")
+        slot_values = attention_aux.get("deformable_slot_values")
+        unmatched_logits = attention_aux.get("deformable_unmatched_logits")
+        if query_mask_flat is None or slot_logits is None or slot_values is None:
+            return zero, metrics
+
+        teacher_patch_tokens, _, value_patch_size, _ = self._teacher_patch_tokens(refined_target, attention_aux)
+        if teacher_patch_tokens is None or value_patch_size <= 0:
+            return zero, metrics
+
+        sampled_slot_tokens = self._normalize_descriptors(slot_values)
+        loss_terms = []
+        supervised_queries = 0
+        total_masked_queries = 0
+        correct_matches = 0
+
+        for batch_idx in range(teacher_patch_tokens.shape[0]):
+            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            total_masked_queries += int(query_indices.numel())
+            if query_indices.numel() == 0:
+                continue
+
+            target_tokens = teacher_patch_tokens[batch_idx, query_indices]
+            candidate_tokens = sampled_slot_tokens[batch_idx, query_indices]
+            teacher_scores = (target_tokens.unsqueeze(1) * candidate_tokens).sum(dim=-1)
+            best_teacher = teacher_scores.max(dim=-1).values
+            logits = slot_logits[batch_idx, query_indices] / self.deformable_slot_teacher_temperature
+            matched_teacher = best_teacher >= self.deformable_slot_teacher_confidence_threshold
+
+            if unmatched_logits is not None:
+                logits = torch.cat(
+                    [logits, unmatched_logits[batch_idx, query_indices].unsqueeze(-1)],
+                    dim=-1,
+                )
+                targets = F.softmax(
+                    teacher_scores / self.deformable_slot_teacher_temperature,
+                    dim=-1,
+                )
+                unmatched_targets = (~matched_teacher).to(dtype=targets.dtype).unsqueeze(-1)
+                targets = targets * matched_teacher.unsqueeze(-1).to(dtype=targets.dtype)
+                targets = torch.cat([targets, unmatched_targets], dim=-1)
+                supervised_mask = matched_teacher | (~matched_teacher)
+            else:
+                targets = F.softmax(
+                    teacher_scores / self.deformable_slot_teacher_temperature,
+                    dim=-1,
+                )
+                supervised_mask = matched_teacher
+
+            if not supervised_mask.any():
+                continue
+
+            loss_terms.append(
+                -(targets[supervised_mask] * F.log_softmax(logits[supervised_mask], dim=-1)).sum(dim=-1).mean()
+            )
+            predictions = logits.argmax(dim=-1)
+            teacher_labels = targets.argmax(dim=-1)
+            supervised_queries += int(supervised_mask.sum().item())
+            correct_matches += int((predictions[supervised_mask] == teacher_labels[supervised_mask]).sum().item())
+
+        if not loss_terms:
+            return zero, metrics
+
+        loss = torch.stack(loss_terms).mean()
+        metrics["deformable_slot_teacher"] = loss.item()
+        metrics["deformable_slot_teacher_accuracy"] = correct_matches / max(supervised_queries, 1)
+        metrics["deformable_slot_teacher_supervised_ratio"] = supervised_queries / max(total_masked_queries, 1)
+        return loss, metrics
+
+    def _deformable_validity_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {"deformable_validity": 0.0}
+        if self.deformable_validity_weight <= 0 or attention_aux is None:
+            return zero, metrics
+        if attention_aux.get("copy_mode") != "deformable_slots":
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        slot_probs = attention_aux.get("deformable_slot_probs")
+        slot_validity = attention_aux.get("deformable_slot_validity")
+        if query_mask_flat is None or slot_probs is None or slot_validity is None:
+            return zero, metrics
+
+        masked_queries = (query_mask_flat > 0.5).unsqueeze(-1).to(dtype=slot_probs.dtype)
+        weighted_invalidity = slot_probs * (1.0 - slot_validity.to(dtype=slot_probs.dtype)) * masked_queries
+        denom = (masked_queries * slot_probs.new_ones(slot_probs.shape)).sum().clamp_min(1e-6)
+        loss = weighted_invalidity.sum() / denom
+        metrics["deformable_validity"] = loss.item()
+        return loss, metrics
+
+    def _deformable_offset_smoothness_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {"deformable_offset_smoothness": 0.0}
+        if self.deformable_offset_smoothness_weight <= 0 or attention_aux is None:
+            return zero, metrics
+        if attention_aux.get("copy_mode") != "deformable_slots":
+            return zero, metrics
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        base_offsets = attention_aux.get("deformable_base_offsets")
+        if query_mask_flat is None or base_offsets is None:
+            return zero, metrics
+
+        token_grid_size = int(refined_target.shape[-1] // max(attention_aux.get("kernel_size", 1), 1))
+        coord_map = base_offsets.transpose(1, 2).contiguous().view(base_offsets.shape[0], 2, token_grid_size, token_grid_size)
+        query_mask_map = query_mask_flat.view(base_offsets.shape[0], 1, token_grid_size, token_grid_size).to(dtype=coord_map.dtype)
+        token_target = F.adaptive_avg_pool2d(refined_target, (token_grid_size, token_grid_size))
+        edge_x = torch.exp(
+            -self.deformable_offset_edge_scale
+            * (token_target[:, :, :, 1:] - token_target[:, :, :, :-1]).abs().mean(dim=1, keepdim=True)
+        )
+        edge_y = torch.exp(
+            -self.deformable_offset_edge_scale
+            * (token_target[:, :, 1:, :] - token_target[:, :, :-1, :]).abs().mean(dim=1, keepdim=True)
+        )
+        mask_x = query_mask_map[:, :, :, 1:] * query_mask_map[:, :, :, :-1]
+        mask_y = query_mask_map[:, :, 1:, :] * query_mask_map[:, :, :-1, :]
+        diff_x = (coord_map[:, :, :, 1:] - coord_map[:, :, :, :-1]).abs().sum(dim=1, keepdim=True)
+        diff_y = (coord_map[:, :, 1:, :] - coord_map[:, :, :-1, :]).abs().sum(dim=1, keepdim=True)
+        denom_x = (mask_x * edge_x).sum().clamp_min(1e-6)
+        denom_y = (mask_y * edge_y).sum().clamp_min(1e-6)
+        loss = 0.5 * (((diff_x * mask_x * edge_x).sum() / denom_x) + ((diff_y * mask_y * edge_y).sum() / denom_y))
+        metrics["deformable_offset_smoothness"] = loss.item()
+        return loss, metrics
+
     def generator_loss(
         self,
         coarse_raw: torch.Tensor,
@@ -470,6 +662,18 @@ class InpaintingLoss(nn.Module):
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         patch_teacher_loss, patch_teacher_metrics = self._patch_teacher_loss(refined_target, attention_aux)
         candidate_rerank_loss, candidate_rerank_metrics = self._candidate_rerank_loss(
+            refined_target,
+            attention_aux,
+        )
+        deformable_slot_teacher_loss, deformable_slot_teacher_metrics = self._deformable_slot_teacher_loss(
+            refined_target,
+            attention_aux,
+        )
+        deformable_validity_loss, deformable_validity_metrics = self._deformable_validity_loss(
+            refined_target,
+            attention_aux,
+        )
+        deformable_offset_smoothness_loss, deformable_offset_smoothness_metrics = self._deformable_offset_smoothness_loss(
             refined_target,
             attention_aux,
         )
@@ -496,6 +700,9 @@ class InpaintingLoss(nn.Module):
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + self.patch_teacher_weight * patch_teacher_loss
             + self.candidate_rerank_weight * candidate_rerank_loss
+            + self.deformable_slot_teacher_weight * deformable_slot_teacher_loss
+            + self.deformable_validity_weight * deformable_validity_loss
+            + self.deformable_offset_smoothness_weight * deformable_offset_smoothness_loss
             + self.frequency_weight * frequency
             + self.perceptual_weight * perceptual
             + self.adversarial_weight * adversarial
@@ -515,6 +722,11 @@ class InpaintingLoss(nn.Module):
             "candidate_rerank_base_accuracy": candidate_rerank_metrics["candidate_rerank_base_accuracy"],
             "candidate_rerank_teacher_in_topk": candidate_rerank_metrics["candidate_rerank_teacher_in_topk"],
             "candidate_rerank_supervised_ratio": candidate_rerank_metrics["candidate_rerank_supervised_ratio"],
+            "deformable_slot_teacher": deformable_slot_teacher_metrics["deformable_slot_teacher"],
+            "deformable_slot_teacher_accuracy": deformable_slot_teacher_metrics["deformable_slot_teacher_accuracy"],
+            "deformable_slot_teacher_supervised_ratio": deformable_slot_teacher_metrics["deformable_slot_teacher_supervised_ratio"],
+            "deformable_validity": deformable_validity_metrics["deformable_validity"],
+            "deformable_offset_smoothness": deformable_offset_smoothness_metrics["deformable_offset_smoothness"],
             "frequency": frequency.item(),
             "perceptual": perceptual.item(),
             "adversarial_g": adversarial.item(),
