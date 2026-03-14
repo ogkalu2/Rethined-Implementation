@@ -22,7 +22,7 @@ model:
     transport_refine_steps: 2
     transport_offset_scale: 1.0
     transport_refine_scale: 0.25
-    transport_self_supervision_ratio: 0.125
+    transport_self_supervision_ratio: 0.05
     matching_descriptor_dim: 256
     match_coarse_rgb: true
     normalize_matching_branches: false
@@ -90,11 +90,11 @@ loss:
   patch_teacher_margin_threshold: 0.03
   transport_patch_weight: 1.0
   transport_validity_weight: 0.1
-  transport_self_patch_weight: 0.5
-  transport_self_validity_weight: 0.05
+  transport_self_patch_weight: 0.15
+  transport_self_validity_weight: 0.02
   transport_offset_smoothness_weight: 0.02
-  transport_cycle_consistency_weight: 0.1
-  transport_confidence_weight: 0.05
+  transport_cycle_consistency_weight: 0.03
+  transport_confidence_weight: 0.0
   transport_offset_edge_scale: 5.0
   frequency_weight: 0.5
   perceptual_weight: 0.15
