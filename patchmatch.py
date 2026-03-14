@@ -777,6 +777,46 @@ class PatchInpainting(nn.Module):
             align_corners=True,
         )
 
+    def _flatten_patch_map(self, patch_map: torch.Tensor) -> torch.Tensor:
+        return patch_map.flatten(start_dim=2).transpose(1, 2)
+
+    def _snap_transport_to_valid_patches(
+        self,
+        source_patch_map: torch.Tensor,
+        coords_flat: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, num_patches, _ = coords_flat.shape
+        source_patch_values = self._flatten_patch_map(source_patch_map)
+        snapped_values = source_patch_values.clone()
+        selected_indices = torch.full(
+            (batch_size, num_patches),
+            -1,
+            dtype=torch.long,
+            device=coords_flat.device,
+        )
+        base_coords_flat = self._get_normalized_token_coords(
+            token_hw,
+            dtype=coords_flat.dtype,
+            device=coords_flat.device,
+        ).flatten(start_dim=2).transpose(1, 2).expand(batch_size, -1, -1)
+
+        for batch_idx in range(batch_size):
+            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            valid_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            if query_indices.numel() == 0 or valid_indices.numel() == 0:
+                continue
+
+            query_coords = coords_flat[batch_idx, query_indices].float()
+            valid_coords = base_coords_flat[batch_idx, valid_indices].float()
+            nearest_valid = valid_indices[torch.cdist(query_coords, valid_coords).argmin(dim=1)]
+            snapped_values[batch_idx].index_copy_(0, query_indices, source_patch_values[batch_idx, nearest_valid])
+            selected_indices[batch_idx].index_copy_(0, query_indices, nearest_valid)
+
+        return snapped_values, selected_indices
+
     def _sample_transport_self_mask(
         self,
         key_valid_flat: torch.Tensor,
@@ -874,16 +914,22 @@ class PatchInpainting(nn.Module):
         base_coords = transport_state["base_coords"]
         sampled_validity = transport_state["sampled_validity"]
         confidence = transport_state["confidence"]
-
-        sampled_values = self._sample_transport_map(source_patch_map, coords)
-        sampled_values = sampled_values * sampled_validity.to(dtype=sampled_values.dtype)
+        coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
+        sampled_values_flat, selected_indices = self._snap_transport_to_valid_patches(
+            source_patch_map,
+            coords_flat,
+            query_mask_flat,
+            key_valid_flat,
+            token_hw,
+        )
         aux = {
             "copy_mode": self.copy_mode,
             "query_mask_flat": query_mask_flat,
             "key_valid_flat": key_valid_flat,
-            "transport_coords": coords.flatten(start_dim=2).transpose(1, 2),
+            "transport_coords": coords_flat,
             "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
-            "transport_values": sampled_values.flatten(start_dim=2).transpose(1, 2),
+            "transport_values": sampled_values_flat,
+            "transport_selected_indices": selected_indices,
             "transport_validity": sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1),
         }
         if confidence is not None:
@@ -899,7 +945,7 @@ class PatchInpainting(nn.Module):
             )
             cycle_back_coords = self._sample_transport_map(backward_state["coords"], coords)
             aux["transport_cycle_back_coords"] = cycle_back_coords.flatten(start_dim=2).transpose(1, 2)
-        return sampled_values, aux
+        return sampled_values_flat, aux
 
     def _build_transport_attention(
         self,
@@ -908,6 +954,7 @@ class PatchInpainting(nn.Module):
         token_hw: tuple[int, int],
         *,
         value_dtype: torch.dtype,
+        selected_indices: torch.Tensor | None = None,
         validity_flat: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size, num_patches, _ = coords_flat.shape
@@ -915,6 +962,20 @@ class PatchInpainting(nn.Module):
         dense_attn = torch.eye(num_patches, device=coords_flat.device, dtype=value_dtype)
         dense_attn = dense_attn.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
+        if selected_indices is not None:
+            for batch_idx in range(batch_size):
+                query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
+                if query_indices.numel() == 0:
+                    continue
+
+                replacement_rows = dense_attn.new_zeros((query_indices.numel(), num_patches))
+                chosen = selected_indices[batch_idx, query_indices]
+                valid_rows = chosen >= 0
+                if valid_rows.any():
+                    replacement_rows[valid_rows, chosen[valid_rows]] = 1.0
+                dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
+            return dense_attn
+
         width_scale = max(width - 1, 1)
         height_scale = max(height - 1, 1)
 
@@ -1002,8 +1063,9 @@ class PatchInpainting(nn.Module):
         sampled_values_flat = aux["transport_values"]
         sampled_validity_flat = aux["transport_validity"]
         coords_flat = aux["transport_coords"]
+        selected_indices = aux["transport_selected_indices"]
 
-        mixed = source_patch_map.flatten(start_dim=2).transpose(1, 2)
+        mixed = self._flatten_patch_map(source_patch_map)
         if default_tokens is not None:
             mixed = default_tokens.clone()
         else:
@@ -1019,6 +1081,7 @@ class PatchInpainting(nn.Module):
             query_mask_flat,
             token_hw,
             value_dtype=source_patch_map.dtype,
+            selected_indices=selected_indices,
             validity_flat=sampled_validity_flat,
         )
         return mixed, dense_attn, aux
@@ -1292,7 +1355,7 @@ class PatchInpainting(nn.Module):
             mixed_patches_flat, masked_attention, copy_aux = self.transport_patch_mix(
                 query_tokens,
                 key_tokens,
-                visible_source_patch_map,
+                source_patch_map,
                 query_mask_flat,
                 key_valid_flat,
                 patch_map.shape[-2:],
@@ -1374,7 +1437,7 @@ class PatchInpainting(nn.Module):
                         _, transport_self_aux = self._build_transport_aux(
                             query_tokens,
                             key_tokens,
-                            visible_source_patch_map,
+                            source_patch_map,
                             transport_self_mask,
                             transport_self_keys,
                             patch_map.shape[-2:],
