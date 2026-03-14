@@ -293,11 +293,6 @@ def format_train_metric_snapshot(metrics):
             f", tcy={metrics['transport_cycle_consistency']:.4f}"
             f", tcm={metrics['transport_confidence_mean']:.3f}"
         )
-    if "boundary_band_l1" in metrics:
-        summary += (
-            f", bdl1={metrics['boundary_band_l1']:.4f}"
-            f", bdg={metrics['boundary_seam_gradient']:.4f}"
-        )
     return summary
 
 
@@ -710,26 +705,6 @@ def train(cfg, args):
         if step_has_nonfinite:
             optimizer_g.zero_grad(set_to_none=True)
             optimizer_d.zero_grad(set_to_none=True)
-            last_batch_views = None
-            last_coarse = None
-            last_refined = None
-            batch_views = None
-            image = None
-            mask = None
-            masked_image = None
-            refine_target = None
-            refined_raw = None
-            attn_map = None
-            coarse_raw = None
-            attention_aux = None
-            refined_vis = None
-            coarse_vis = None
-            real_logits = None
-            fake_logits_d = None
-            d_loss = None
-            fake_logits_g = None
-            g_loss = None
-            empty_device_cache(device)
             progress_bar.write(f"Skipping non-finite step {step}")
             continue
 
@@ -798,9 +773,6 @@ def train(cfg, args):
                     metrics["transport_confidence_mean"],
                     step,
                 )
-            if "boundary_band_l1" in metrics:
-                writer.add_scalar("loss/boundary_band_l1", metrics["boundary_band_l1"], step)
-                writer.add_scalar("loss/boundary_seam_gradient", metrics["boundary_seam_gradient"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -837,8 +809,6 @@ def train(cfg, args):
                     tcr=(f"{metrics['transport_offset_curvature']:.4f}" if "transport_offset_curvature" in metrics else "n/a"),
                     tcy=(f"{metrics['transport_cycle_consistency']:.4f}" if "transport_cycle_consistency" in metrics else "n/a"),
                     tcm=(f"{metrics['transport_confidence_mean']:.3f}" if "transport_confidence_mean" in metrics else "n/a"),
-                    bdl1=(f"{metrics['boundary_band_l1']:.4f}" if "boundary_band_l1" in metrics else "n/a"),
-                    bdg=(f"{metrics['boundary_seam_gradient']:.4f}" if "boundary_seam_gradient" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,

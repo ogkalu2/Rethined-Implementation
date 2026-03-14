@@ -96,9 +96,6 @@ loss:
   transport_cycle_consistency_weight: 0.0
   transport_confidence_weight: 0.0
   transport_offset_edge_scale: 5.0
-  boundary_band_l1_weight: 0.5
-  boundary_seam_gradient_weight: 0.1
-  boundary_band_kernel_size: 7
   frequency_weight: 0.5
   perceptual_weight: 0.15
   adversarial_weight: 0.02
