@@ -294,6 +294,11 @@ def format_train_metric_snapshot(metrics):
             f", tcy={metrics['transport_cycle_consistency']:.4f}"
             f", tcm={metrics['transport_confidence_mean']:.3f}"
         )
+    if "boundary_band_l1" in metrics:
+        summary += (
+            f", bdl1={metrics['boundary_band_l1']:.4f}"
+            f", bdg={metrics['boundary_seam_gradient']:.4f}"
+        )
     return summary
 
 
@@ -775,6 +780,9 @@ def train(cfg, args):
                     metrics["transport_confidence_mean"],
                     step,
                 )
+            if "boundary_band_l1" in metrics:
+                writer.add_scalar("loss/boundary_band_l1", metrics["boundary_band_l1"], step)
+                writer.add_scalar("loss/boundary_seam_gradient", metrics["boundary_seam_gradient"], step)
             writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
@@ -812,6 +820,8 @@ def train(cfg, args):
                     tcr=(f"{metrics['transport_offset_curvature']:.4f}" if "transport_offset_curvature" in metrics else "n/a"),
                     tcy=(f"{metrics['transport_cycle_consistency']:.4f}" if "transport_cycle_consistency" in metrics else "n/a"),
                     tcm=(f"{metrics['transport_confidence_mean']:.3f}" if "transport_confidence_mean" in metrics else "n/a"),
+                    bdl1=(f"{metrics['boundary_band_l1']:.4f}" if "boundary_band_l1" in metrics else "n/a"),
+                    bdg=(f"{metrics['boundary_seam_gradient']:.4f}" if "boundary_seam_gradient" in metrics else "n/a"),
                     a1=f"{metrics['attention_top1']:.3f}",
                     ff=f"{metrics['frequency']:.4f}",
                     refresh=False,
