@@ -282,9 +282,7 @@ class PatchmatchHelpersMixin:
         rerank_entry = {
             "query_indices": query_indices,
             "candidate_key_indices": key_indices[topk_local_indices],
-            "stage1_logits": topk_stage1_logits.float(),
             "rerank_logits": rerank_logits.float(),
-            "rerank_probs": rerank_probs.float(),
         }
         return mixed_queries, rerank_probs, rerank_entry
 

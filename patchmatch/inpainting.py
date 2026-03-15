@@ -12,17 +12,37 @@ from .patch_ops import PatchOpsMixin
 
 
 class TopKReranker(nn.Module):
-    def __init__(self, token_dim: int, hidden_dim: int):
+    def __init__(self, token_dim: int, hidden_dim: int, query_chunk_size: int = 256):
         super().__init__()
-        input_dim = 4 * int(token_dim) + 3
         hidden_dim = int(hidden_dim)
+        self.query_chunk_size = max(0, int(query_chunk_size))
+        self.query_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
+        self.key_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
         self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.Linear(2 * hidden_dim + 3, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
+
+    def _forward_chunk(
+        self,
+        query_tokens: torch.Tensor,
+        candidate_tokens: torch.Tensor,
+        stage1_logits: torch.Tensor,
+        relative_coords: torch.Tensor,
+    ) -> torch.Tensor:
+        query_features = self.query_proj(query_tokens).unsqueeze(1)
+        candidate_features = self.key_proj(candidate_tokens)
+        features = torch.cat(
+            [
+                query_features * candidate_features,
+                (query_features - candidate_features).abs(),
+                stage1_logits.unsqueeze(-1),
+                relative_coords,
+            ],
+            dim=-1,
+        )
+        return self.net(features).squeeze(-1)
 
     def forward(
         self,
@@ -31,19 +51,21 @@ class TopKReranker(nn.Module):
         stage1_logits: torch.Tensor,
         relative_coords: torch.Tensor,
     ) -> torch.Tensor:
-        query_tokens = query_tokens.unsqueeze(1).expand(-1, candidate_tokens.shape[1], -1)
-        features = torch.cat(
-            [
-                query_tokens,
-                candidate_tokens,
-                (query_tokens - candidate_tokens).abs(),
-                query_tokens * candidate_tokens,
-                stage1_logits.unsqueeze(-1),
-                relative_coords,
-            ],
-            dim=-1,
-        )
-        return self.net(features).squeeze(-1)
+        if self.query_chunk_size <= 0 or query_tokens.shape[0] <= self.query_chunk_size:
+            return self._forward_chunk(query_tokens, candidate_tokens, stage1_logits, relative_coords)
+
+        outputs = []
+        for start in range(0, query_tokens.shape[0], self.query_chunk_size):
+            end = start + self.query_chunk_size
+            outputs.append(
+                self._forward_chunk(
+                    query_tokens[start:end],
+                    candidate_tokens[start:end],
+                    stage1_logits[start:end],
+                    relative_coords[start:end],
+                )
+            )
+        return torch.cat(outputs, dim=0)
 
 
 class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
@@ -65,6 +87,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         matching_hidden_dim: int | None = None,
         reranker_hidden_dim: int = 0,
         reranker_top_k: int | None = None,
+        reranker_query_chunk_size: int = 256,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
@@ -116,6 +139,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.reranker_top_k = None if reranker_top_k is None else int(reranker_top_k)
         if self.reranker_top_k is not None and self.reranker_top_k <= 0:
             self.reranker_top_k = None
+        self.reranker_query_chunk_size = max(0, int(reranker_query_chunk_size))
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
@@ -275,7 +299,11 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             attention_gumbel_hard=attention_gumbel_hard,
         )
         if self.reranker_hidden_dim > 0:
-            self.patch_reranker = TopKReranker(self.patch_token_dim, self.reranker_hidden_dim)
+            self.patch_reranker = TopKReranker(
+                self.patch_token_dim,
+                self.reranker_hidden_dim,
+                query_chunk_size=self.reranker_query_chunk_size,
+            )
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
             nn.Parameter(
