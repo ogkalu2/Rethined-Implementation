@@ -699,8 +699,11 @@ def train(cfg, args):
 
             scaler.scale(g_loss / grad_accum).backward()
 
+            attn_summary_map = attention_aux.get("attention_probs")
+            if attn_summary_map is None:
+                attn_summary_map = attn_map
             attn_metrics = model.generator.summarize_attention(
-                attn_map.detach(),
+                attn_summary_map.detach(),
                 model.generator.flatten_query_mask(mask).detach(),
             )
 
