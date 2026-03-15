@@ -121,9 +121,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         query_context_residual_init: float = 0.0,
         key_coarse_rgb_residual_init: float = 0.0,
         key_feature_residual_init: float = 0.0,
-        value_source: str = "rgb",
-        fusion_mode: str = "replace",
-        fusion_hidden_channels: int = 32,
         nheads: int,
         stem_out_stride: int = 1,
         stem_out_channels: int = 3,
@@ -196,15 +193,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             raise ValueError(
                 "query_context_channels must be positive when query_image_context_matching=True."
             )
-        self.value_source = str(value_source).lower()
-        if self.value_source not in {"rgb", "high_freq_residual"}:
-            raise ValueError("value_source must be either 'rgb' or 'high_freq_residual'.")
-        self.fusion_mode = str(fusion_mode).lower()
-        if self.fusion_mode not in {"replace", "add", "gate"}:
-            raise ValueError("fusion_mode must be one of {'replace', 'add', 'gate'}.")
-        self.fusion_hidden_channels = int(fusion_hidden_channels)
-        if self.fusion_hidden_channels <= 0:
-            raise ValueError("fusion_hidden_channels must be positive.")
         self.concat_features = bool(concat_features)
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
@@ -377,29 +365,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             if self.use_positional_encoding
             else None
         )
-        self.fusion_gate = None
-        if self.fusion_mode == "gate":
-            self.fusion_gate = nn.Sequential(
-                nn.Conv2d(
-                    10,
-                    self.fusion_hidden_channels,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                ),
-                nn.GELU(),
-                nn.Conv2d(
-                    self.fusion_hidden_channels,
-                    1,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    padding_mode="reflect",
-                ),
-            )
-            nn.init.zeros_(self.fusion_gate[-1].weight)
-            nn.init.constant_(self.fusion_gate[-1].bias, -2.0)
         self.coherence_layer = (
             nn.Conv2d(
                 3,
@@ -458,16 +423,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         coarse_token_source = coarse_composite
 
         patch_map, output_size = self.unfold_native(coarse_token_source, self.kernel_size)
-        default_patch_values = None
-        if self.value_source == "high_freq_residual":
-            value_base = known_image - self.final_gaussian_blur(known_image)
-            visible_value_base = image - self.final_gaussian_blur(image)
-        else:
-            value_base = known_image
-            visible_value_base = image
-
         source_patch_map, _ = self.extract_patches(
-            value_base,
+            known_image,
             self.value_patch_size,
             stride=self.kernel_size,
             padding=self.value_patch_padding,
@@ -605,8 +562,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             )
 
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
-        if self.value_source == "high_freq_residual":
-            default_patch_values = torch.zeros_like(patch_values)
         if self.attention_masking:
             mixed_patches_flat, masked_attention, copy_aux = self.direct_patch_mix_masked_queries(
                 query_tokens,
@@ -614,7 +569,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
-                default_tokens=default_patch_values,
                 token_hw=token_hw,
             )
         else:
@@ -635,17 +589,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             padding=self.value_patch_padding,
             use_window=self.value_patch_padding > 0,
         )
-        if self.fusion_mode == "add" or self.value_source == "high_freq_residual":
-            refined = coarse_composite + mixed_image
-        elif self.fusion_mode == "gate":
-            gate_input = torch.cat(
-                [coarse_composite, mixed_image, (coarse_composite - mixed_image).abs(), mask],
-                dim=1,
-            )
-            gate = torch.sigmoid(self.fusion_gate(gate_input))
-            refined = gate * mixed_image + (1.0 - gate) * coarse_composite
-        else:
-            refined = mixed_image
+        refined = mixed_image
 
         if self.coherence_layer is not None:
             refined = refined + self.coherence_layer(refined)
