@@ -8,8 +8,7 @@ model:
   generator:
     kernel_size: 8
     value_patch_size: 8
-    value_source: "high_freq_residual"
-    fusion_mode: "add"
+    value_source: "rgb"
     attention_temperature: 0.5
     attention_top_k: 32
     attention_selection: "gumbel"
