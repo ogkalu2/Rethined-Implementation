@@ -107,6 +107,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         reranker_top_k: int | None = None,
         reranker_query_chunk_size: int = 256,
         reranker_source_context_radius: int = 1,
+        reranker_stage1_logit_scale: float = 0.0,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
@@ -160,6 +161,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             self.reranker_top_k = None
         self.reranker_query_chunk_size = max(0, int(reranker_query_chunk_size))
         self.reranker_source_context_radius = max(0, int(reranker_source_context_radius))
+        self.reranker_stage1_logit_scale = float(reranker_stage1_logit_scale)
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)

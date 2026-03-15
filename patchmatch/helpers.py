@@ -312,15 +312,18 @@ class PatchmatchHelpersMixin:
         topk_source_context = source_context_bank[shortlisted_key_indices]
         topk_source_context_density = source_context_density_bank[shortlisted_key_indices]
 
+        reranker_stage1_logits = topk_stage1_logits.detach()
         rerank_delta = self.patch_reranker(
             query_token_bank,
             topk_key_tokens,
             topk_source_context,
-            topk_stage1_logits,
+            reranker_stage1_logits,
             relative_coords,
             topk_source_context_density,
         )
-        rerank_logits = topk_stage1_logits + rerank_delta
+        rerank_logits = rerank_delta
+        if getattr(self, "reranker_stage1_logit_scale", 0.0) != 0.0:
+            rerank_logits = rerank_logits + self.reranker_stage1_logit_scale * reranker_stage1_logits
         rerank_attn, rerank_probs = self.multihead_attention.attention_from_logits(
             rerank_logits.unsqueeze(0).unsqueeze(0),
             value_dtype=value_tokens.dtype,
