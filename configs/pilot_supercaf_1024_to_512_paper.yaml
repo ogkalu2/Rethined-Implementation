@@ -22,7 +22,7 @@ model:
     matching_hidden_dim: 384
     coarse_structure_hidden_dim: 32
     coarse_structure_descriptor_dim: 16
-    coarse_structure_logit_scale: 1.0
+    coarse_structure_logit_scale: 0.25
     reranker_hidden_dim: 0
     reranker_query_chunk_size: 256
     reranker_source_context_radius: 1
