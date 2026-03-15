@@ -101,6 +101,7 @@ class MultiHeadAttention(nn.Module):
         *,
         post_softmax_mask: torch.Tensor | None = None,
         query_mask_flat: torch.Tensor | None = None,
+        logit_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, len_q, len_k = q.size(0), q.size(1), k.size(1)
         q_proj = self.w_qs(q).view(batch_size, len_q, self.n_head, self.d_k).transpose(1, 2)
@@ -108,6 +109,10 @@ class MultiHeadAttention(nn.Module):
         attn_logits_raw = torch.matmul(q_proj / (self.d_k ** 0.5), k_proj.transpose(2, 3)).float()
         if self.attention_temperature != 1.0:
             attn_logits_raw = attn_logits_raw / self.attention_temperature
+        if logit_bias is not None:
+            if logit_bias.dim() == 3:
+                logit_bias = logit_bias.unsqueeze(1)
+            attn_logits_raw = attn_logits_raw + logit_bias.to(dtype=attn_logits_raw.dtype)
         if post_softmax_mask is not None:
             attn_logits_raw = attn_logits_raw.masked_fill(
                 post_softmax_mask == 0,
@@ -146,6 +151,7 @@ class MultiHeadAttention(nn.Module):
         post_softmax_mask: torch.Tensor | None = None,
         direct_patch_mixing: bool = False,
         query_mask_flat: torch.Tensor | None = None,
+        logit_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, len_q, len_k, len_v = q.size(0), q.size(1), k.size(1), v.size(1)
 
@@ -161,6 +167,7 @@ class MultiHeadAttention(nn.Module):
             k,
             post_softmax_mask=post_softmax_mask,
             query_mask_flat=query_mask_flat,
+            logit_bias=logit_bias,
         )
         attn, attn_probs = self.attention_from_logits(
             attn_logits,

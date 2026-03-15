@@ -155,6 +155,7 @@ class PatchmatchHelpersMixin:
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         token_hw: tuple[int, int],
+        coord_prior_params_flat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor | tuple[int, int]]]]:
         band_mask_flat = self._build_supervision_band_mask(query_mask_flat, token_hw)
         supervision_entries: list[dict[str, torch.Tensor | tuple[int, int]]] = []
@@ -173,9 +174,21 @@ class PatchmatchHelpersMixin:
                 supervision_entries.append(entry)
                 continue
 
+            coord_prior_bias = self._coordinate_prior_bias(
+                None if coord_prior_params_flat is None else coord_prior_params_flat[batch_idx, query_indices],
+                query_indices,
+                key_indices,
+                token_hw,
+                dtype=query_tokens.dtype,
+            )
             raw_logits, _ = self.multihead_attention.compute_attention_logits(
                 query_tokens[batch_idx : batch_idx + 1, query_indices],
                 key_tokens[batch_idx : batch_idx + 1, key_indices],
+                logit_bias=(
+                    None
+                    if coord_prior_bias is None
+                    else coord_prior_bias.unsqueeze(0)
+                ),
             )
             entry["raw_logits"] = raw_logits.mean(dim=1).squeeze(0)
             supervision_entries.append(entry)
@@ -197,6 +210,31 @@ class PatchmatchHelpersMixin:
         if height > 1:
             ys = ys / float(height - 1)
         return torch.stack([xs, ys], dim=-1)
+
+    def _coordinate_prior_bias(
+        self,
+        coord_prior_params: torch.Tensor | None,
+        query_indices: torch.Tensor,
+        key_indices: torch.Tensor,
+        token_hw: tuple[int, int],
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        if coord_prior_params is None or coord_prior_params.numel() == 0:
+            return None
+        if getattr(self, "coord_prior_logit_scale", 0.0) <= 0.0:
+            return None
+        if query_indices.numel() == 0 or key_indices.numel() == 0:
+            return None
+
+        query_coords = self._normalized_token_coords(query_indices, token_hw, dtype=dtype)
+        key_coords = self._normalized_token_coords(key_indices, token_hw, dtype=dtype)
+        offsets = torch.tanh(coord_prior_params[:, :2].to(dtype=dtype))
+        centers = (query_coords + offsets).clamp(0.0, 1.0)
+        scales = 0.05 + F.softplus(coord_prior_params[:, 2].to(dtype=dtype))
+        distance_sq = (centers.unsqueeze(1) - key_coords.unsqueeze(0)).pow(2).sum(dim=-1)
+        prior_bias = -0.5 * distance_sq / scales.unsqueeze(-1).pow(2).clamp_min(1e-4)
+        return float(self.coord_prior_logit_scale) * prior_bias
 
     def _active_reranker_top_k(self, num_keys: int) -> int | None:
         if getattr(self, "patch_reranker", None) is None or num_keys <= 1:
@@ -272,20 +310,45 @@ class PatchmatchHelpersMixin:
         token_hw: tuple[int, int],
         source_context_bank: torch.Tensor,
         source_context_density_bank: torch.Tensor,
+        coord_prior_params: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        raw_logits, _ = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
+        coord_prior_bias = self._coordinate_prior_bias(
+            coord_prior_params,
+            query_indices,
+            key_indices,
+            token_hw,
+            dtype=query_tokens.dtype,
+        )
+        raw_logits, _ = self.multihead_attention.compute_attention_logits(
+            query_tokens,
+            key_tokens,
+            logit_bias=(
+                None
+                if coord_prior_bias is None
+                else coord_prior_bias.unsqueeze(0)
+            ),
+        )
         stage1_logits = raw_logits.squeeze(0).squeeze(0)
         shortlist_k = self._active_reranker_top_k(stage1_logits.shape[-1])
         if shortlist_k is None:
-            mixed_queries, masked_attention = self.multihead_attention(
+            _, biased_logits = self.multihead_attention.compute_attention_logits(
                 query_tokens,
                 key_tokens,
-                value_tokens,
+                logit_bias=(
+                    None
+                    if coord_prior_bias is None
+                    else coord_prior_bias.unsqueeze(0)
+                ),
+            )
+            masked_attention, masked_probs = self.multihead_attention.attention_from_logits(
+                biased_logits,
+                value_dtype=value_tokens.dtype,
                 direct_patch_mixing=True,
             )
+            mixed_queries = torch.matmul(masked_attention.squeeze(0).squeeze(0), value_tokens.squeeze(0))
             return (
-                mixed_queries.squeeze(0),
-                masked_attention.squeeze(0).squeeze(0),
+                mixed_queries,
+                masked_probs.squeeze(0).squeeze(0),
                 {},
             )
 
@@ -352,6 +415,7 @@ class PatchmatchHelpersMixin:
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
         token_hw: tuple[int, int] | None = None,
+        coord_prior_params_flat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]] | None]:
         batch_size, num_patches, _ = query_tokens_full.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
@@ -400,6 +464,11 @@ class PatchmatchHelpersMixin:
                         key_valid_flat[batch_idx].to(dtype=query_tokens_full.dtype)
                         if source_context_density_bank is None
                         else source_context_density_bank
+                    ),
+                    coord_prior_params=(
+                        None
+                        if coord_prior_params_flat is None
+                        else coord_prior_params_flat[batch_idx, query_indices]
                     ),
                 )
                 mixed_queries = mixed_queries.to(dtype=mixed.dtype)

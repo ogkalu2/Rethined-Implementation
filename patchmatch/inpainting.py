@@ -103,6 +103,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
+        coord_prior_hidden_dim: int = 0,
+        coord_prior_logit_scale: float = 0.0,
         reranker_hidden_dim: int = 0,
         reranker_top_k: int | None = None,
         reranker_query_chunk_size: int = 256,
@@ -155,6 +157,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_hidden_dim = None if matching_hidden_dim is None else int(matching_hidden_dim)
         if self.matching_hidden_dim is not None and self.matching_hidden_dim <= 0:
             self.matching_hidden_dim = None
+        self.coord_prior_hidden_dim = max(0, int(coord_prior_hidden_dim))
+        self.coord_prior_logit_scale = float(coord_prior_logit_scale)
         self.reranker_hidden_dim = max(0, int(reranker_hidden_dim))
         self.reranker_top_k = None if reranker_top_k is None else int(reranker_top_k)
         if self.reranker_top_k is not None and self.reranker_top_k <= 0:
@@ -213,6 +217,13 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
+        self.coord_prior_input_dim = 0
+        if self.match_coarse_rgb:
+            self.coord_prior_input_dim += self.query_patch_dim
+        if self.concat_features:
+            self.coord_prior_input_dim += self.feature_dim
+        if self.coord_prior_logit_scale > 0.0 and self.coord_prior_input_dim == 0:
+            raise ValueError("Coordinate prior requires coarse RGB patches, coarse features, or both.")
         self.matching_input_dim = 0
         if self.match_coarse_rgb:
             self.matching_input_dim += self.query_patch_dim
@@ -270,6 +281,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_descriptor_head = None
         self.key_descriptor_head = None
         self.matching_descriptor_head = None
+        self.coord_prior_head = None
         self.patch_reranker = None
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
@@ -308,6 +320,15 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 self.patch_token_dim,
             )
             self.query_context_scale = nn.Parameter(torch.tensor(self.query_context_residual_init))
+        if self.coord_prior_logit_scale > 0.0:
+            prior_hidden_dim = max(32, self.coord_prior_hidden_dim)
+            self.coord_prior_head = nn.Sequential(
+                nn.Conv2d(self.coord_prior_input_dim, prior_hidden_dim, kernel_size=1, stride=1, bias=False),
+                nn.GELU(),
+                nn.Conv2d(prior_hidden_dim, 3, kernel_size=1, stride=1),
+            )
+            nn.init.zeros_(self.coord_prior_head[-1].weight)
+            nn.init.zeros_(self.coord_prior_head[-1].bias)
         self.multihead_attention = MultiHeadAttention(
             embed_dim=self.patch_token_dim,
             d_v=self.value_patch_dim,
@@ -438,6 +459,38 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             padding=self.value_patch_padding,
         )
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
+        coarse_match_map = None
+        if self.match_coarse_rgb:
+            coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
+            coarse_match_map = self._prepare_matching_branch(
+                coarse_match_map,
+                drop_prob=self.coarse_rgb_branch_dropout,
+            )
+        coarse_features = None
+        if self.concat_features:
+            coarse_features = F.interpolate(
+                features[self.feature_i],
+                size=patch_map.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            coarse_features = self._prepare_matching_branch(
+                coarse_features,
+                drop_prob=0.0,
+            )
+        coord_prior_params_flat = None
+        if self.coord_prior_head is not None:
+            coord_prior_inputs = []
+            if coarse_match_map is not None:
+                coord_prior_inputs.append(coarse_match_map)
+            if coarse_features is not None:
+                coord_prior_inputs.append(coarse_features)
+            coord_prior_input_map = (
+                coord_prior_inputs[0]
+                if len(coord_prior_inputs) == 1
+                else torch.cat(coord_prior_inputs, dim=1)
+            )
+            coord_prior_params_flat = self.coord_prior_head(coord_prior_input_map).flatten(start_dim=2).transpose(1, 2)
 
         query_matching_tokens = None
         key_matching_tokens = None
@@ -454,23 +507,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
             query_token_inputs = [query_context_map, visible_patch_map]
             if self.match_coarse_rgb:
-                coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
-                coarse_match_map = self._prepare_matching_branch(
-                    coarse_match_map,
-                    drop_prob=self.coarse_rgb_branch_dropout,
-                )
                 query_token_inputs.append(coarse_match_map)
             if self.concat_features:
-                coarse_features = F.interpolate(
-                    features[self.feature_i],
-                    size=patch_map.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                coarse_features = self._prepare_matching_branch(
-                    coarse_features,
-                    drop_prob=0.0,
-                )
                 query_token_inputs.append(coarse_features)
 
             key_token_inputs = [key_context_map, visible_patch_map]
@@ -493,23 +531,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         else:
             token_inputs = []
             if self.match_coarse_rgb:
-                coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
-                coarse_match_map = self._prepare_matching_branch(
-                    coarse_match_map,
-                    drop_prob=self.coarse_rgb_branch_dropout,
-                )
                 token_inputs.append(coarse_match_map)
             if self.concat_features:
-                coarse_features = F.interpolate(
-                    features[self.feature_i],
-                    size=patch_map.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                coarse_features = self._prepare_matching_branch(
-                    coarse_features,
-                    drop_prob=0.0,
-                )
                 token_inputs.append(coarse_features)
 
             token_map = token_inputs[0] if len(token_inputs) == 1 else torch.cat(token_inputs, dim=1)
@@ -549,6 +572,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 query_mask_flat,
                 key_valid_flat,
                 token_hw,
+                coord_prior_params_flat=coord_prior_params_flat,
             )
 
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
@@ -563,6 +587,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 key_valid_flat,
                 default_tokens=default_patch_values,
                 token_hw=token_hw,
+                coord_prior_params_flat=coord_prior_params_flat,
             )
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(
@@ -612,6 +637,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "matching_tokens": query_matching_tokens,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
+                "coord_prior_params": coord_prior_params_flat,
                 "copy_aux": copy_aux,
             }
             return refined, masked_attention, coarse_raw, aux
