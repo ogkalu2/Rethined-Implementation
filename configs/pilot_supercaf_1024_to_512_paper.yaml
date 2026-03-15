@@ -19,8 +19,6 @@ model:
     attention_gumbel_hard_start_step: 1800
     matching_descriptor_dim: 256
     matching_hidden_dim: 384
-    coarse_query_modulation_hidden_dim: 64
-    coarse_query_modulation_strength: 0.1
     reranker_hidden_dim: 0
     reranker_query_chunk_size: 256
     reranker_source_context_radius: 1
