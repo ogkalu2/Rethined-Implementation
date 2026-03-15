@@ -272,7 +272,7 @@ class PatchmatchHelpersMixin:
         token_hw: tuple[int, int],
         source_context_bank: torch.Tensor,
         source_context_density_bank: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         raw_logits, attn_logits = self.multihead_attention.compute_attention_logits(
             query_tokens,
             key_tokens,
@@ -288,7 +288,6 @@ class PatchmatchHelpersMixin:
             mixed_queries = torch.matmul(masked_attention.squeeze(0).squeeze(0), value_tokens.squeeze(0))
             return (
                 mixed_queries,
-                masked_attention.squeeze(0).squeeze(0),
                 masked_probs.squeeze(0).squeeze(0),
                 {},
             )
@@ -345,7 +344,7 @@ class PatchmatchHelpersMixin:
             "candidate_key_indices": shortlisted_key_indices,
             "rerank_logits": rerank_logits.float(),
         }
-        return mixed_queries, rerank_attn, rerank_probs, rerank_entry
+        return mixed_queries, rerank_probs, rerank_entry
 
     def direct_patch_mix_masked_queries(
         self,
@@ -356,17 +355,11 @@ class PatchmatchHelpersMixin:
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
         token_hw: tuple[int, int] | None = None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        list[dict[str, torch.Tensor]] | None,
-        torch.Tensor,
-    ]:
+    ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]] | None]:
         batch_size, num_patches, _ = query_tokens_full.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
         eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
         dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
-        dense_attn_probs = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
         valid_keys = key_valid_flat > 0.5
         reranker_entries: list[dict[str, torch.Tensor]] | None = (
@@ -382,7 +375,6 @@ class PatchmatchHelpersMixin:
 
             key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
             replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
-            replacement_prob_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
             if key_indices.numel() > 0:
                 query_tokens = query_tokens_full[batch_idx : batch_idx + 1, query_indices]
                 key_tokens = key_tokens_full[batch_idx : batch_idx + 1, key_indices]
@@ -395,7 +387,7 @@ class PatchmatchHelpersMixin:
                         key_valid_flat[batch_idx],
                         token_hw if token_hw is not None else (1, num_patches),
                     )
-                mixed_queries, masked_attention, masked_probs, rerank_entry = self._rerank_masked_shortlist(
+                mixed_queries, masked_attention, rerank_entry = self._rerank_masked_shortlist(
                     query_tokens,
                     key_tokens,
                     value_tokens,
@@ -415,14 +407,11 @@ class PatchmatchHelpersMixin:
                 )
                 mixed_queries = mixed_queries.to(dtype=mixed.dtype)
                 masked_attention = masked_attention.to(dtype=replacement_rows.dtype)
-                masked_probs = masked_probs.to(dtype=replacement_prob_rows.dtype)
                 if rerank_entry:
                     candidate_key_indices = rerank_entry["candidate_key_indices"]
                     replacement_rows.scatter_(1, candidate_key_indices, masked_attention)
-                    replacement_prob_rows.scatter_(1, candidate_key_indices, masked_probs)
                 else:
                     replacement_rows[:, key_indices] = masked_attention
-                    replacement_prob_rows[:, key_indices] = masked_probs
                 mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
                 if reranker_entries is not None:
                     reranker_entries.append(rerank_entry)
@@ -430,9 +419,8 @@ class PatchmatchHelpersMixin:
                 reranker_entries.append({})
 
             dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
-            dense_attn_probs[batch_idx, 0].index_copy_(0, query_indices, replacement_prob_rows)
 
-        return mixed, dense_attn, reranker_entries, dense_attn_probs
+        return mixed, dense_attn, reranker_entries
 
     def build_paper_attention_mask(
         self,

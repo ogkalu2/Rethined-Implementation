@@ -32,7 +32,6 @@ model:
     query_image_context_matching: false
     separate_query_key_matching: true
     shared_query_key_descriptor: false
-    query_use_visible_rgb: false
     query_context_channels: 48
     query_context_residual_init: 0.0
     key_context_channels: 48
@@ -50,7 +49,7 @@ model:
     concat_features: true
     concat_features_on_key: false
     detach_coarse_rgb: false
-    fusion_mode: "replace"
+    fusion_mode: "gate"
     final_conv: true
     attention_masking: true
     supervision_band_radius: 1

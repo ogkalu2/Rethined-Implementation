@@ -130,19 +130,14 @@ class MultiHeadAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         attn_probs = self._normalize_attention_logits(attn_logits).to(value_dtype)
         attn = attn_probs
-        if direct_patch_mixing:
-            hard_attn = self._hard_attention_from_logits(attn_logits).to(value_dtype)
-            if self.training:
-                needs_straight_through_hardening = (
-                    self.attention_selection == "softmax"
-                    or (self.attention_selection == "gumbel" and not self.attention_gumbel_hard)
-                )
-                if needs_straight_through_hardening:
-                    attn = hard_attn - attn_probs.detach() + attn_probs
-                else:
-                    attn = hard_attn
-            else:
-                attn = hard_attn
+        if direct_patch_mixing and self.training:
+            needs_straight_through_hardening = (
+                self.attention_selection == "softmax"
+                or (self.attention_selection == "gumbel" and not self.attention_gumbel_hard)
+            )
+            if needs_straight_through_hardening:
+                hard_attn = self._hard_attention_from_logits(attn_logits).to(value_dtype)
+                attn = hard_attn - attn_probs.detach() + attn_probs
         if not direct_patch_mixing:
             attn = self.dropout(attn)
         return attn, attn_probs
@@ -184,4 +179,4 @@ class MultiHeadAttention(nn.Module):
         output = mixed.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
         if not direct_patch_mixing:
             output = self.fc(output)
-        return output, (attn if direct_patch_mixing else attn_probs)
+        return output, attn_probs

@@ -117,7 +117,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         query_image_context_matching: bool = False,
         separate_query_key_matching: bool = False,
         shared_query_key_descriptor: bool = False,
-        query_use_visible_rgb: bool = True,
         query_context_channels: int = 32,
         key_context_channels: int = 32,
         query_context_residual_init: float = 0.0,
@@ -176,7 +175,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_image_context_matching = bool(query_image_context_matching)
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
-        self.query_use_visible_rgb = bool(query_use_visible_rgb)
         self.query_context_channels = int(query_context_channels)
         self.key_context_channels = int(key_context_channels)
         self.query_context_residual_init = float(query_context_residual_init)
@@ -242,9 +240,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_matching_input_dim = self.matching_input_dim
         self.key_matching_input_dim = self.matching_input_dim
         if self.separate_query_key_matching:
-            self.query_matching_input_dim = self.query_context_channels
-            if self.query_use_visible_rgb:
-                self.query_matching_input_dim += self.query_patch_dim
+            self.query_matching_input_dim = self.query_patch_dim + self.query_context_channels
             if self.match_coarse_rgb:
                 self.query_matching_input_dim += self.query_patch_dim
             if self.concat_features:
@@ -524,9 +520,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 patch_map.shape[-2:],
             )
 
-            query_token_inputs = [query_context_map]
-            if self.query_use_visible_rgb:
-                query_token_inputs.append(visible_patch_map)
+            query_token_inputs = [query_context_map, visible_patch_map]
             if self.match_coarse_rgb:
                 query_token_inputs.append(coarse_match_map)
             if self.concat_features:
@@ -618,7 +612,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
         if self.attention_masking:
-            mixed_patches_flat, masked_attention, copy_aux, attention_probs = self.direct_patch_mix_masked_queries(
+            mixed_patches_flat, masked_attention, copy_aux = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
                 patch_values,
@@ -636,7 +630,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 query_mask_flat=query_mask_flat,
             )
             copy_aux = None
-            attention_probs = None
 
         mixed_image = self.fold_native(
             mixed_patches_flat,
@@ -674,7 +667,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "supervision_band_mask_flat": supervision_band_mask_flat,
                 "attention_supervision_entries": attention_supervision_entries,
                 "copy_aux": copy_aux,
-                "attention_probs": attention_probs,
             }
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw
