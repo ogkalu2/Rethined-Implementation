@@ -104,6 +104,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
         coarse_structure_hidden_dim: int = 0,
+        coarse_structure_descriptor_dim: int = 64,
         coarse_structure_logit_scale: float = 0.0,
         reranker_hidden_dim: int = 0,
         reranker_top_k: int | None = None,
@@ -158,6 +159,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.matching_hidden_dim is not None and self.matching_hidden_dim <= 0:
             self.matching_hidden_dim = None
         self.coarse_structure_hidden_dim = max(0, int(coarse_structure_hidden_dim))
+        self.coarse_structure_descriptor_dim = max(1, int(coarse_structure_descriptor_dim))
         self.coarse_structure_logit_scale = float(coarse_structure_logit_scale)
         self.reranker_hidden_dim = max(0, int(reranker_hidden_dim))
         self.reranker_top_k = None if reranker_top_k is None else int(reranker_top_k)
@@ -327,19 +329,19 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             self.query_context_scale = nn.Parameter(torch.tensor(self.query_context_residual_init))
         if self.coarse_structure_logit_scale > 0.0:
             structure_hidden_dim = (
-                self.matching_hidden_dim
+                self.coarse_structure_descriptor_dim
                 if self.coarse_structure_hidden_dim <= 0
                 else self.coarse_structure_hidden_dim
             )
             self.coarse_query_structure_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.coarse_structure_query_descriptor_head = self._build_matching_descriptor_head(
                 self.coarse_structure_query_input_dim,
-                self.patch_token_dim,
+                self.coarse_structure_descriptor_dim,
                 hidden_dim=structure_hidden_dim,
             )
             self.coarse_structure_key_descriptor_head = self._build_matching_descriptor_head(
                 self.coarse_structure_key_input_dim,
-                self.patch_token_dim,
+                self.coarse_structure_descriptor_dim,
                 hidden_dim=structure_hidden_dim,
             )
         self.multihead_attention = MultiHeadAttention(
@@ -659,11 +661,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "token_hw": token_hw,
                 "supervision_band_mask_flat": supervision_band_mask_flat,
                 "attention_supervision_entries": attention_supervision_entries,
-                "matching_tokens": query_matching_tokens,
-                "query_matching_tokens": query_matching_tokens,
-                "key_matching_tokens": key_matching_tokens,
-                "query_structure_tokens": query_structure_tokens,
-                "key_structure_tokens": key_structure_tokens,
                 "copy_aux": copy_aux,
             }
             return refined, masked_attention, coarse_raw, aux
