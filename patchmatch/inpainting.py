@@ -111,7 +111,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         reranker_source_context_radius: int = 1,
         reranker_stage1_logit_scale: float = 0.0,
         match_coarse_rgb: bool = True,
-        match_coarse_rgb_on_key: bool = True,
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
         query_image_context_matching: bool = False,
@@ -135,7 +134,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         feature_i: int = 2,
         feature_dim: int = 128,
         concat_features: bool = True,
-        concat_features_on_key: bool = True,
         attention_masking: bool = True,
         final_conv: bool = False,
         positional_grid_size: int = 32,
@@ -169,7 +167,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.reranker_source_context_radius = max(0, int(reranker_source_context_radius))
         self.reranker_stage1_logit_scale = float(reranker_stage1_logit_scale)
         self.match_coarse_rgb = bool(match_coarse_rgb)
-        self.match_coarse_rgb_on_key = bool(match_coarse_rgb_on_key)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
         self.query_image_context_matching = bool(query_image_context_matching)
@@ -209,7 +206,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.fusion_hidden_channels <= 0:
             raise ValueError("fusion_hidden_channels must be positive.")
         self.concat_features = bool(concat_features)
-        self.concat_features_on_key = bool(concat_features_on_key)
         self.attention_masking = bool(attention_masking)
         self.final_conv = bool(final_conv)
         self.image_size = int(image_size)
@@ -246,9 +242,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             if self.concat_features:
                 self.query_matching_input_dim += self.feature_dim
             self.key_matching_input_dim = self.query_patch_dim + self.key_context_channels
-            if self.match_coarse_rgb and self.match_coarse_rgb_on_key:
+            if self.match_coarse_rgb:
                 self.key_matching_input_dim += self.query_patch_dim
-            if self.concat_features and self.concat_features_on_key:
+            if self.concat_features:
                 self.key_matching_input_dim += self.feature_dim
         self.patch_token_dim = (
             max(self.query_matching_input_dim, self.key_matching_input_dim)
@@ -292,9 +288,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
-            if self.match_coarse_rgb and self.match_coarse_rgb_on_key:
+            if self.match_coarse_rgb:
                 self.key_coarse_rgb_scale = nn.Parameter(torch.tensor(self.key_coarse_rgb_residual_init))
-            if self.concat_features and self.concat_features_on_key:
+            if self.concat_features:
                 self.key_feature_scale = nn.Parameter(torch.tensor(self.key_feature_residual_init))
             if self.shared_query_key_descriptor:
                 self.shared_query_key_descriptor_head = self._build_matching_descriptor_head(
@@ -527,9 +523,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 query_token_inputs.append(coarse_features)
 
             key_token_inputs = [key_context_map, visible_patch_map]
-            if self.match_coarse_rgb and self.match_coarse_rgb_on_key:
+            if self.match_coarse_rgb:
                 key_token_inputs.append(self.key_coarse_rgb_scale * coarse_match_map)
-            if self.concat_features and self.concat_features_on_key:
+            if self.concat_features:
                 key_token_inputs.append(self.key_feature_scale * coarse_features)
             query_token_map = torch.cat(query_token_inputs, dim=1)
             key_token_map = torch.cat(key_token_inputs, dim=1)
