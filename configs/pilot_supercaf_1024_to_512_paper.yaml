@@ -27,6 +27,7 @@ model:
     reranker_source_context_radius: 1
     reranker_stage1_logit_scale: 0.0
     match_coarse_rgb: true
+    match_coarse_rgb_on_key: false
     coarse_rgb_branch_dropout: 0
     query_image_context_matching: false
     separate_query_key_matching: true
@@ -34,8 +35,8 @@ model:
     query_context_channels: 48
     query_context_residual_init: 0.0
     key_context_channels: 48
-    key_coarse_rgb_residual_init: 0.25
-    key_feature_residual_init: 0.25
+    key_coarse_rgb_residual_init: 0.0
+    key_feature_residual_init: 0.0
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
@@ -46,7 +47,9 @@ model:
     feature_i: 3
     feature_dim: null
     concat_features: true
+    concat_features_on_key: false
     detach_coarse_rgb: false
+    fusion_mode: "gate"
     final_conv: true
     attention_masking: true
     supervision_band_radius: 1
