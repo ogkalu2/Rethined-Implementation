@@ -66,6 +66,7 @@ training:
   total_steps: 3000
   grad_accum_steps: 4
   lr: 0.001
+  matcher_lr_scale: 2.5
   discriminator_lr: 0.00002
   warmup_steps: 200
   min_lr: 0.000001
@@ -90,15 +91,8 @@ loss:
   boundary_identity_weight: 0.25
   coordinate_loss_weight: 0.2
   coherence_loss_weight: 0.1
-  loss_schedule_focus_steps: 1800
-  loss_schedule_transition_steps: 600
-  retrieval_loss_weight_start: 2.0
-  boundary_identity_weight_start: 1.0
-  coordinate_loss_weight_start: 0.5
-  coherence_loss_weight_start: 0.25
-  frequency_weight_start: 0.05
-  perceptual_weight_start: 0.02
-  adversarial_weight_start: 0.0
+  loss_schedule_focus_steps: 0
+  loss_schedule_transition_steps: 0
   frequency_weight: 0.5
   perceptual_weight: 0.15
   adversarial_weight: 0.02

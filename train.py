@@ -93,6 +93,86 @@ def build_model_config(cfg):
     }
 
 
+def _collect_matcher_parameters(model: InpaintingModel) -> tuple[list[torch.nn.Parameter], set[int]]:
+    generator = model.generator
+    matcher_params: list[torch.nn.Parameter] = []
+    matcher_param_ids: set[int] = set()
+
+    def add_param(param: torch.nn.Parameter | None):
+        if param is None or (not param.requires_grad) or id(param) in matcher_param_ids:
+            return
+        matcher_params.append(param)
+        matcher_param_ids.add(id(param))
+
+    matcher_module_names = (
+        "query_context_encoder",
+        "key_context_encoder",
+        "query_context_descriptor_head",
+        "shared_query_key_descriptor_head",
+        "query_descriptor_head",
+        "key_descriptor_head",
+        "matching_descriptor_head",
+        "patch_reranker",
+        "pre_attention_norm",
+        "multihead_attention",
+    )
+    for module_name in matcher_module_names:
+        module = getattr(generator, module_name, None)
+        if module is None:
+            continue
+        for param in module.parameters():
+            add_param(param)
+
+    for param_name in (
+        "positionalencoding",
+        "key_coarse_rgb_scale",
+        "key_feature_scale",
+        "query_context_scale",
+    ):
+        param = getattr(generator, param_name, None)
+        if isinstance(param, torch.nn.Parameter):
+            add_param(param)
+
+    return matcher_params, matcher_param_ids
+
+
+def build_generator_optimizer(
+    model: InpaintingModel,
+    *,
+    base_lr: float,
+    betas: tuple[float, float],
+    matcher_lr_scale: float = 1.0,
+) -> tuple[torch.optim.Optimizer, bool]:
+    matcher_lr_scale = float(matcher_lr_scale)
+    matcher_params, matcher_param_ids = _collect_matcher_parameters(model)
+    base_params = [
+        param
+        for param in model.parameters()
+        if param.requires_grad and id(param) not in matcher_param_ids
+    ]
+    param_groups: list[dict[str, object]] = []
+    if base_params:
+        param_groups.append(
+            {
+                "params": base_params,
+                "lr": base_lr,
+                "lr_scale": 1.0,
+                "group_name": "base",
+            }
+        )
+    if matcher_params:
+        param_groups.append(
+            {
+                "params": matcher_params,
+                "lr": base_lr * matcher_lr_scale,
+                "lr_scale": matcher_lr_scale,
+                "group_name": "matcher",
+            }
+        )
+    optimizer = torch.optim.Adam(param_groups, lr=base_lr, betas=betas)
+    return optimizer, bool(matcher_params)
+
+
 def get_lr(step, warmup_steps, total_steps, max_lr, min_lr):
     if step < warmup_steps:
         return max_lr * step / max(warmup_steps, 1)
@@ -545,16 +625,19 @@ def train(cfg, args):
     discriminator = PatchDiscriminator(**cfg["discriminator"]).to(device)
     loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
     criterion = InpaintingLoss(**loss_cfg).to(device)
+    optimizer_betas = tuple(cfg["training"].get("betas", [0.9, 0.999]))
+    matcher_lr_scale = float(cfg["training"].get("matcher_lr_scale", 1.0))
 
-    optimizer_g = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg["training"]["lr"],
-        betas=tuple(cfg["training"].get("betas", [0.9, 0.999])),
+    optimizer_g, has_matcher_group = build_generator_optimizer(
+        model,
+        base_lr=cfg["training"]["lr"],
+        betas=optimizer_betas,
+        matcher_lr_scale=matcher_lr_scale,
     )
     optimizer_d = torch.optim.Adam(
         discriminator.parameters(),
         lr=cfg["training"].get("discriminator_lr", cfg["training"]["lr"]),
-        betas=tuple(cfg["training"].get("betas", [0.9, 0.999])),
+        betas=optimizer_betas,
     )
 
     use_amp = is_amp_enabled(device, cfg["training"]["mixed_precision"])
@@ -581,6 +664,8 @@ def train(cfg, args):
     print(f"Generator parameters: {sum(p.numel() for p in model.parameters()):,}")
     print(f"Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
     print(f"Effective batch size: {cfg['data']['batch_size'] * grad_accum}")
+    if has_matcher_group:
+        print(f"Matcher/reranker LR scale: {matcher_lr_scale:.2f}x")
 
     log_dir = Path(log_cfg["log_dir"])
     ckpt_dir = log_dir / "checkpoints"
@@ -617,6 +702,7 @@ def train(cfg, args):
     last_coarse = None
     last_refined = None
     metrics = {}
+    matcher_group_lr = cfg["training"]["lr"] * matcher_lr_scale
 
     progress_bar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
     for step_idx in progress_bar:
@@ -632,7 +718,9 @@ def train(cfg, args):
             cfg["training"].get("discriminator_min_lr", min_lr),
         )
         for pg in optimizer_g.param_groups:
-            pg["lr"] = lr_g
+            pg["lr"] = lr_g * float(pg.get("lr_scale", 1.0))
+            if pg.get("group_name") == "matcher":
+                matcher_group_lr = pg["lr"]
         for pg in optimizer_d.param_groups:
             pg["lr"] = lr_d
 
@@ -797,6 +885,8 @@ def train(cfg, args):
             if "weight/adversarial" in metrics:
                 writer.add_scalar("loss_weight/adversarial", metrics["weight/adversarial"], step)
             writer.add_scalar("lr/generator", lr_g, step)
+            if has_matcher_group:
+                writer.add_scalar("lr/generator_matcher", matcher_group_lr, step)
             writer.add_scalar("lr/discriminator", lr_d, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
             if peak_memory_gb is not None:
