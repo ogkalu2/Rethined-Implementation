@@ -764,6 +764,12 @@ def train(cfg, args):
             masked_image = batch_views["masked_image"]
             refine_target = batch_views["refine_target"]
             use_gradient_routing = route_image_losses_away_from_matcher and has_matcher_group
+            cpu_rng_state = None
+            cuda_rng_state = None
+            if use_gradient_routing:
+                cpu_rng_state = torch.get_rng_state()
+                if device.type == "cuda":
+                    cuda_rng_state = torch.cuda.get_rng_state_all()
 
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
                 refined_raw, attn_map, coarse_raw, attention_aux = model(
@@ -818,24 +824,47 @@ def train(cfg, args):
                     + g_components["coordinate"]
                     + g_components["coherence"]
                 )
-                base_loss = (
-                    g_components["coarse_l2"]
-                    + g_components["coarse_blur_l1"]
-                    + g_components["coarse_gradient"]
-                    + g_components["coarse_perceptual"]
-                    + g_components["refined_l1"]
-                    + g_components["refined_query_patch_l1"]
-                    + g_components["frequency"]
-                    + g_components["perceptual"]
-                    + g_components["adversarial"]
-                )
-                if generator_matcher_params:
-                    scaler.scale(matcher_loss / grad_accum).backward(
-                        inputs=generator_matcher_params,
-                        retain_graph=bool(generator_base_params),
-                    )
+                scaler.scale(matcher_loss / grad_accum).backward()
                 if generator_base_params:
-                    scaler.scale(base_loss / grad_accum).backward(inputs=generator_base_params)
+                    set_parameter_requires_grad(generator_matcher_params, False)
+                    try:
+                        if cpu_rng_state is not None:
+                            torch.set_rng_state(cpu_rng_state)
+                        if cuda_rng_state is not None:
+                            torch.cuda.set_rng_state_all(cuda_rng_state)
+                        with torch.amp.autocast(amp_device_type, enabled=use_amp):
+                            refined_raw_base, _, coarse_raw_base, attention_aux_base = model(
+                                masked_image,
+                                mask,
+                                value_image=refine_target,
+                                return_aux=True,
+                            )
+                            refined_vis_base = refined_raw_base.clamp(0, 1)
+                            fake_logits_g_base = discriminator(refined_vis_base)
+                            _, _, g_components_base = criterion.generator_loss(
+                                coarse_raw_base,
+                                refined_raw_base,
+                                image,
+                                refine_target,
+                                mask,
+                                fake_logits_g_base,
+                                attention_aux=attention_aux_base,
+                                return_components=True,
+                            )
+                            base_loss = (
+                                g_components_base["coarse_l2"]
+                                + g_components_base["coarse_blur_l1"]
+                                + g_components_base["coarse_gradient"]
+                                + g_components_base["coarse_perceptual"]
+                                + g_components_base["refined_l1"]
+                                + g_components_base["refined_query_patch_l1"]
+                                + g_components_base["frequency"]
+                                + g_components_base["perceptual"]
+                                + g_components_base["adversarial"]
+                            )
+                        scaler.scale(base_loss / grad_accum).backward()
+                    finally:
+                        set_parameter_requires_grad(generator_matcher_params, True)
             else:
                 scaler.scale(g_loss / grad_accum).backward()
 
