@@ -20,6 +20,7 @@ model:
     attention_gumbel_hard_start_step: 1800
     matching_descriptor_dim: 256
     matching_hidden_dim: 384
+    reranker_hidden_dim: 128
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
     query_image_context_matching: false
@@ -80,6 +81,7 @@ loss:
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 1.0
+  reranker_loss_weight: 1.0
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.07
   boundary_identity_weight: 0.25

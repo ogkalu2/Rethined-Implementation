@@ -11,6 +11,41 @@ from .helpers import PatchmatchHelpersMixin
 from .patch_ops import PatchOpsMixin
 
 
+class TopKReranker(nn.Module):
+    def __init__(self, token_dim: int, hidden_dim: int):
+        super().__init__()
+        input_dim = 4 * int(token_dim) + 3
+        hidden_dim = int(hidden_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(
+        self,
+        query_tokens: torch.Tensor,
+        candidate_tokens: torch.Tensor,
+        stage1_logits: torch.Tensor,
+        relative_coords: torch.Tensor,
+    ) -> torch.Tensor:
+        query_tokens = query_tokens.unsqueeze(1).expand(-1, candidate_tokens.shape[1], -1)
+        features = torch.cat(
+            [
+                query_tokens,
+                candidate_tokens,
+                (query_tokens - candidate_tokens).abs(),
+                query_tokens * candidate_tokens,
+                stage1_logits.unsqueeze(-1),
+                relative_coords,
+            ],
+            dim=-1,
+        )
+        return self.net(features).squeeze(-1)
+
+
 class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
     def __init__(
         self,
@@ -28,6 +63,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
+        reranker_hidden_dim: int = 0,
+        reranker_top_k: int | None = None,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
@@ -75,6 +112,10 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_hidden_dim = None if matching_hidden_dim is None else int(matching_hidden_dim)
         if self.matching_hidden_dim is not None and self.matching_hidden_dim <= 0:
             self.matching_hidden_dim = None
+        self.reranker_hidden_dim = max(0, int(reranker_hidden_dim))
+        self.reranker_top_k = None if reranker_top_k is None else int(reranker_top_k)
+        if self.reranker_top_k is not None and self.reranker_top_k <= 0:
+            self.reranker_top_k = None
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
@@ -183,6 +224,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_descriptor_head = None
         self.key_descriptor_head = None
         self.matching_descriptor_head = None
+        self.patch_reranker = None
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
@@ -232,6 +274,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
         )
+        if self.reranker_hidden_dim > 0:
+            self.patch_reranker = TopKReranker(self.patch_token_dim, self.reranker_hidden_dim)
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
             nn.Parameter(
@@ -461,15 +505,15 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.value_source == "high_freq_residual":
             default_patch_values = torch.zeros_like(patch_values)
         if self.attention_masking:
-            mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
+            mixed_patches_flat, masked_attention, copy_aux = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
                 default_tokens=default_patch_values,
+                token_hw=token_hw,
             )
-            copy_aux = None
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(
                 query_tokens,
@@ -518,6 +562,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "matching_tokens": query_matching_tokens,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
+                "copy_aux": copy_aux,
             }
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw

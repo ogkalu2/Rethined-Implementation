@@ -292,6 +292,10 @@ def format_train_metric_snapshot(metrics):
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
     if "retrieval_recall1" in metrics:
         summary += f", r1={metrics['retrieval_recall1']:.3f}"
+    if "reranker_recall1" in metrics:
+        summary += f", rr1={metrics['reranker_recall1']:.3f}"
+    if "reranker_shortlist_acc" in metrics:
+        summary += f", rsa={metrics['reranker_shortlist_acc']:.3f}"
     if "retrieval_recall8" in metrics:
         summary += f", r8={metrics['retrieval_recall8']:.3f}"
     if "retrieval_recall32" in metrics:
@@ -743,6 +747,8 @@ def train(cfg, args):
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
             if "retrieval_loss" in metrics:
                 writer.add_scalar("loss/retrieval", metrics["retrieval_loss"], step)
+            if "reranker_loss" in metrics:
+                writer.add_scalar("loss/reranker", metrics["reranker_loss"], step)
             if "boundary_identity_loss" in metrics:
                 writer.add_scalar("loss/boundary_identity", metrics["boundary_identity_loss"], step)
             if "coordinate_loss" in metrics:
@@ -764,10 +770,14 @@ def train(cfg, args):
             writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
             if "retrieval_recall1" in metrics:
                 writer.add_scalar("retrieval/recall1", metrics["retrieval_recall1"], step)
+            if "reranker_recall1" in metrics:
+                writer.add_scalar("retrieval/rerank_recall1", metrics["reranker_recall1"], step)
             if "retrieval_recall8" in metrics:
                 writer.add_scalar("retrieval/recall8", metrics["retrieval_recall8"], step)
             if "retrieval_recall32" in metrics:
                 writer.add_scalar("retrieval/recall32", metrics["retrieval_recall32"], step)
+            if "reranker_shortlist_acc" in metrics:
+                writer.add_scalar("retrieval/rerank_shortlist_acc", metrics["reranker_shortlist_acc"], step)
             if "retrieval_coord_error" in metrics:
                 writer.add_scalar("retrieval/coord_error", metrics["retrieval_coord_error"], step)
             if "boundary_identity_acc" in metrics:
@@ -798,6 +808,8 @@ def train(cfg, args):
                     d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
                     qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
+                    rr1=(f"{metrics['reranker_recall1']:.3f}" if "reranker_recall1" in metrics else "n/a"),
+                    rsa=(f"{metrics['reranker_shortlist_acc']:.3f}" if "reranker_shortlist_acc" in metrics else "n/a"),
                     r8=(f"{metrics['retrieval_recall8']:.3f}" if "retrieval_recall8" in metrics else "n/a"),
                     r32=(f"{metrics['retrieval_recall32']:.3f}" if "retrieval_recall32" in metrics else "n/a"),
                     coord=(f"{metrics['retrieval_coord_error']:.3f}" if "retrieval_coord_error" in metrics else "n/a"),

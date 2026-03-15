@@ -120,6 +120,7 @@ class InpaintingLoss(nn.Module):
         refined_l1_weight: float = 1.0,
         refined_query_patch_l1_weight: float = 0.0,
         retrieval_loss_weight: float = 0.0,
+        reranker_loss_weight: float = 0.0,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
         boundary_identity_weight: float = 0.0,
@@ -149,6 +150,7 @@ class InpaintingLoss(nn.Module):
         self.refined_l1_weight = float(refined_l1_weight)
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
+        self.reranker_loss_weight = float(reranker_loss_weight)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
         self.boundary_identity_weight = float(boundary_identity_weight)
@@ -362,6 +364,7 @@ class InpaintingLoss(nn.Module):
         zero = refined_target.new_zeros(())
         loss_terms = {
             "retrieval": zero,
+            "reranker": zero,
             "boundary_identity": zero,
             "coordinate": zero,
             "coherence": zero,
@@ -370,6 +373,8 @@ class InpaintingLoss(nn.Module):
             "retrieval_recall1": 0.0,
             "retrieval_recall8": 0.0,
             "retrieval_recall32": 0.0,
+            "reranker_recall1": 0.0,
+            "reranker_shortlist_acc": 0.0,
             "retrieval_coord_error": 0.0,
             "boundary_identity_acc": 0.0,
         }
@@ -380,6 +385,7 @@ class InpaintingLoss(nn.Module):
         query_mask_flat = attention_aux.get("query_mask_flat")
         supervision_entries = attention_aux.get("attention_supervision_entries")
         token_hw = attention_aux.get("token_hw")
+        copy_aux = attention_aux.get("copy_aux")
         if (
             kernel_size <= 0
             or query_mask_flat is None
@@ -398,12 +404,15 @@ class InpaintingLoss(nn.Module):
         teacher_tokens = self._normalize_patch_tokens(teacher_tokens)
 
         retrieval_losses = []
+        reranker_losses = []
         boundary_losses = []
         coordinate_losses = []
         coherence_losses = []
         retrieval_recall1 = []
         retrieval_recall8 = []
         retrieval_recall32 = []
+        reranker_recall1 = []
+        reranker_shortlist_acc = []
         retrieval_coord_errors = []
         boundary_accs = []
 
@@ -473,6 +482,52 @@ class InpaintingLoss(nn.Module):
                 retrieval_coord_errors.append(
                     (masked_pred_coords - masked_teacher_coords).abs().sum(dim=-1).mean()
                 )
+                if copy_aux is not None and batch_idx < len(copy_aux):
+                    rerank_entry = copy_aux[batch_idx]
+                    if rerank_entry:
+                        rerank_query_indices = rerank_entry["query_indices"]
+                        candidate_key_indices = rerank_entry["candidate_key_indices"]
+                        rerank_logits = rerank_entry["rerank_logits"].float()
+                        query_positions = torch.searchsorted(query_indices, rerank_query_indices)
+                        valid_queries = query_positions < query_indices.numel()
+                        if valid_queries.any():
+                            valid_positions = query_positions[valid_queries]
+                            valid_queries = valid_queries.clone()
+                            valid_queries[valid_queries.clone()] = (
+                                query_indices[valid_positions] == rerank_query_indices[valid_queries]
+                            )
+                        if valid_queries.any():
+                            valid_rerank_query_indices = rerank_query_indices[valid_queries]
+                            valid_candidate_key_indices = candidate_key_indices[valid_queries]
+                            valid_rerank_logits = rerank_logits[valid_queries]
+                            valid_query_teacher_tokens = teacher_tokens[batch_idx, valid_rerank_query_indices]
+                            candidate_teacher_tokens = teacher_tokens[batch_idx, valid_candidate_key_indices]
+                            candidate_teacher_logits = (
+                                candidate_teacher_tokens * valid_query_teacher_tokens.unsqueeze(1)
+                            ).sum(dim=-1)
+                            candidate_teacher_logits = (
+                                candidate_teacher_logits / self.retrieval_teacher_temperature
+                            )
+                            candidate_teacher_probs = F.softmax(candidate_teacher_logits, dim=-1)
+                            rerank_log_probs = F.log_softmax(valid_rerank_logits, dim=-1)
+                            reranker_losses.append(
+                                (-(candidate_teacher_probs * rerank_log_probs).sum(dim=-1)).mean()
+                            )
+                            shortlist_teacher_best = candidate_teacher_probs.argmax(dim=-1)
+                            rerank_pred_best = valid_rerank_logits.argmax(dim=-1)
+                            reranker_shortlist_acc.append(
+                                (rerank_pred_best == shortlist_teacher_best).float().mean()
+                            )
+                            teacher_best_global = key_indices[
+                                teacher_probs[valid_positions].argmax(dim=-1)
+                            ]
+                            rerank_best_global = valid_candidate_key_indices.gather(
+                                1,
+                                rerank_pred_best.unsqueeze(-1),
+                            ).squeeze(-1)
+                            reranker_recall1.append(
+                                (rerank_best_global == teacher_best_global).float().mean()
+                            )
 
             if boundary_mask.any():
                 boundary_query_indices = query_indices[boundary_mask]
@@ -495,6 +550,8 @@ class InpaintingLoss(nn.Module):
 
         if retrieval_losses:
             loss_terms["retrieval"] = torch.stack(retrieval_losses).mean()
+        if reranker_losses:
+            loss_terms["reranker"] = torch.stack(reranker_losses).mean()
         if boundary_losses:
             loss_terms["boundary_identity"] = torch.stack(boundary_losses).mean()
         if coordinate_losses:
@@ -508,6 +565,10 @@ class InpaintingLoss(nn.Module):
             metrics["retrieval_recall8"] = torch.stack(retrieval_recall8).mean().item()
         if retrieval_recall32:
             metrics["retrieval_recall32"] = torch.stack(retrieval_recall32).mean().item()
+        if reranker_recall1:
+            metrics["reranker_recall1"] = torch.stack(reranker_recall1).mean().item()
+        if reranker_shortlist_acc:
+            metrics["reranker_shortlist_acc"] = torch.stack(reranker_shortlist_acc).mean().item()
         if retrieval_coord_errors:
             metrics["retrieval_coord_error"] = torch.stack(retrieval_coord_errors).mean().item()
         if boundary_accs:
@@ -561,6 +622,7 @@ class InpaintingLoss(nn.Module):
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
+            + self.reranker_loss_weight * attention_loss_terms["reranker"]
             + scheduled_weights["boundary_identity_weight"] * attention_loss_terms["boundary_identity"]
             + scheduled_weights["coordinate_loss_weight"] * attention_loss_terms["coordinate"]
             + scheduled_weights["coherence_loss_weight"] * attention_loss_terms["coherence"]
@@ -576,6 +638,7 @@ class InpaintingLoss(nn.Module):
             "refined_l1": refined_l1.item(),
             "refined_query_patch_l1": refined_query_patch_l1.item(),
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
+            "reranker_loss": attention_loss_terms["reranker"].item(),
             "boundary_identity_loss": attention_loss_terms["boundary_identity"].item(),
             "coordinate_loss": attention_loss_terms["coordinate"].item(),
             "coherence_loss": attention_loss_terms["coherence"].item(),
