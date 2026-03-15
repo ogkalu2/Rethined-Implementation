@@ -103,9 +103,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
-        coarse_structure_hidden_dim: int = 0,
-        coarse_structure_descriptor_dim: int = 64,
-        coarse_structure_logit_scale: float = 0.0,
+        coarse_query_modulation_hidden_dim: int = 0,
+        coarse_query_modulation_strength: float = 0.0,
         reranker_hidden_dim: int = 0,
         reranker_top_k: int | None = None,
         reranker_query_chunk_size: int = 256,
@@ -158,9 +157,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_hidden_dim = None if matching_hidden_dim is None else int(matching_hidden_dim)
         if self.matching_hidden_dim is not None and self.matching_hidden_dim <= 0:
             self.matching_hidden_dim = None
-        self.coarse_structure_hidden_dim = max(0, int(coarse_structure_hidden_dim))
-        self.coarse_structure_descriptor_dim = max(1, int(coarse_structure_descriptor_dim))
-        self.coarse_structure_logit_scale = float(coarse_structure_logit_scale)
+        self.coarse_query_modulation_hidden_dim = max(0, int(coarse_query_modulation_hidden_dim))
+        self.coarse_query_modulation_strength = float(coarse_query_modulation_strength)
         self.reranker_hidden_dim = max(0, int(reranker_hidden_dim))
         self.reranker_top_k = None if reranker_top_k is None else int(reranker_top_k)
         if self.reranker_top_k is not None and self.reranker_top_k <= 0:
@@ -219,16 +217,15 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.token_grid_size = self.image_size // self.stem_out_stride // self.kernel_size
         self.query_patch_dim = self.stem_out_channels * self.kernel_size * self.kernel_size
         self.value_patch_dim = self.stem_out_channels * self.value_patch_size * self.value_patch_size
-        self.coarse_structure_query_input_dim = 0
-        self.coarse_structure_key_input_dim = 0
-        if self.coarse_structure_logit_scale > 0.0 and not self.separate_query_key_matching:
-            raise ValueError("coarse_structure_logit_scale requires separate_query_key_matching=True.")
-        if self.coarse_structure_logit_scale > 0.0:
-            self.coarse_structure_query_input_dim = self.query_patch_dim
-            self.coarse_structure_key_input_dim = self.query_patch_dim
-            if self.concat_features:
-                self.coarse_structure_query_input_dim += self.feature_dim
-                self.coarse_structure_key_input_dim += self.feature_dim
+        self.coarse_query_modulation_input_dim = 0
+        if self.match_coarse_rgb:
+            self.coarse_query_modulation_input_dim += self.query_patch_dim
+        if self.concat_features:
+            self.coarse_query_modulation_input_dim += self.feature_dim
+        if self.coarse_query_modulation_strength > 0.0 and self.coarse_query_modulation_input_dim == 0:
+            raise ValueError(
+                "coarse_query_modulation_strength requires coarse RGB patches, coarse features, or both."
+            )
         self.matching_input_dim = 0
         if self.match_coarse_rgb:
             self.matching_input_dim += self.query_patch_dim
@@ -286,8 +283,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_descriptor_head = None
         self.key_descriptor_head = None
         self.matching_descriptor_head = None
-        self.coarse_structure_query_descriptor_head = None
-        self.coarse_structure_key_descriptor_head = None
+        self.coarse_query_modulation_head = None
         self.patch_reranker = None
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
@@ -326,45 +322,30 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 self.patch_token_dim,
             )
             self.query_context_scale = nn.Parameter(torch.tensor(self.query_context_residual_init))
-        if self.coarse_structure_logit_scale > 0.0:
-            structure_hidden_dim = max(
-                self.coarse_structure_descriptor_dim,
-                self.coarse_structure_hidden_dim,
+        if self.coarse_query_modulation_strength > 0.0:
+            modulation_hidden_dim = (
+                self.patch_token_dim
+                if self.coarse_query_modulation_hidden_dim <= 0
+                else self.coarse_query_modulation_hidden_dim
             )
-            self.coarse_structure_query_descriptor_head = nn.Sequential(
+            self.coarse_query_modulation_head = nn.Sequential(
                 nn.Conv2d(
-                    self.coarse_structure_query_input_dim,
-                    structure_hidden_dim,
+                    self.coarse_query_modulation_input_dim,
+                    modulation_hidden_dim,
                     kernel_size=1,
                     stride=1,
                     bias=False,
                 ),
                 nn.GELU(),
                 nn.Conv2d(
-                    structure_hidden_dim,
-                    self.coarse_structure_descriptor_dim,
+                    modulation_hidden_dim,
+                    2 * self.patch_token_dim,
                     kernel_size=1,
                     stride=1,
-                    bias=False,
                 ),
             )
-            self.coarse_structure_key_descriptor_head = nn.Sequential(
-                nn.Conv2d(
-                    self.coarse_structure_key_input_dim,
-                    structure_hidden_dim,
-                    kernel_size=1,
-                    stride=1,
-                    bias=False,
-                ),
-                nn.GELU(),
-                nn.Conv2d(
-                    structure_hidden_dim,
-                    self.coarse_structure_descriptor_dim,
-                    kernel_size=1,
-                    stride=1,
-                    bias=False,
-                ),
-            )
+            nn.init.zeros_(self.coarse_query_modulation_head[-1].weight)
+            nn.init.zeros_(self.coarse_query_modulation_head[-1].bias)
         self.multihead_attention = MultiHeadAttention(
             embed_dim=self.patch_token_dim,
             d_v=self.value_patch_dim,
@@ -495,9 +476,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             padding=self.value_patch_padding,
         )
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
-        coarse_composite_patch_map = None
-        if self.coarse_structure_query_descriptor_head is not None:
-            coarse_composite_patch_map, _ = self.unfold_native(coarse_composite, self.kernel_size)
+        coarse_modulation_patch_map = None
+        if self.coarse_query_modulation_head is not None:
+            coarse_modulation_patch_map, _ = self.unfold_native(coarse_composite, self.kernel_size)
         coarse_match_map = None
         if self.match_coarse_rgb:
             coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
@@ -520,8 +501,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         query_matching_tokens = None
         key_matching_tokens = None
-        query_structure_tokens = None
-        key_structure_tokens = None
         if self.separate_query_key_matching:
             visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
             query_context_map = self._pool_to_token_grid(
@@ -554,20 +533,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 key_token_map = self.key_descriptor_head(key_token_map)
             query_matching_tokens = query_token_map.flatten(start_dim=2).transpose(1, 2)
             key_matching_tokens = key_token_map.flatten(start_dim=2).transpose(1, 2)
-            if self.coarse_structure_query_descriptor_head is not None:
-                coarse_query_inputs = [coarse_composite_patch_map]
-                coarse_key_inputs = [visible_patch_map]
-                if self.concat_features:
-                    coarse_query_inputs.append(coarse_features)
-                    coarse_key_inputs.append(coarse_features)
-                coarse_query_token_map = self.coarse_structure_query_descriptor_head(
-                    torch.cat(coarse_query_inputs, dim=1)
-                )
-                coarse_key_token_map = self.coarse_structure_key_descriptor_head(
-                    torch.cat(coarse_key_inputs, dim=1)
-                )
-                query_structure_tokens = coarse_query_token_map.flatten(start_dim=2).transpose(1, 2)
-                key_structure_tokens = coarse_key_token_map.flatten(start_dim=2).transpose(1, 2)
             query_tokens = query_matching_tokens
             key_tokens = key_matching_tokens
         else:
@@ -597,6 +562,25 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             query_tokens = query_matching_tokens
             key_tokens = key_matching_tokens
 
+        if self.coarse_query_modulation_head is not None:
+            coarse_modulation_inputs = [coarse_modulation_patch_map]
+            if self.concat_features:
+                coarse_modulation_inputs.append(coarse_features)
+            coarse_modulation_map = self.coarse_query_modulation_head(
+                coarse_modulation_inputs[0]
+                if len(coarse_modulation_inputs) == 1
+                else torch.cat(coarse_modulation_inputs, dim=1)
+            )
+            gamma_map, beta_map = coarse_modulation_map.chunk(2, dim=1)
+            gamma_tokens = gamma_map.flatten(start_dim=2).transpose(1, 2)
+            beta_tokens = beta_map.flatten(start_dim=2).transpose(1, 2)
+            modulation_mask = query_mask_flat.unsqueeze(-1).to(dtype=query_matching_tokens.dtype)
+            modulation_strength = float(self.coarse_query_modulation_strength)
+            gamma_tokens = modulation_strength * torch.tanh(gamma_tokens) * modulation_mask
+            beta_tokens = modulation_strength * torch.tanh(beta_tokens) * modulation_mask
+            query_matching_tokens = (1.0 + gamma_tokens) * query_matching_tokens + beta_tokens
+            query_tokens = query_matching_tokens
+
         positional_encoding = self.get_positional_encoding()
         if positional_encoding is not None:
             query_tokens = query_tokens + positional_encoding
@@ -614,8 +598,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 query_mask_flat,
                 key_valid_flat,
                 token_hw,
-                query_structure_tokens=query_structure_tokens,
-                key_structure_tokens=key_structure_tokens,
             )
 
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
@@ -630,8 +612,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 key_valid_flat,
                 default_tokens=default_patch_values,
                 token_hw=token_hw,
-                query_structure_tokens_full=query_structure_tokens,
-                key_structure_tokens_full=key_structure_tokens,
             )
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(

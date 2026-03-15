@@ -155,8 +155,6 @@ class PatchmatchHelpersMixin:
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         token_hw: tuple[int, int],
-        query_structure_tokens: torch.Tensor | None = None,
-        key_structure_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[dict[str, torch.Tensor | tuple[int, int]]]]:
         band_mask_flat = self._build_supervision_band_mask(query_mask_flat, token_hw)
         supervision_entries: list[dict[str, torch.Tensor | tuple[int, int]]] = []
@@ -175,18 +173,9 @@ class PatchmatchHelpersMixin:
                 supervision_entries.append(entry)
                 continue
 
-            structure_logit_bias = self._coarse_structure_logit_bias(
-                None if query_structure_tokens is None else query_structure_tokens[batch_idx, query_indices],
-                None if key_structure_tokens is None else key_structure_tokens[batch_idx, key_indices],
-            )
             raw_logits, _ = self.multihead_attention.compute_attention_logits(
                 query_tokens[batch_idx : batch_idx + 1, query_indices],
                 key_tokens[batch_idx : batch_idx + 1, key_indices],
-                logit_bias=(
-                    None
-                    if structure_logit_bias is None
-                    else structure_logit_bias.unsqueeze(0)
-                ),
             )
             entry["raw_logits"] = raw_logits.mean(dim=1).squeeze(0)
             supervision_entries.append(entry)
@@ -208,25 +197,6 @@ class PatchmatchHelpersMixin:
         if height > 1:
             ys = ys / float(height - 1)
         return torch.stack([xs, ys], dim=-1)
-
-    def _coarse_structure_logit_bias(
-        self,
-        query_structure_tokens: torch.Tensor | None,
-        key_structure_tokens: torch.Tensor | None,
-    ) -> torch.Tensor | None:
-        if query_structure_tokens is None or key_structure_tokens is None:
-            return None
-        if query_structure_tokens.numel() == 0 or key_structure_tokens.numel() == 0:
-            return None
-        if getattr(self, "coarse_structure_logit_scale", 0.0) <= 0.0:
-            return None
-
-        query_structure_tokens = F.normalize(query_structure_tokens.float(), dim=-1, eps=1e-6)
-        key_structure_tokens = F.normalize(key_structure_tokens.float(), dim=-1, eps=1e-6)
-        return float(self.coarse_structure_logit_scale) * torch.matmul(
-            query_structure_tokens,
-            key_structure_tokens.transpose(-2, -1),
-        )
 
     def _active_reranker_top_k(self, num_keys: int) -> int | None:
         if getattr(self, "patch_reranker", None) is None or num_keys <= 1:
@@ -302,21 +272,10 @@ class PatchmatchHelpersMixin:
         token_hw: tuple[int, int],
         source_context_bank: torch.Tensor,
         source_context_density_bank: torch.Tensor,
-        query_structure_tokens: torch.Tensor | None = None,
-        key_structure_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-        structure_logit_bias = self._coarse_structure_logit_bias(
-            query_structure_tokens,
-            key_structure_tokens,
-        )
         raw_logits, attn_logits = self.multihead_attention.compute_attention_logits(
             query_tokens,
             key_tokens,
-            logit_bias=(
-                None
-                if structure_logit_bias is None
-                else structure_logit_bias.unsqueeze(0)
-            ),
         )
         stage1_logits = raw_logits.squeeze(0).squeeze(0)
         shortlist_k = self._active_reranker_top_k(stage1_logits.shape[-1])
@@ -396,8 +355,6 @@ class PatchmatchHelpersMixin:
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
         token_hw: tuple[int, int] | None = None,
-        query_structure_tokens_full: torch.Tensor | None = None,
-        key_structure_tokens_full: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor]] | None]:
         batch_size, num_patches, _ = query_tokens_full.shape
         mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
@@ -446,16 +403,6 @@ class PatchmatchHelpersMixin:
                         key_valid_flat[batch_idx].to(dtype=query_tokens_full.dtype)
                         if source_context_density_bank is None
                         else source_context_density_bank
-                    ),
-                    query_structure_tokens=(
-                        None
-                        if query_structure_tokens_full is None
-                        else query_structure_tokens_full[batch_idx, query_indices]
-                    ),
-                    key_structure_tokens=(
-                        None
-                        if key_structure_tokens_full is None
-                        else key_structure_tokens_full[batch_idx, key_indices]
                     ),
                 )
                 mixed_queries = mixed_queries.to(dtype=mixed.dtype)
