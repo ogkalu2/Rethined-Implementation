@@ -224,8 +224,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.coarse_structure_logit_scale > 0.0 and not self.separate_query_key_matching:
             raise ValueError("coarse_structure_logit_scale requires separate_query_key_matching=True.")
         if self.coarse_structure_logit_scale > 0.0:
-            self.coarse_structure_query_input_dim = self.query_context_channels + self.query_patch_dim
-            self.coarse_structure_key_input_dim = self.key_context_channels + self.query_patch_dim
+            self.coarse_structure_query_input_dim = self.query_patch_dim
+            self.coarse_structure_key_input_dim = self.query_patch_dim
             if self.concat_features:
                 self.coarse_structure_query_input_dim += self.feature_dim
                 self.coarse_structure_key_input_dim += self.feature_dim
@@ -286,7 +286,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_descriptor_head = None
         self.key_descriptor_head = None
         self.matching_descriptor_head = None
-        self.coarse_query_structure_context_encoder = None
         self.coarse_structure_query_descriptor_head = None
         self.coarse_structure_key_descriptor_head = None
         self.patch_reranker = None
@@ -328,21 +327,43 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             )
             self.query_context_scale = nn.Parameter(torch.tensor(self.query_context_residual_init))
         if self.coarse_structure_logit_scale > 0.0:
-            structure_hidden_dim = (
-                self.coarse_structure_descriptor_dim
-                if self.coarse_structure_hidden_dim <= 0
-                else self.coarse_structure_hidden_dim
-            )
-            self.coarse_query_structure_context_encoder = self._build_context_encoder(4, self.query_context_channels)
-            self.coarse_structure_query_descriptor_head = self._build_matching_descriptor_head(
-                self.coarse_structure_query_input_dim,
+            structure_hidden_dim = max(
                 self.coarse_structure_descriptor_dim,
-                hidden_dim=structure_hidden_dim,
+                self.coarse_structure_hidden_dim,
             )
-            self.coarse_structure_key_descriptor_head = self._build_matching_descriptor_head(
-                self.coarse_structure_key_input_dim,
-                self.coarse_structure_descriptor_dim,
-                hidden_dim=structure_hidden_dim,
+            self.coarse_structure_query_descriptor_head = nn.Sequential(
+                nn.Conv2d(
+                    self.coarse_structure_query_input_dim,
+                    structure_hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                    bias=False,
+                ),
+                nn.GELU(),
+                nn.Conv2d(
+                    structure_hidden_dim,
+                    self.coarse_structure_descriptor_dim,
+                    kernel_size=1,
+                    stride=1,
+                    bias=False,
+                ),
+            )
+            self.coarse_structure_key_descriptor_head = nn.Sequential(
+                nn.Conv2d(
+                    self.coarse_structure_key_input_dim,
+                    structure_hidden_dim,
+                    kernel_size=1,
+                    stride=1,
+                    bias=False,
+                ),
+                nn.GELU(),
+                nn.Conv2d(
+                    structure_hidden_dim,
+                    self.coarse_structure_descriptor_dim,
+                    kernel_size=1,
+                    stride=1,
+                    bias=False,
+                ),
             )
         self.multihead_attention = MultiHeadAttention(
             embed_dim=self.patch_token_dim,
@@ -534,12 +555,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             query_matching_tokens = query_token_map.flatten(start_dim=2).transpose(1, 2)
             key_matching_tokens = key_token_map.flatten(start_dim=2).transpose(1, 2)
             if self.coarse_structure_query_descriptor_head is not None:
-                coarse_query_context_map = self._pool_to_token_grid(
-                    self.coarse_query_structure_context_encoder(torch.cat([coarse_composite, mask], dim=1)),
-                    patch_map.shape[-2:],
-                )
-                coarse_query_inputs = [coarse_query_context_map, coarse_composite_patch_map]
-                coarse_key_inputs = [key_context_map, visible_patch_map]
+                coarse_query_inputs = [coarse_composite_patch_map]
+                coarse_key_inputs = [visible_patch_map]
                 if self.concat_features:
                     coarse_query_inputs.append(coarse_features)
                     coarse_key_inputs.append(coarse_features)
