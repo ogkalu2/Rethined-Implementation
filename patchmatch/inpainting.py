@@ -452,8 +452,12 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         coarse_raw, features = self.encoder_decoder(image)
         known_image = image if value_image is None else value_image
         coarse_composite = coarse_raw * mask + known_image * (1 - mask)
+        # `coarse_raw` is only supervised inside the hole. For matching, use the coarse
+        # prediction inside masked regions and keep known pixels as the source of truth
+        # elsewhere so visible-key descriptors are not polluted by arbitrary coarse output.
+        coarse_token_source = coarse_composite
 
-        patch_map, output_size = self.unfold_native(coarse_raw, self.kernel_size)
+        patch_map, output_size = self.unfold_native(coarse_token_source, self.kernel_size)
         default_patch_values = None
         if self.value_source == "high_freq_residual":
             value_base = known_image - self.final_gaussian_blur(known_image)
@@ -478,7 +482,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
         coarse_modulation_patch_map = None
         if self.coarse_query_modulation_head is not None:
-            coarse_modulation_patch_map, _ = self.unfold_native(coarse_composite, self.kernel_size)
+            coarse_modulation_patch_map, _ = self.unfold_native(coarse_token_source, self.kernel_size)
         coarse_match_map = None
         if self.match_coarse_rgb:
             coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
