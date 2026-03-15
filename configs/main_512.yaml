@@ -21,6 +21,7 @@ model:
     matching_hidden_dim: 384
     reranker_hidden_dim: 128
     reranker_query_chunk_size: 256
+    reranker_source_context_radius: 1
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
     query_image_context_matching: false

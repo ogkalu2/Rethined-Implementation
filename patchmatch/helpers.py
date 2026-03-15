@@ -214,6 +214,53 @@ class PatchmatchHelpersMixin:
             return None
         return min(top_k, num_keys)
 
+    def _build_source_context_bank(
+        self,
+        key_tokens_full: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        radius = max(0, int(getattr(self, "reranker_source_context_radius", 0)))
+        if radius <= 0:
+            density = key_tokens_full.new_ones((key_tokens_full.shape[0],), dtype=key_tokens_full.dtype)
+            return key_tokens_full, density
+
+        height, width = token_hw
+        num_tokens, token_dim = key_tokens_full.shape
+        token_map = key_tokens_full.transpose(0, 1).reshape(1, token_dim, height, width)
+        valid_map = key_valid_flat.reshape(1, 1, height, width).to(dtype=token_map.dtype)
+        kernel_size = 2 * radius + 1
+        window_area = float(kernel_size * kernel_size)
+
+        summed_tokens = (
+            F.avg_pool2d(
+                token_map * valid_map,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=radius,
+            )
+            * window_area
+        )
+        valid_counts = (
+            F.avg_pool2d(
+                valid_map,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=radius,
+            )
+            * window_area
+        )
+
+        neighbor_sum = summed_tokens - token_map * valid_map
+        neighbor_count = (valid_counts - valid_map).clamp_min(0.0)
+        neighbor_mean = neighbor_sum / neighbor_count.clamp_min(1.0)
+        neighbor_mean = torch.where(neighbor_count > 0, neighbor_mean, token_map)
+        density = neighbor_count / max(window_area - 1.0, 1.0)
+        return (
+            neighbor_mean.reshape(1, token_dim, num_tokens).transpose(1, 2).squeeze(0),
+            density.reshape(num_tokens),
+        )
+
     def _rerank_masked_shortlist(
         self,
         query_tokens: torch.Tensor,
@@ -223,6 +270,8 @@ class PatchmatchHelpersMixin:
         query_indices: torch.Tensor,
         key_indices: torch.Tensor,
         token_hw: tuple[int, int],
+        source_context_bank: torch.Tensor,
+        source_context_density_bank: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         raw_logits, _ = self.multihead_attention.compute_attention_logits(query_tokens, key_tokens)
         stage1_logits = raw_logits.squeeze(0).squeeze(0)
@@ -259,12 +308,17 @@ class PatchmatchHelpersMixin:
         )
         topk_key_coords = key_coords_bank[topk_local_indices]
         relative_coords = topk_key_coords - query_coords.unsqueeze(1)
+        shortlisted_key_indices = key_indices[topk_local_indices]
+        topk_source_context = source_context_bank[shortlisted_key_indices]
+        topk_source_context_density = source_context_density_bank[shortlisted_key_indices]
 
         rerank_delta = self.patch_reranker(
             query_token_bank,
             topk_key_tokens,
+            topk_source_context,
             topk_stage1_logits,
             relative_coords,
+            topk_source_context_density,
         )
         rerank_logits = topk_stage1_logits + rerank_delta
         rerank_attn, rerank_probs = self.multihead_attention.attention_from_logits(
@@ -281,7 +335,7 @@ class PatchmatchHelpersMixin:
 
         rerank_entry = {
             "query_indices": query_indices,
-            "candidate_key_indices": key_indices[topk_local_indices],
+            "candidate_key_indices": shortlisted_key_indices,
             "rerank_logits": rerank_logits.float(),
         }
         return mixed_queries, rerank_probs, rerank_entry
@@ -319,6 +373,14 @@ class PatchmatchHelpersMixin:
                 query_tokens = query_tokens_full[batch_idx : batch_idx + 1, query_indices]
                 key_tokens = key_tokens_full[batch_idx : batch_idx + 1, key_indices]
                 value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
+                source_context_bank = None
+                source_context_density_bank = None
+                if reranker_entries is not None:
+                    source_context_bank, source_context_density_bank = self._build_source_context_bank(
+                        key_tokens_full[batch_idx],
+                        key_valid_flat[batch_idx],
+                        token_hw if token_hw is not None else (1, num_patches),
+                    )
                 mixed_queries, masked_attention, rerank_entry = self._rerank_masked_shortlist(
                     query_tokens,
                     key_tokens,
@@ -326,6 +388,16 @@ class PatchmatchHelpersMixin:
                     query_indices=query_indices,
                     key_indices=key_indices,
                     token_hw=token_hw if token_hw is not None else (1, num_patches),
+                    source_context_bank=(
+                        key_tokens_full[batch_idx]
+                        if source_context_bank is None
+                        else source_context_bank
+                    ),
+                    source_context_density_bank=(
+                        key_valid_flat[batch_idx].to(dtype=query_tokens_full.dtype)
+                        if source_context_density_bank is None
+                        else source_context_density_bank
+                    ),
                 )
                 mixed_queries = mixed_queries.to(dtype=mixed.dtype)
                 masked_attention = masked_attention.to(dtype=replacement_rows.dtype)

@@ -18,8 +18,9 @@ class TopKReranker(nn.Module):
         self.query_chunk_size = max(0, int(query_chunk_size))
         self.query_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
         self.key_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
+        self.source_context_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
         self.net = nn.Sequential(
-            nn.Linear(2 * hidden_dim + 3, hidden_dim),
+            nn.Linear(4 * hidden_dim + 4, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -28,17 +29,23 @@ class TopKReranker(nn.Module):
         self,
         query_tokens: torch.Tensor,
         candidate_tokens: torch.Tensor,
+        source_context_tokens: torch.Tensor,
         stage1_logits: torch.Tensor,
         relative_coords: torch.Tensor,
+        source_context_density: torch.Tensor,
     ) -> torch.Tensor:
         query_features = self.query_proj(query_tokens).unsqueeze(1)
         candidate_features = self.key_proj(candidate_tokens)
+        source_context_features = self.source_context_proj(source_context_tokens)
         features = torch.cat(
             [
                 query_features * candidate_features,
                 (query_features - candidate_features).abs(),
+                candidate_features * source_context_features,
+                (candidate_features - source_context_features).abs(),
                 stage1_logits.unsqueeze(-1),
                 relative_coords,
+                source_context_density.unsqueeze(-1),
             ],
             dim=-1,
         )
@@ -48,11 +55,20 @@ class TopKReranker(nn.Module):
         self,
         query_tokens: torch.Tensor,
         candidate_tokens: torch.Tensor,
+        source_context_tokens: torch.Tensor,
         stage1_logits: torch.Tensor,
         relative_coords: torch.Tensor,
+        source_context_density: torch.Tensor,
     ) -> torch.Tensor:
         if self.query_chunk_size <= 0 or query_tokens.shape[0] <= self.query_chunk_size:
-            return self._forward_chunk(query_tokens, candidate_tokens, stage1_logits, relative_coords)
+            return self._forward_chunk(
+                query_tokens,
+                candidate_tokens,
+                source_context_tokens,
+                stage1_logits,
+                relative_coords,
+                source_context_density,
+            )
 
         outputs = []
         for start in range(0, query_tokens.shape[0], self.query_chunk_size):
@@ -61,8 +77,10 @@ class TopKReranker(nn.Module):
                 self._forward_chunk(
                     query_tokens[start:end],
                     candidate_tokens[start:end],
+                    source_context_tokens[start:end],
                     stage1_logits[start:end],
                     relative_coords[start:end],
+                    source_context_density[start:end],
                 )
             )
         return torch.cat(outputs, dim=0)
@@ -88,6 +106,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         reranker_hidden_dim: int = 0,
         reranker_top_k: int | None = None,
         reranker_query_chunk_size: int = 256,
+        reranker_source_context_radius: int = 1,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
@@ -140,6 +159,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.reranker_top_k is not None and self.reranker_top_k <= 0:
             self.reranker_top_k = None
         self.reranker_query_chunk_size = max(0, int(reranker_query_chunk_size))
+        self.reranker_source_context_radius = max(0, int(reranker_source_context_radius))
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
