@@ -67,7 +67,6 @@ training:
   grad_accum_steps: 4
   lr: 0.001
   matcher_lr_scale: 2.5
-  route_image_losses_away_from_matcher: true
   discriminator_lr: 0.00002
   warmup_steps: 200
   min_lr: 0.000001

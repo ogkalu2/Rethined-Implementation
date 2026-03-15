@@ -627,9 +627,6 @@ def train(cfg, args):
     criterion = InpaintingLoss(**loss_cfg).to(device)
     optimizer_betas = tuple(cfg["training"].get("betas", [0.9, 0.999]))
     matcher_lr_scale = float(cfg["training"].get("matcher_lr_scale", 1.0))
-    route_image_losses_away_from_matcher = bool(
-        cfg["training"].get("route_image_losses_away_from_matcher", False)
-    )
 
     optimizer_g, has_matcher_group = build_generator_optimizer(
         model,
@@ -669,8 +666,6 @@ def train(cfg, args):
     print(f"Effective batch size: {cfg['data']['batch_size'] * grad_accum}")
     if has_matcher_group:
         print(f"Matcher/reranker LR scale: {matcher_lr_scale:.2f}x")
-    if has_matcher_group and route_image_losses_away_from_matcher:
-        print("Gradient routing enabled: image losses bypass matcher/reranker params")
 
     log_dir = Path(log_cfg["log_dir"])
     ckpt_dir = log_dir / "checkpoints"
@@ -708,13 +703,6 @@ def train(cfg, args):
     last_refined = None
     metrics = {}
     matcher_group_lr = cfg["training"]["lr"] * matcher_lr_scale
-    generator_base_params = []
-    generator_matcher_params = []
-    for param_group in optimizer_g.param_groups:
-        if param_group.get("group_name") == "matcher":
-            generator_matcher_params.extend(param_group["params"])
-        else:
-            generator_base_params.extend(param_group["params"])
 
     progress_bar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
     for step_idx in progress_bar:
@@ -783,7 +771,7 @@ def train(cfg, args):
             with torch.amp.autocast(amp_device_type, enabled=use_amp):
                 set_discriminator_requires_grad(discriminator, False)
                 fake_logits_g = discriminator(refined_vis) 
-                g_loss_result = criterion.generator_loss(
+                g_loss, g_metrics = criterion.generator_loss(
                     coarse_raw,
                     refined_raw,
                     image,
@@ -791,45 +779,13 @@ def train(cfg, args):
                     mask,
                     fake_logits_g,
                     attention_aux=attention_aux,
-                    return_components=route_image_losses_away_from_matcher and has_matcher_group,
                 )
-                if route_image_losses_away_from_matcher and has_matcher_group:
-                    g_loss, g_metrics, g_components = g_loss_result
-                else:
-                    g_loss, g_metrics = g_loss_result
 
             if not torch.isfinite(g_loss):
                 step_has_nonfinite = True
                 break
 
-            if route_image_losses_away_from_matcher and has_matcher_group:
-                matcher_loss = (
-                    g_components["refined_l1"]
-                    + g_components["refined_query_patch_l1"]
-                    + g_components["retrieval"]
-                    + g_components["reranker"]
-                    + g_components["boundary_identity"]
-                    + g_components["coordinate"]
-                    + g_components["coherence"]
-                )
-                base_loss = (
-                    g_components["coarse_l2"]
-                    + g_components["coarse_blur_l1"]
-                    + g_components["coarse_gradient"]
-                    + g_components["coarse_perceptual"]
-                    + g_components["refined_l1"]
-                    + g_components["refined_query_patch_l1"]
-                    + g_components["frequency"]
-                    + g_components["perceptual"]
-                    + g_components["adversarial"]
-                )
-                scaler.scale(matcher_loss / grad_accum).backward(
-                    retain_graph=bool(generator_base_params)
-                )
-                if generator_base_params:
-                    scaler.scale(base_loss / grad_accum).backward(inputs=generator_base_params)
-            else:
-                scaler.scale(g_loss / grad_accum).backward()
+            scaler.scale(g_loss / grad_accum).backward()
 
             attn_metrics = model.generator.summarize_attention(
                 attn_map.detach(),

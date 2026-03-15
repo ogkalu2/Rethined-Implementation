@@ -584,10 +584,7 @@ class InpaintingLoss(nn.Module):
         mask: torch.Tensor,
         fake_logits: list[torch.Tensor] | None = None,
         attention_aux: dict[str, object] | None = None,
-        return_components: bool = False,
-    ) -> tuple[torch.Tensor, dict[str, float]] | tuple[
-        torch.Tensor, dict[str, float], dict[str, torch.Tensor]
-    ]:
+    ) -> tuple[torch.Tensor, dict[str, float]]:
         coarse_composite = composite_with_known(coarse_raw, coarse_target, mask)
         coarse_blurred = self.coarse_blur(coarse_composite)
         target_blurred = self.coarse_blur(coarse_target)
@@ -617,25 +614,22 @@ class InpaintingLoss(nn.Module):
             name: self._get_scheduled_weight(name)
             for name in self.SCHEDULED_WEIGHT_NAMES
         }
-        weighted_components = {
-            "coarse_l2": self.coarse_l2_weight * coarse_l2,
-            "coarse_blur_l1": self.coarse_blur_l1_weight * coarse_blur_l1,
-            "coarse_gradient": self.coarse_gradient_weight * coarse_gradient,
-            "coarse_perceptual": self.coarse_perceptual_weight * coarse_perceptual,
-            "refined_l1": self.refined_l1_weight * refined_l1,
-            "refined_query_patch_l1": self.refined_query_patch_l1_weight * refined_query_patch_l1,
-            "retrieval": scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"],
-            "reranker": self.reranker_loss_weight * attention_loss_terms["reranker"],
-            "boundary_identity": (
-                scheduled_weights["boundary_identity_weight"] * attention_loss_terms["boundary_identity"]
-            ),
-            "coordinate": scheduled_weights["coordinate_loss_weight"] * attention_loss_terms["coordinate"],
-            "coherence": scheduled_weights["coherence_loss_weight"] * attention_loss_terms["coherence"],
-            "frequency": scheduled_weights["frequency_weight"] * frequency,
-            "perceptual": scheduled_weights["perceptual_weight"] * perceptual,
-            "adversarial": scheduled_weights["adversarial_weight"] * adversarial,
-        }
-        total = sum(weighted_components.values(), refined.new_zeros(()))
+        total = (
+            self.coarse_l2_weight * coarse_l2
+            + self.coarse_blur_l1_weight * coarse_blur_l1
+            + self.coarse_gradient_weight * coarse_gradient
+            + self.coarse_perceptual_weight * coarse_perceptual
+            + self.refined_l1_weight * refined_l1
+            + self.refined_query_patch_l1_weight * refined_query_patch_l1
+            + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
+            + self.reranker_loss_weight * attention_loss_terms["reranker"]
+            + scheduled_weights["boundary_identity_weight"] * attention_loss_terms["boundary_identity"]
+            + scheduled_weights["coordinate_loss_weight"] * attention_loss_terms["coordinate"]
+            + scheduled_weights["coherence_loss_weight"] * attention_loss_terms["coherence"]
+            + scheduled_weights["frequency_weight"] * frequency
+            + scheduled_weights["perceptual_weight"] * perceptual
+            + scheduled_weights["adversarial_weight"] * adversarial
+        )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
             "coarse_blur_l1": coarse_blur_l1.item(),
@@ -658,8 +652,6 @@ class InpaintingLoss(nn.Module):
             for name, value in scheduled_weights.items()
         })
         loss_dict.update(attention_metrics)
-        if return_components:
-            return total, loss_dict, weighted_components
         return total, loss_dict
 
     def discriminator_loss(
