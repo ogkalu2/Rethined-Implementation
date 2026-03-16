@@ -78,7 +78,7 @@ loss:
   retrieval_loss_weight: 0.5
   retrieval_hard_ce_weight: 1.0
   retrieval_teacher_patch_padding: 8
-  retrieval_teacher_temperature: 0.12
+  retrieval_teacher_temperature: 0.15
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
   perceptual_weight: 0.15
