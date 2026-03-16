@@ -737,11 +737,6 @@ def train(cfg, args):
 
         if step == 1 or step % log_cfg["log_interval"] == 0:
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
-            if "coarse_blur_l1" in metrics:
-                writer.add_scalar("loss/coarse_blur_l1", metrics["coarse_blur_l1"], step)
-            if "coarse_gradient" in metrics:
-                writer.add_scalar("loss/coarse_gradient", metrics["coarse_gradient"], step)
-            writer.add_scalar("loss/coarse_perceptual", metrics["coarse_perceptual"], step)
             writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
             if "refined_query_patch_l1" in metrics:
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)

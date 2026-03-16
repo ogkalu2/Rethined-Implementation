@@ -5,8 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from blocks import NativeGaussianBlur2d
 from losses.perceptual import PerceptualLoss
 
 
@@ -114,9 +112,6 @@ class InpaintingLoss(nn.Module):
     def __init__(
         self,
         coarse_l2_weight: float = 1.0,
-        coarse_blur_l1_weight: float = 0.0,
-        coarse_gradient_weight: float = 0.0,
-        coarse_perceptual_weight: float = 0.05,
         refined_l1_weight: float = 1.0,
         refined_query_patch_l1_weight: float = 0.0,
         retrieval_loss_weight: float = 0.0,
@@ -144,9 +139,6 @@ class InpaintingLoss(nn.Module):
     ):
         super().__init__()
         self.coarse_l2_weight = float(coarse_l2_weight)
-        self.coarse_blur_l1_weight = float(coarse_blur_l1_weight)
-        self.coarse_gradient_weight = float(coarse_gradient_weight)
-        self.coarse_perceptual_weight = float(coarse_perceptual_weight)
         self.refined_l1_weight = float(refined_l1_weight)
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
@@ -171,7 +163,6 @@ class InpaintingLoss(nn.Module):
 
         self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
-        self.coarse_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.current_training_step = 0
         self._base_weight_values = {
             name: float(getattr(self, name))
@@ -585,14 +576,7 @@ class InpaintingLoss(nn.Module):
         fake_logits: list[torch.Tensor] | None = None,
         attention_aux: dict[str, object] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        coarse_composite = composite_with_known(coarse_raw, coarse_target, mask)
-        coarse_blurred = self.coarse_blur(coarse_composite)
-        target_blurred = self.coarse_blur(coarse_target)
-        coarse_grad_mask = dilate_mask(mask)
         coarse_l2 = masked_mse_loss(coarse_raw, coarse_target, mask)
-        coarse_blur_l1 = masked_l1_loss(coarse_blurred, target_blurred, mask)
-        coarse_gradient = masked_gradient_l1_loss(coarse_blurred, target_blurred, coarse_grad_mask)
-        coarse_perceptual = self.perceptual_loss(coarse_composite, coarse_target)
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         attention_loss_terms, attention_metrics = self._attention_supervision_losses(refined_target, attention_aux)
@@ -616,9 +600,6 @@ class InpaintingLoss(nn.Module):
         }
         total = (
             self.coarse_l2_weight * coarse_l2
-            + self.coarse_blur_l1_weight * coarse_blur_l1
-            + self.coarse_gradient_weight * coarse_gradient
-            + self.coarse_perceptual_weight * coarse_perceptual
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
@@ -632,9 +613,6 @@ class InpaintingLoss(nn.Module):
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
-            "coarse_blur_l1": coarse_blur_l1.item(),
-            "coarse_gradient": coarse_gradient.item(),
-            "coarse_perceptual": coarse_perceptual.item(),
             "refined_l1": refined_l1.item(),
             "refined_query_patch_l1": refined_query_patch_l1.item(),
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
