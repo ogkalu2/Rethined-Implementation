@@ -61,8 +61,10 @@ training:
   total_steps: 3000
   grad_accum_steps: 4
   lr: 0.001
+  scorer_lr: 0.003
   warmup_steps: 200
   min_lr: 0.000001
+  scorer_min_lr: 0.000003
   grad_clip: 1.0
   mixed_precision: true
   seed: 42

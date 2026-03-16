@@ -520,14 +520,31 @@ def train(cfg, args):
     loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
     criterion = InpaintingLoss(**loss_cfg).to(device)
 
+    scorer_param_names = {
+        "query_descriptor_head", "key_descriptor_head",
+        "matching_descriptor_head", "shared_query_key_descriptor_head",
+        "query_context_encoder", "key_context_encoder",
+        "query_context_descriptor_head", "query_context_scale",
+        "key_coarse_rgb_scale", "key_feature_scale",
+        "pre_attention_norm", "multihead_attention",
+    }
+    scorer_params = []
+    base_params = []
+    for name, param in model.named_parameters():
+        parts = name.split(".")
+        # Check if any part of the parameter path matches a scorer module
+        if any(part in scorer_param_names for part in parts):
+            scorer_params.append(param)
+        else:
+            base_params.append(param)
+
+    scorer_lr = cfg["training"].get("scorer_lr", cfg["training"]["lr"] * 3)
+    scorer_min_lr = cfg["training"].get("scorer_min_lr", cfg["training"]["min_lr"] * 3)
     optimizer_g = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg["training"]["lr"],
-        betas=tuple(cfg["training"].get("betas", [0.9, 0.999])),
-    )
-    optimizer_d = torch.optim.Adam(
-        discriminator.parameters(),
-        lr=cfg["training"].get("discriminator_lr", cfg["training"]["lr"]),
+        [
+            {"params": base_params, "lr": cfg["training"]["lr"]},
+            {"params": scorer_params, "lr": scorer_lr, "_group_name": "scorer"},
+        ],
         betas=tuple(cfg["training"].get("betas", [0.9, 0.999])),
     )
 
@@ -552,6 +569,8 @@ def train(cfg, args):
     model_image_size = model.generator.image_size
 
     print(f"Generator parameters: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Base parameters: {sum(p.numel() for p in base_params):,}")
+    print(f"  Scorer parameters: {sum(p.numel() for p in scorer_params):,} (LR: {scorer_lr})")
     print(f"Effective batch size: {cfg['data']['batch_size'] * grad_accum}")
 
     log_dir = Path(log_cfg["log_dir"])
@@ -593,13 +612,12 @@ def train(cfg, args):
         model.generator.set_training_step(step)
         criterion.set_training_step(step)
         lr_g = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
-        lr_d = get_lr(
-            step,
-            warmup_steps,
-            total_steps,
-        )
+        lr_scorer = get_lr(step, warmup_steps, total_steps, scorer_lr, scorer_min_lr)
         for pg in optimizer_g.param_groups:
-            pg["lr"] = lr_g
+            if pg.get("_group_name") == "scorer":
+                pg["lr"] = lr_scorer
+            else:
+                pg["lr"] = lr_g
 
         optimizer_g.zero_grad(set_to_none=True)
         metric_sums = defaultdict(float)
