@@ -161,22 +161,6 @@ def set_discriminator_requires_grad(discriminator: torch.nn.Module, enabled: boo
         param.requires_grad = enabled
 
 
-def compute_r1_penalty(
-    discriminator: torch.nn.Module,
-    real_images: torch.Tensor,
-) -> torch.Tensor:
-    """R1 gradient penalty on real images (Mescheder et al., 2018)."""
-    real_images = real_images.detach().requires_grad_(True)
-    real_logits = discriminator(real_images)
-    grad_outputs = [torch.ones_like(l) for l in real_logits]
-    all_logits = torch.cat([l.reshape(l.shape[0], -1) for l in real_logits], dim=1)
-    grads = torch.autograd.grad(
-        outputs=all_logits.sum(),
-        inputs=real_images,
-        create_graph=True,
-    )[0]
-    return grads.pow(2).sum(dim=(1, 2, 3)).mean()
-
 
 def save_checkpoint(
     model,
@@ -591,7 +575,6 @@ def train(cfg, args):
     warmup_steps = cfg["training"]["warmup_steps"]
     grad_clip_g = cfg["training"].get("grad_clip", 1.0)
     grad_clip_d = cfg["training"].get("discriminator_grad_clip", grad_clip_g)
-    r1_weight = cfg["training"].get("r1_weight", 10.0)
     model_image_size = model.generator.image_size
 
     print(f"Generator parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -693,13 +676,6 @@ def train(cfg, args):
             if not torch.isfinite(d_loss):
                 step_has_nonfinite = True
                 break
-
-            # R1 gradient penalty (computed outside autocast for numerical stability)
-            r1_penalty = refine_target.new_zeros(())
-            if r1_weight > 0:
-                r1_penalty = compute_r1_penalty(discriminator, refine_target)
-                d_loss = d_loss + 0.5 * r1_weight * r1_penalty
-            d_metrics["r1_penalty"] = r1_penalty.item()
 
             scaler.scale(d_loss / grad_accum).backward()
 
