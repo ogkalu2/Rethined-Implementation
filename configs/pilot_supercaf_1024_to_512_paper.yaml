@@ -60,9 +60,9 @@ data:
     min_capsule_width_ratio: 0.008
     max_capsule_width_ratio: 0.035
     min_component_count: 10
-    max_component_count: 52
-    articulated_probability: 0.45
-    connector_probability: 0.35
+    max_component_count: 28
+    articulated_probability: 0.25
+    connector_probability: 0.15
     overlap_tolerance: 0.08
   force_random_masks_train: true
   force_random_masks_eval: true
