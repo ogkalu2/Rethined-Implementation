@@ -84,7 +84,7 @@ loss:
   reranker_loss_weight: 0
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.15
-  boundary_identity_weight: 0.25
+  boundary_identity_weight: 0
   coordinate_loss_weight: 0
   coherence_loss_weight: 0
   loss_schedule_focus_steps: 0
