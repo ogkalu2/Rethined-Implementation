@@ -278,7 +278,7 @@ def build_checkpoint_metrics(train_metrics, best_metric_name, best_metric_mode, 
     return checkpoint_metrics
 
 
-def format_train_metric_snapshot(metrics):
+def format_train_metric_snapshot(metrics, include_retrieval=True):
     summary = (
         f"train g={metrics['generator_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
@@ -286,13 +286,24 @@ def format_train_metric_snapshot(metrics):
     )
     if "refined_query_patch_l1" in metrics:
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
-    if "retrieval_recall1" in metrics:
+    if include_retrieval and "retrieval_recall1" in metrics:
         summary += f", r1={metrics['retrieval_recall1']:.3f}"
-    if "retrieval_recall8" in metrics:
+    if include_retrieval and "retrieval_recall8" in metrics:
         summary += f", r8={metrics['retrieval_recall8']:.3f}"
-    if "retrieval_recall32" in metrics:
+    if include_retrieval and "retrieval_recall32" in metrics:
         summary += f", r32={metrics['retrieval_recall32']:.3f}"
     return summary
+
+
+def format_val_retrieval_snapshot(metrics):
+    parts = []
+    if "retrieval_recall1" in metrics:
+        parts.append(f"r1={metrics['retrieval_recall1']:.3f}")
+    if "retrieval_recall8" in metrics:
+        parts.append(f"r8={metrics['retrieval_recall8']:.3f}")
+    if "retrieval_recall32" in metrics:
+        parts.append(f"r32={metrics['retrieval_recall32']:.3f}")
+    return ", ".join(parts)
 
 
 def save_vis(writer, batch, coarse, refined, step, log_dir=None):
@@ -311,7 +322,7 @@ def save_vis(writer, batch, coarse, refined, step, log_dir=None):
 
 
 @torch.no_grad()
-def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ctx, max_batches=8):
+def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ctx, criterion=None, max_batches=8):
     model.eval()
     raw_model = unwrap_model(model)
     attn_upscaler = AttentionUpscaling(raw_model.generator)
@@ -336,11 +347,20 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
         refine_target = batch_views["refine_target"]
 
         with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
-            refined_lr, attn_map, coarse_raw = model(
-                masked_image,
-                mask,
-                value_image=refine_target,
-            )
+            if criterion is not None:
+                refined_lr, attn_map, coarse_raw, attention_aux = model(
+                    masked_image,
+                    mask,
+                    value_image=refine_target,
+                    return_aux=True,
+                )
+            else:
+                refined_lr, attn_map, coarse_raw = model(
+                    masked_image,
+                    mask,
+                    value_image=refine_target,
+                )
+                attention_aux = None
 
         refined_lr = refined_lr.clamp(0, 1)
         coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
@@ -384,6 +404,11 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
         metric_counts["masked_l1_hr_refined"] += int(hr_refined_err.numel())
         metric_sums["hr_gain_abs"] += float(hr_gain.sum().item())
         metric_counts["hr_gain_abs"] += int(hr_gain.numel())
+        if criterion is not None:
+            retrieval_metrics = criterion.attention_supervision_metrics(refine_target, attention_aux)
+            for key in ("retrieval_recall1", "retrieval_recall8", "retrieval_recall32"):
+                metric_sums[key] += float(retrieval_metrics[key])
+                metric_counts[key] += 1
 
     model.train()
     if dist_ctx.enabled:
@@ -415,7 +440,7 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
     hr_coarse_mean = mean_from("masked_l1_hr_coarse_baseline")
     hr_refined_mean = mean_from("masked_l1_hr_refined")
     hr_gain_mean = mean_from("hr_gain_abs")
-    return {
+    result = {
         "masked_l1_lr_coarse": lr_coarse_mean,
         "masked_l1_lr_refined": lr_refined_mean,
         "lr_gain_abs": lr_gain_mean,
@@ -433,6 +458,11 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
             else None
         ),
     }
+    for key in ("retrieval_recall1", "retrieval_recall8", "retrieval_recall32"):
+        value = mean_from(key)
+        if value is not None:
+            result[key] = value
+    return result
 
 
 def write_status(log_dir, step, total_steps, metrics, lr):
@@ -558,6 +588,8 @@ def run_eval_only(cfg, args, dist_ctx):
     if isinstance(eval_sampler, DistributedSampler):
         eval_sampler.set_epoch(0)
 
+    loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
+    criterion = InpaintingLoss(**loss_cfg).to(device)
     health = validate_model(
         model,
         eval_loader,
@@ -565,6 +597,7 @@ def run_eval_only(cfg, args, dist_ctx):
         cfg["training"]["mixed_precision"],
         unwrap_model(model).generator.image_size,
         dist_ctx,
+        criterion=criterion,
         max_batches=(args.eval_batches if args.eval_batches is not None else cfg.get("logging", {}).get("eval_batches", 8)),
     )
     if dist_ctx.is_main_process:
@@ -610,8 +643,8 @@ def train(cfg, args, dist_ctx):
         else:
             base_params.append(param)
 
-    scorer_lr = cfg["training"].get("scorer_lr", cfg["training"]["lr"] * 3)
-    scorer_min_lr = cfg["training"].get("scorer_min_lr", cfg["training"]["min_lr"] * 3)
+    scorer_lr = cfg["training"].get("scorer_lr", cfg["training"]["lr"])
+    scorer_min_lr = cfg["training"].get("scorer_min_lr", cfg["training"]["min_lr"])
     optimizer_g = torch.optim.Adam(
         [
             {"params": base_params, "lr": cfg["training"]["lr"]},
@@ -860,6 +893,7 @@ def train(cfg, args, dist_ctx):
                 cfg["training"]["mixed_precision"],
                 model_image_size,
                 dist_ctx,
+                criterion=criterion,
                 max_batches=log_cfg.get("eval_batches", 8),
             )
             if dist_ctx.is_main_process:
@@ -871,14 +905,22 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("val/hr_masked_l1_refined", val_metrics["masked_l1_hr_refined"], step)
                 if val_metrics["hr_gain_pct"] is not None:
                     writer.add_scalar("val/hr_gain_pct", val_metrics["hr_gain_pct"], step)
+                if "retrieval_recall1" in val_metrics:
+                    writer.add_scalar("val/retrieval_recall1", val_metrics["retrieval_recall1"], step)
+                if "retrieval_recall8" in val_metrics:
+                    writer.add_scalar("val/retrieval_recall8", val_metrics["retrieval_recall8"], step)
+                if "retrieval_recall32" in val_metrics:
+                    writer.add_scalar("val/retrieval_recall32", val_metrics["retrieval_recall32"], step)
                 write_validation_history(log_cfg["log_dir"], step, val_metrics)
+                retrieval_snapshot = format_val_retrieval_snapshot(val_metrics)
+                retrieval_suffix = f" | val {retrieval_snapshot}" if retrieval_snapshot else ""
                 progress_bar.write(
                     f"Validation step {step}: "
                     f"LR {val_metrics['masked_l1_lr_coarse']:.4f} -> {val_metrics['masked_l1_lr_refined']:.4f} "
                     f"(gain {val_metrics['lr_gain_pct']:.2f}%) | "
                     f"HR {val_metrics['masked_l1_hr_coarse_baseline']:.4f} -> {val_metrics['masked_l1_hr_refined']:.4f} "
-                    f"(gain {val_metrics['hr_gain_pct']:.2f}%)\n"
-                    f"  {format_train_metric_snapshot(metrics)}"
+                    f"(gain {val_metrics['hr_gain_pct']:.2f}%){retrieval_suffix}\n"
+                    f"  {format_train_metric_snapshot(metrics, include_retrieval=False)}"
                 )
                 current_best_metric = val_metrics.get(best_metric_name)
                 if save_best_checkpoint and is_better_metric(current_best_metric, best_metric_value, best_metric_mode):
