@@ -15,9 +15,7 @@ class SinglePatchDiscriminator(nn.Module):
         super().__init__()
         channels = int(base_channels)
         layers = [
-            nn.utils.spectral_norm(
-                nn.Conv2d(in_channels, channels, kernel_size=4, stride=2, padding=1)
-            ),
+            nn.Conv2d(in_channels, channels, kernel_size=4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
         ]
 
@@ -27,19 +25,14 @@ class SinglePatchDiscriminator(nn.Module):
             stride = 1 if layer_idx == n_layers - 1 else 2
             layers.extend(
                 [
-                    nn.utils.spectral_norm(
-                        nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=stride, padding=1)
-                    ),
+                    nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=stride, padding=1, bias=False),
+                    nn.BatchNorm2d(out_ch),
                     nn.LeakyReLU(0.2, inplace=True),
                 ]
             )
             in_ch = out_ch
 
-        layers.append(
-            nn.utils.spectral_norm(
-                nn.Conv2d(in_ch, 1, kernel_size=4, stride=1, padding=1)
-            )
-        )
+        layers.append(nn.Conv2d(in_ch, 1, kernel_size=4, stride=1, padding=1))
         self.model = nn.Sequential(*layers)
 
     def forward(self, x):
