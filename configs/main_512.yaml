@@ -71,12 +71,13 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
-  retrieval_loss_weight: 1.0
+  retrieval_loss_weight: 0.5
+  retrieval_hard_ce_weight: 1.0
   retrieval_teacher_patch_padding: 8
-  retrieval_teacher_temperature: 0.07
+  retrieval_teacher_temperature: 0.15
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
-  perceptual_weight: 0.1
+  perceptual_weight: 0.15
 
 logging:
   log_dir: "logs/train_main"
