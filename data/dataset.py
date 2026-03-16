@@ -97,6 +97,7 @@ class InpaintingDataset(Dataset):
         deterministic: bool = False,
         fixed_mask_seed: int = 0,
         force_random_masks: bool = False,
+        mask_generator_kwargs: Optional[dict] = None,
     ):
         self.image_size = image_size
         self.split = split
@@ -104,6 +105,7 @@ class InpaintingDataset(Dataset):
         self.deterministic = deterministic
         self.fixed_mask_seed = int(fixed_mask_seed)
         self.force_random_masks = bool(force_random_masks)
+        self.mask_generator_kwargs = dict(mask_generator_kwargs or {})
 
         if self.manifest_path is not None:
             self.samples = _load_manifest(self.manifest_path, split)
@@ -144,6 +146,7 @@ class InpaintingDataset(Dataset):
             image_size=image_size,
             min_coverage=mask_min_coverage,
             max_coverage=mask_max_coverage,
+            **self.mask_generator_kwargs,
         )
 
     def _resize_if_needed(self, image: Image.Image, mask: Optional[Image.Image]):
@@ -251,6 +254,7 @@ def get_dataloader(
     deterministic: bool = False,
     fixed_mask_seed: int = 0,
     force_random_masks: bool = False,
+    mask_generator_kwargs: Optional[dict] = None,
     shuffle_override: Optional[bool] = None,
     distributed: bool = False,
     rank: int = 0,
@@ -270,6 +274,7 @@ def get_dataloader(
         deterministic=deterministic,
         fixed_mask_seed=fixed_mask_seed,
         force_random_masks=force_random_masks,
+        mask_generator_kwargs=mask_generator_kwargs,
     )
     loader_kwargs = {
         "dataset": dataset,

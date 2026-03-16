@@ -379,6 +379,7 @@ def main():
         deterministic=cfg["data"].get("force_random_masks_eval", False),
         fixed_mask_seed=cfg["training"]["seed"],
         force_random_masks=cfg["data"].get("force_random_masks_eval", False),
+        mask_generator_kwargs=cfg["data"].get("mask_generator"),
         shuffle_override=False,
     )
     quality = evaluate_quality(model, val_loader, device, model.generator.image_size, num_images=args.num_images)

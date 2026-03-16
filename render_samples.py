@@ -135,6 +135,7 @@ def main():
         manifest_path=cfg["data"].get("manifest_path"),
         deterministic=args.deterministic,
         fixed_mask_seed=args.fixed_mask_seed,
+        mask_generator_kwargs=cfg["data"].get("mask_generator"),
     )
     if args.random_masks and any(sample["mask_path"] is not None for sample in dataset.samples):
         print(
