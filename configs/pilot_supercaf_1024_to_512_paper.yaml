@@ -40,7 +40,7 @@ model:
     feature_dim: null
     concat_features: true
     detach_coarse_rgb: false
-    final_conv: true
+    final_conv: false
     attention_masking: true
     supervision_band_radius: 1
 
@@ -76,7 +76,7 @@ loss:
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 0.5
   retrieval_hard_ce_weight: 1.0
-  retrieval_teacher_patch_padding: 8
+  retrieval_teacher_patch_padding: 4
   retrieval_teacher_temperature: 0.15
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
