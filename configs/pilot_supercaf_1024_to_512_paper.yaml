@@ -75,8 +75,8 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
-  retrieval_loss_weight: 0.5
-  retrieval_hard_ce_weight: 1.0
+  retrieval_loss_weight: 0.25
+  retrieval_hard_ce_weight: 2.0
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.15
   loss_schedule_focus_steps: 0
