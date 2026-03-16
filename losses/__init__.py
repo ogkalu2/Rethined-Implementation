@@ -278,9 +278,7 @@ class InpaintingLoss(nn.Module):
         return torch.stack(losses).mean()
 
     def _normalize_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
-        patch_tokens = patch_tokens.float()
-        patch_tokens = patch_tokens - patch_tokens.mean(dim=-1, keepdim=True)
-        return F.normalize(patch_tokens, dim=-1, eps=1e-6)
+        return patch_tokens.float()
 
     def _token_coords(
         self,
@@ -418,7 +416,11 @@ class InpaintingLoss(nn.Module):
             batch_query_mask = query_mask_flat[batch_idx, query_indices] > 0.5
             query_teacher_tokens = teacher_tokens[batch_idx, query_indices]
             key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
-            teacher_logits = torch.matmul(query_teacher_tokens, key_teacher_tokens.transpose(0, 1))
+            teacher_logits = -torch.cdist(
+                query_teacher_tokens.unsqueeze(0),
+                key_teacher_tokens.unsqueeze(0),
+                p=1,
+            ).squeeze(0) / max(query_teacher_tokens.shape[-1], 1)
             teacher_logits = teacher_logits / self.retrieval_teacher_temperature
             teacher_probs = F.softmax(teacher_logits, dim=-1)
             boundary_mask = ~batch_query_mask
@@ -493,9 +495,7 @@ class InpaintingLoss(nn.Module):
                             valid_rerank_logits = rerank_logits[valid_queries]
                             valid_query_teacher_tokens = teacher_tokens[batch_idx, valid_rerank_query_indices]
                             candidate_teacher_tokens = teacher_tokens[batch_idx, valid_candidate_key_indices]
-                            candidate_teacher_logits = (
-                                candidate_teacher_tokens * valid_query_teacher_tokens.unsqueeze(1)
-                            ).sum(dim=-1)
+                            candidate_teacher_logits = -(candidate_teacher_tokens - valid_query_teacher_tokens.unsqueeze(1)).abs().mean(dim=-1)
                             candidate_teacher_logits = (
                                 candidate_teacher_logits / self.retrieval_teacher_temperature
                             )
