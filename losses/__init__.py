@@ -113,6 +113,7 @@ class InpaintingLoss(nn.Module):
         refined_l1_weight: float = 1.0,
         refined_query_patch_l1_weight: float = 0.0,
         retrieval_loss_weight: float = 0.0,
+        retrieval_hard_ce_weight: float = 0.0,
         reranker_loss_weight: float = 0.0,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
@@ -140,6 +141,7 @@ class InpaintingLoss(nn.Module):
         self.refined_l1_weight = float(refined_l1_weight)
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
+        self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
         self.reranker_loss_weight = float(reranker_loss_weight)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
@@ -351,6 +353,7 @@ class InpaintingLoss(nn.Module):
         zero = refined_target.new_zeros(())
         loss_terms = {
             "retrieval": zero,
+            "retrieval_hard_ce": zero,
             "reranker": zero,
             "boundary_identity": zero,
             "coordinate": zero,
@@ -391,6 +394,7 @@ class InpaintingLoss(nn.Module):
         teacher_tokens = self._normalize_patch_tokens(teacher_tokens)
 
         retrieval_losses = []
+        retrieval_hard_ce_losses = []
         reranker_losses = []
         boundary_losses = []
         coordinate_losses = []
@@ -461,6 +465,9 @@ class InpaintingLoss(nn.Module):
                 masked_teacher_best = masked_teacher_probs.argmax(dim=-1)
                 retrieval_losses.append(
                     (-(masked_teacher_probs * masked_pred_log_probs).sum(dim=-1)).mean()
+                )
+                retrieval_hard_ce_losses.append(
+                    F.cross_entropy(masked_raw_logits, masked_teacher_best)
                 )
                 for top_k, metric_name in ((1, retrieval_recall1), (8, retrieval_recall8), (32, retrieval_recall32)):
                     k = min(top_k, masked_raw_logits.shape[-1])
@@ -539,6 +546,8 @@ class InpaintingLoss(nn.Module):
 
         if retrieval_losses:
             loss_terms["retrieval"] = torch.stack(retrieval_losses).mean()
+        if retrieval_hard_ce_losses:
+            loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
         if reranker_losses:
             loss_terms["reranker"] = torch.stack(reranker_losses).mean()
         if boundary_losses:
@@ -601,6 +610,7 @@ class InpaintingLoss(nn.Module):
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
+            + self.retrieval_hard_ce_weight * attention_loss_terms["retrieval_hard_ce"]
             + self.reranker_loss_weight * attention_loss_terms["reranker"]
             + scheduled_weights["boundary_identity_weight"] * attention_loss_terms["boundary_identity"]
             + scheduled_weights["coordinate_loss_weight"] * attention_loss_terms["coordinate"]
@@ -614,6 +624,7 @@ class InpaintingLoss(nn.Module):
             "refined_l1": refined_l1.item(),
             "refined_query_patch_l1": refined_query_patch_l1.item(),
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
+            "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
             "reranker_loss": attention_loss_terms["reranker"].item(),
             "boundary_identity_loss": attention_loss_terms["boundary_identity"].item(),
             "coordinate_loss": attention_loss_terms["coordinate"].item(),
