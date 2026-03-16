@@ -1,5 +1,3 @@
-"""Paper-aligned RETHINED evaluation."""
-
 from __future__ import annotations
 
 import argparse
@@ -293,7 +291,7 @@ def test_upscaling_quality(model, dataloader, device, hr_res=2048, num_images=50
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Paper-aligned RETHINED evaluation")
+    parser = argparse.ArgumentParser(description="Model Evaluation")
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--device", type=str, default=None)

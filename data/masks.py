@@ -1,6 +1,6 @@
 """LaMa-style free-form mask generation for image inpainting.
 
-Generates random masks with controllable coverage (30-50% as per RETHINED paper).
+Generates random masks with controllable coverage (30-50%).
 Mask convention: 1 = hole (to be inpainted), 0 = valid region.
 """
 

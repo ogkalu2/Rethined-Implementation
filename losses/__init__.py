@@ -1,5 +1,3 @@
-"""Paper-aligned losses for RETHINED training."""
-
 from __future__ import annotations
 
 import torch
@@ -97,7 +95,7 @@ class FocalFrequencyLoss(nn.Module):
 
 
 class InpaintingLoss(nn.Module):
-    """Paper-aligned generator and discriminator losses."""
+    """Generator and discriminator losses."""
 
     SCHEDULED_WEIGHT_NAMES = (
         "retrieval_loss_weight",

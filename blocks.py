@@ -1,5 +1,3 @@
-"""Shared building blocks for the RETHINED model family."""
-
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -38,7 +36,7 @@ def fuse_conv_bn_pair(conv: nn.Module, bn: nn.Module) -> tuple[nn.Module, nn.Mod
 
 
 def make_norm2d(num_channels: int) -> nn.Module:
-    """Return the BatchNorm2d layer described by the paper."""
+    """Return a BatchNorm2d layer."""
     return nn.BatchNorm2d(num_channels)
 
 

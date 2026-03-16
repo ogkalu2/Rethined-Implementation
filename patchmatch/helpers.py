@@ -422,7 +422,7 @@ class PatchmatchHelpersMixin:
 
         return mixed, dense_attn, reranker_entries
 
-    def build_paper_attention_mask(
+    def build_attention_mask(
         self,
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor | None = None,

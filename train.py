@@ -1,5 +1,3 @@
-"""Paper-aligned RETHINED training entry point."""
-
 from __future__ import annotations
 
 import argparse
@@ -929,7 +927,7 @@ def train(cfg, args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Paper-aligned RETHINED training")
+    parser = argparse.ArgumentParser(description="Model Training")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config")
     parser.add_argument("--resume", type=str, default=None, help="Checkpoint to resume from")
     parser.add_argument("--device", type=str, default=None, help="Device override, e.g. cuda, xpu, cpu")

@@ -157,7 +157,7 @@ class MultiHeadAttention(nn.Module):
 
         if direct_patch_mixing:
             if self.n_head != 1:
-                raise ValueError("Paper-style direct patch mixing expects a single attention head.")
+                raise ValueError("direct patch mixing expects a single attention head.")
             v_proj = v.unsqueeze(1)
         else:
             v_proj = self.w_vs(v).view(batch_size, len_v, self.n_head, self.d_v).transpose(1, 2)

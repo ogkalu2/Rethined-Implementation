@@ -1,4 +1,4 @@
-"""Paper-aligned NeuralPatchMatch refinement modules."""
+"""NeuralPatchMatch refinement modules."""
 
 from .attention import MultiHeadAttention
 from .inpainting import PatchInpainting
