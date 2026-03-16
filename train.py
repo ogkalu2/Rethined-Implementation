@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import nullcontext
 import json
 import math
 import random
@@ -12,6 +13,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
@@ -22,8 +25,8 @@ from device_utils import (
     get_device_name,
     get_peak_memory_allocated_gb,
     is_amp_enabled,
-    resolve_device,
 )
+from distributed_utils import barrier, destroy_distributed, init_distributed, reduce_metrics, reduce_scalar, unwrap_model
 from hr import AttentionUpscaling
 from losses import InpaintingLoss
 from model import InpaintingModel
@@ -155,6 +158,12 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
 
 
+def metric_to_float(value):
+    if isinstance(value, torch.Tensor):
+        return float(value.detach().item())
+    return float(value)
+
+
 def save_checkpoint(
     model,
     optimizer_g,
@@ -164,10 +173,11 @@ def save_checkpoint(
     cfg,
     path,
 ):
+    raw_model = unwrap_model(model)
     torch.save(
         {
             "step": step,
-            "model_state_dict": model.state_dict(),
+            "model_state_dict": raw_model.state_dict(),
             "optimizer_g_state_dict": optimizer_g.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "metrics": metrics,
@@ -178,12 +188,15 @@ def save_checkpoint(
 
 
 def load_model_checkpoint(model, state_dict):
+    raw_model = unwrap_model(model)
+    if state_dict and all(key.startswith("module.") for key in state_dict):
+        state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
     filtered_state_dict = {
         key: value
         for key, value in state_dict.items()
         if ".transport_" not in key and "transport_" not in key
     }
-    missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
+    missing_keys, unexpected_keys = raw_model.load_state_dict(filtered_state_dict, strict=False)
     unexpected_non_transport = [
         key for key in unexpected_keys
         if "transport_" not in key
@@ -298,18 +311,15 @@ def save_vis(writer, batch, coarse, refined, step, log_dir=None):
 
 
 @torch.no_grad()
-def validate_model(model, dataloader, device, use_amp, model_image_size, max_batches=8):
+def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ctx, max_batches=8):
     model.eval()
-    attn_upscaler = AttentionUpscaling(model.generator)
+    raw_model = unwrap_model(model)
+    attn_upscaler = AttentionUpscaling(raw_model.generator)
     amp_device_type = get_autocast_device_type(device)
     amp_enabled = is_amp_enabled(device, use_amp)
 
-    lr_coarse_values = []
-    lr_refined_values = []
-    lr_gain_values = []
-    hr_coarse_values = []
-    hr_refined_values = []
-    hr_gain_values = []
+    metric_sums = defaultdict(float)
+    metric_counts = defaultdict(int)
 
     for batch_idx, batch in enumerate(dataloader):
         if max_batches is not None and max_batches > 0 and batch_idx >= max_batches:
@@ -319,7 +329,7 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
             batch,
             device,
             model_image_size,
-            blur_layer=model.generator.final_gaussian_blur,
+            blur_layer=raw_model.generator.final_gaussian_blur,
         )
         mask = batch_views["mask"]
         masked_image = batch_views["masked_image"]
@@ -336,9 +346,13 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
         coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
         lr_coarse_err = masked_l1(coarse_lr, refine_target, mask)
         lr_refined_err = masked_l1(refined_lr, refine_target, mask)
-        lr_coarse_values.extend(lr_coarse_err.tolist())
-        lr_refined_values.extend(lr_refined_err.tolist())
-        lr_gain_values.extend((lr_coarse_err - lr_refined_err).tolist())
+        lr_gain = lr_coarse_err - lr_refined_err
+        metric_sums["masked_l1_lr_coarse"] += float(lr_coarse_err.sum().item())
+        metric_counts["masked_l1_lr_coarse"] += int(lr_coarse_err.numel())
+        metric_sums["masked_l1_lr_refined"] += float(lr_refined_err.sum().item())
+        metric_counts["masked_l1_lr_refined"] += int(lr_refined_err.numel())
+        metric_sums["lr_gain_abs"] += float(lr_gain.sum().item())
+        metric_counts["lr_gain_abs"] += int(lr_gain.numel())
 
         if batch_views["has_hr_target"]:
             target = batch_views["image_hr"]
@@ -358,30 +372,64 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, max_bat
             refined_eval = composite_with_known(refined_hr, target, eval_mask)
             hr_coarse_err = masked_l1(coarse_eval, target, eval_mask)
             hr_refined_err = masked_l1(refined_eval, target, eval_mask)
-            hr_coarse_values.extend(hr_coarse_err.tolist())
-            hr_refined_values.extend(hr_refined_err.tolist())
-            hr_gain_values.extend((hr_coarse_err - hr_refined_err).tolist())
+            hr_gain = hr_coarse_err - hr_refined_err
         else:
-            hr_coarse_values.extend(lr_coarse_err.tolist())
-            hr_refined_values.extend(lr_refined_err.tolist())
-            hr_gain_values.extend((lr_coarse_err - lr_refined_err).tolist())
+            hr_coarse_err = lr_coarse_err
+            hr_refined_err = lr_refined_err
+            hr_gain = lr_gain
+
+        metric_sums["masked_l1_hr_coarse_baseline"] += float(hr_coarse_err.sum().item())
+        metric_counts["masked_l1_hr_coarse_baseline"] += int(hr_coarse_err.numel())
+        metric_sums["masked_l1_hr_refined"] += float(hr_refined_err.sum().item())
+        metric_counts["masked_l1_hr_refined"] += int(hr_refined_err.numel())
+        metric_sums["hr_gain_abs"] += float(hr_gain.sum().item())
+        metric_counts["hr_gain_abs"] += int(hr_gain.numel())
 
     model.train()
+    if dist_ctx.enabled:
+        reduced_payload = {}
+        for key in sorted(metric_sums):
+            reduced_payload[f"{key}/sum"] = metric_sums[key]
+            reduced_payload[f"{key}/count"] = float(metric_counts[key])
+        reduced_payload = reduce_metrics(reduced_payload, dist_ctx, average=False)
+        metric_sums = {
+            key[:-4]: value
+            for key, value in reduced_payload.items()
+            if key.endswith("/sum")
+        }
+        metric_counts = {
+            key[:-6]: int(round(value))
+            for key, value in reduced_payload.items()
+            if key.endswith("/count")
+        }
+
+    def mean_from(name):
+        count = metric_counts.get(name, 0)
+        if count <= 0:
+            return None
+        return metric_sums[name] / count
+
+    lr_coarse_mean = mean_from("masked_l1_lr_coarse")
+    lr_refined_mean = mean_from("masked_l1_lr_refined")
+    lr_gain_mean = mean_from("lr_gain_abs")
+    hr_coarse_mean = mean_from("masked_l1_hr_coarse_baseline")
+    hr_refined_mean = mean_from("masked_l1_hr_refined")
+    hr_gain_mean = mean_from("hr_gain_abs")
     return {
-        "masked_l1_lr_coarse": mean_metric(lr_coarse_values),
-        "masked_l1_lr_refined": mean_metric(lr_refined_values),
-        "lr_gain_abs": mean_metric(lr_gain_values),
+        "masked_l1_lr_coarse": lr_coarse_mean,
+        "masked_l1_lr_refined": lr_refined_mean,
+        "lr_gain_abs": lr_gain_mean,
         "lr_gain_pct": (
-            100.0 * (mean_metric(lr_gain_values) / max(mean_metric(lr_coarse_values), 1e-8))
-            if lr_coarse_values
+            100.0 * (lr_gain_mean / max(lr_coarse_mean, 1e-8))
+            if lr_coarse_mean is not None and lr_gain_mean is not None
             else None
         ),
-        "masked_l1_hr_coarse_baseline": mean_metric(hr_coarse_values),
-        "masked_l1_hr_refined": mean_metric(hr_refined_values),
-        "hr_gain_abs": mean_metric(hr_gain_values),
+        "masked_l1_hr_coarse_baseline": hr_coarse_mean,
+        "masked_l1_hr_refined": hr_refined_mean,
+        "hr_gain_abs": hr_gain_mean,
         "hr_gain_pct": (
-            100.0 * (mean_metric(hr_gain_values) / max(mean_metric(hr_coarse_values), 1e-8))
-            if hr_coarse_values
+            100.0 * (hr_gain_mean / max(hr_coarse_mean, 1e-8))
+            if hr_coarse_mean is not None and hr_gain_mean is not None
             else None
         ),
     }
@@ -431,7 +479,7 @@ def write_validation_history(log_dir, step, metrics):
         json.dump(history, handle, indent=2)
 
 
-def build_train_loader(cfg, args):
+def build_train_loader(cfg, args, dist_ctx):
     max_images = args.overfit if args.overfit else None
     num_workers = 0 if args.overfit else cfg["data"]["num_workers"]
     return get_dataloader(
@@ -451,10 +499,14 @@ def build_train_loader(cfg, args):
         fixed_mask_seed=cfg["training"]["seed"],
         force_random_masks=(cfg["data"].get("force_random_masks_train", False) or args.force_random_masks),
         shuffle_override=(False if args.overfit else None),
+        distributed=dist_ctx.enabled,
+        rank=dist_ctx.rank,
+        world_size=dist_ctx.world_size,
+        sampler_seed=cfg["training"]["seed"],
     )
 
 
-def build_eval_loader(cfg, args):
+def build_eval_loader(cfg, args, dist_ctx):
     eval_interval = cfg.get("logging", {}).get("eval_interval", 0)
     if eval_interval <= 0 and not args.eval_only:
         return None
@@ -478,45 +530,63 @@ def build_eval_loader(cfg, args):
         fixed_mask_seed=cfg["training"]["seed"],
         force_random_masks=(cfg["data"].get("force_random_masks_eval", False) or args.force_random_masks),
         shuffle_override=False,
+        distributed=dist_ctx.enabled,
+        rank=dist_ctx.rank,
+        world_size=dist_ctx.world_size,
+        sampler_seed=cfg["training"]["seed"],
     )
 
 
-def run_eval_only(cfg, args):
-    device = resolve_device(args.device)
-    print_device_banner(device)
+def run_eval_only(cfg, args, dist_ctx):
+    device = dist_ctx.device
+    if dist_ctx.is_main_process:
+        print_device_banner(device)
     seed_everything(cfg["training"]["seed"])
 
     model = InpaintingModel(build_model_config(cfg)).to(device)
     if not args.resume:
         raise ValueError("--eval-only requires --resume CHECKPOINT")
     checkpoint_step = load_eval_checkpoint(args.resume, model, device)
-    model.generator.set_training_step(checkpoint_step)
-    eval_loader = build_eval_loader(cfg, args)
+    unwrap_model(model).generator.set_training_step(checkpoint_step)
+    eval_loader = build_eval_loader(cfg, args, dist_ctx)
     if eval_loader is None:
         raise ValueError("No evaluation loader configured.")
+
+    eval_sampler = getattr(eval_loader, "sampler", None)
+    if isinstance(eval_sampler, DistributedSampler):
+        eval_sampler.set_epoch(0)
 
     health = validate_model(
         model,
         eval_loader,
         device,
         cfg["training"]["mixed_precision"],
-        model.generator.image_size,
+        unwrap_model(model).generator.image_size,
+        dist_ctx,
         max_batches=(args.eval_batches if args.eval_batches is not None else cfg.get("logging", {}).get("eval_batches", 8)),
     )
-    print(json.dumps(health, indent=2))
+    if dist_ctx.is_main_process:
+        print(json.dumps(health, indent=2))
 
-    log_dir = Path(cfg["logging"]["log_dir"])
-    log_dir.mkdir(parents=True, exist_ok=True)
-    with open(log_dir / "eval_only_full_val.json", "w", encoding="utf-8") as handle:
-        json.dump(health, handle, indent=2)
+        log_dir = Path(cfg["logging"]["log_dir"])
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "eval_only_full_val.json", "w", encoding="utf-8") as handle:
+            json.dump(health, handle, indent=2)
+    barrier(dist_ctx)
 
 
-def train(cfg, args):
-    device = resolve_device(args.device)
-    print_device_banner(device)
+def train(cfg, args, dist_ctx):
+    device = dist_ctx.device
+    if dist_ctx.is_main_process:
+        print_device_banner(device)
+        if dist_ctx.enabled:
+            print(
+                f"Distributed training enabled: world_size={dist_ctx.world_size}, "
+                f"backend={dist_ctx.backend}"
+            )
     seed_everything(cfg["training"]["seed"])
 
-    model = InpaintingModel(build_model_config(cfg)).to(device)
+    raw_model = InpaintingModel(build_model_config(cfg)).to(device)
     loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
     criterion = InpaintingLoss(**loss_cfg).to(device)
 
@@ -530,7 +600,7 @@ def train(cfg, args):
     }
     scorer_params = []
     base_params = []
-    for name, param in model.named_parameters():
+    for name, param in raw_model.named_parameters():
         parts = name.split(".")
         # Check if any part of the parameter path matches a scorer module
         if any(part in scorer_param_names for part in parts):
@@ -550,44 +620,20 @@ def train(cfg, args):
 
     use_amp = is_amp_enabled(device, cfg["training"]["mixed_precision"])
     if cfg["training"]["mixed_precision"] and not use_amp:
-        print("Mixed precision requested, but no supported accelerator is active; disabling AMP.")
+        if dist_ctx.is_main_process:
+            print("Mixed precision requested, but no supported accelerator is active; disabling AMP.")
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
 
-    train_loader = build_train_loader(cfg, args)
-    eval_loader = build_eval_loader(cfg, args)
-    print(f"Training images: {len(train_loader.dataset)}")
-    if eval_loader is not None:
-        print(f"Validation images: {len(eval_loader.dataset)}")
-
-    log_cfg = cfg["logging"]
-    total_steps = args.steps if args.steps else cfg["training"]["total_steps"]
-    grad_accum = 1 if args.overfit else cfg["training"]["grad_accum_steps"]
-    max_lr = cfg["training"]["lr"]
-    min_lr = cfg["training"]["min_lr"]
-    warmup_steps = cfg["training"]["warmup_steps"]
-    grad_clip_g = cfg["training"].get("grad_clip", 1.0)
-    model_image_size = model.generator.image_size
-
-    print(f"Generator parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"  Base parameters: {sum(p.numel() for p in base_params):,}")
-    print(f"  Scorer parameters: {sum(p.numel() for p in scorer_params):,} (LR: {scorer_lr})")
-    print(f"Effective batch size: {cfg['data']['batch_size'] * grad_accum}")
-
-    log_dir = Path(log_cfg["log_dir"])
-    ckpt_dir = log_dir / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    writer = create_summary_writer(log_dir / "tb")
-
     start_step = 0
-    best_metric_name = log_cfg.get("save_best_metric", "masked_l1_hr_refined")
-    best_metric_mode = log_cfg.get("save_best_mode", "min")
-    save_best_checkpoint = log_cfg.get("save_best_checkpoint", True)
+    best_metric_name = cfg["logging"].get("save_best_metric", "masked_l1_hr_refined")
+    best_metric_mode = cfg["logging"].get("save_best_mode", "min")
+    save_best_checkpoint = cfg["logging"].get("save_best_checkpoint", True)
     best_metric_value = None
     best_metric_step = None
     if args.resume:
         resume_state = load_training_checkpoint(
             args.resume,
-            model,
+            raw_model,
             optimizer_g,
             scaler,
             device,
@@ -596,9 +642,56 @@ def train(cfg, args):
         if resume_state["best_metric_name"] == best_metric_name and resume_state["best_metric_mode"] == best_metric_mode:
             best_metric_value = resume_state["best_metric_value"]
             best_metric_step = resume_state["best_metric_step"]
+
+    ddp_find_unused = cfg["training"].get("ddp_find_unused_parameters", False)
+    if dist_ctx.enabled:
+        ddp_kwargs = {"find_unused_parameters": ddp_find_unused}
+        if device.type == "cuda":
+            ddp_kwargs["device_ids"] = [device.index]
+            ddp_kwargs["output_device"] = device.index
+        model = DDP(raw_model, **ddp_kwargs)
+    else:
+        model = raw_model
+
+    train_loader = build_train_loader(cfg, args, dist_ctx)
+    eval_loader = build_eval_loader(cfg, args, dist_ctx)
+    train_sampler = train_loader.sampler if isinstance(train_loader.sampler, DistributedSampler) else None
+    eval_sampler = eval_loader.sampler if (eval_loader is not None and isinstance(eval_loader.sampler, DistributedSampler)) else None
+    if train_sampler is not None:
+        train_sampler.set_epoch(0)
+    if eval_sampler is not None:
+        eval_sampler.set_epoch(0)
+    if dist_ctx.is_main_process:
+        print(f"Training images: {len(train_loader.dataset)}")
+        if eval_loader is not None:
+            print(f"Validation images: {len(eval_loader.dataset)}")
+
+    log_cfg = cfg["logging"]
+    total_steps = args.steps if args.steps else cfg["training"]["total_steps"]
+    grad_accum = 1 if args.overfit else cfg["training"]["grad_accum_steps"]
+    max_lr = cfg["training"]["lr"]
+    min_lr = cfg["training"]["min_lr"]
+    warmup_steps = cfg["training"]["warmup_steps"]
+    grad_clip_g = cfg["training"].get("grad_clip", 1.0)
+    model_image_size = raw_model.generator.image_size
+
+    if dist_ctx.is_main_process:
+        print(f"Generator parameters: {sum(p.numel() for p in raw_model.parameters()):,}")
+        print(f"  Base parameters: {sum(p.numel() for p in base_params):,}")
+        print(f"  Scorer parameters: {sum(p.numel() for p in scorer_params):,} (LR: {scorer_lr})")
+        print(f"Per-rank effective batch size: {cfg['data']['batch_size'] * grad_accum}")
+        print(f"Global effective batch size: {cfg['data']['batch_size'] * grad_accum * dist_ctx.world_size}")
+
+    log_dir = Path(log_cfg["log_dir"])
+    ckpt_dir = log_dir / "checkpoints"
+    if dist_ctx.is_main_process:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    writer = create_summary_writer(log_dir / "tb") if dist_ctx.is_main_process else NullSummaryWriter()
+    if args.resume and dist_ctx.is_main_process:
         print(f"Resumed from step {start_step}")
 
     amp_device_type = get_autocast_device_type(device)
+    train_epoch = 0
     data_iter = iter(train_loader)
     running_g = 0.0
     last_batch_views = None
@@ -606,10 +699,15 @@ def train(cfg, args):
     last_refined = None
     metrics = {}
 
-    progress_bar = tqdm(range(start_step, total_steps), desc="Training", dynamic_ncols=True)
+    progress_bar = tqdm(
+        range(start_step, total_steps),
+        desc="Training",
+        dynamic_ncols=True,
+        disable=not dist_ctx.is_main_process,
+    )
     for step_idx in progress_bar:
         step = step_idx + 1
-        model.generator.set_training_step(step)
+        raw_model.generator.set_training_step(step)
         criterion.set_training_step(step)
         lr_g = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         lr_scorer = get_lr(step, warmup_steps, total_steps, scorer_lr, scorer_min_lr)
@@ -623,10 +721,13 @@ def train(cfg, args):
         metric_sums = defaultdict(float)
         step_has_nonfinite = False
 
-        for _ in range(grad_accum):
+        for accum_idx in range(grad_accum):
             try:
                 batch = next(data_iter)
             except StopIteration:
+                train_epoch += 1
+                if train_sampler is not None:
+                    train_sampler.set_epoch(train_epoch)
                 data_iter = iter(train_loader)
                 batch = next(data_iter)
 
@@ -634,46 +735,55 @@ def train(cfg, args):
                 batch,
                 device,
                 model_image_size,
-                blur_layer=model.generator.final_gaussian_blur,
+                blur_layer=raw_model.generator.final_gaussian_blur,
             )
             image = batch_views["image"]
             mask = batch_views["mask"]
             masked_image = batch_views["masked_image"]
             refine_target = batch_views["refine_target"]
 
-            with torch.amp.autocast(amp_device_type, enabled=use_amp):
-                refined_raw, attn_map, coarse_raw, attention_aux = model(
-                    masked_image,
-                    mask,
-                    value_image=refine_target,
-                    return_aux=True,
-                )
-                refined_vis = refined_raw.clamp(0, 1)
-                coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
-                g_loss, g_metrics = criterion.generator_loss(
-                    coarse_raw,
-                    refined_raw,
-                    image,
-                    refine_target,
-                    mask,
-                    attention_aux=attention_aux,
-                )
+            sync_context = model.no_sync() if dist_ctx.enabled and accum_idx < (grad_accum - 1) else nullcontext()
+            with sync_context:
+                with torch.amp.autocast(amp_device_type, enabled=use_amp):
+                    refined_raw, attn_map, coarse_raw, attention_aux = model(
+                        masked_image,
+                        mask,
+                        value_image=refine_target,
+                        return_aux=True,
+                    )
+                    refined_vis = refined_raw.clamp(0, 1)
+                    coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
+                    g_loss, g_metrics = criterion.generator_loss(
+                        coarse_raw,
+                        refined_raw,
+                        image,
+                        refine_target,
+                        mask,
+                        attention_aux=attention_aux,
+                    )
 
-            if not torch.isfinite(g_loss):
+                has_nonfinite = not torch.isfinite(g_loss)
+                if dist_ctx.enabled:
+                    has_nonfinite = bool(reduce_scalar(float(has_nonfinite), dist_ctx, average=False))
+                if has_nonfinite:
+                    step_has_nonfinite = True
+                    break
+
+                scaler.scale(g_loss / grad_accum).backward()
+
+            if step_has_nonfinite:
                 step_has_nonfinite = True
                 break
 
-            scaler.scale(g_loss / grad_accum).backward()
-
-            attn_metrics = model.generator.summarize_attention(
+            attn_metrics = raw_model.generator.summarize_attention(
                 attn_map.detach(),
-                model.generator.flatten_query_mask(mask).detach(),
+                raw_model.generator.flatten_query_mask(mask).detach(),
             )
 
             for key, value in g_metrics.items():
-                metric_sums[key] += value
+                metric_sums[key] += metric_to_float(value)
             for key, value in attn_metrics.items():
-                metric_sums[key] += value
+                metric_sums[key] += metric_to_float(value)
 
             last_batch_views = batch_views
             last_coarse = coarse_vis.detach()
@@ -681,19 +791,21 @@ def train(cfg, args):
 
         if step_has_nonfinite:
             optimizer_g.zero_grad(set_to_none=True)
-            progress_bar.write(f"Skipping non-finite step {step}")
+            if dist_ctx.is_main_process:
+                progress_bar.write(f"Skipping non-finite step {step}")
             continue
 
         scaler.unscale_(optimizer_g)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_g)
+        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip_g)
         scaler.step(optimizer_g)
         scaler.update()
         optimizer_g.zero_grad(set_to_none=True)
 
         metrics = {key: value / grad_accum for key, value in metric_sums.items()}
+        metrics = reduce_metrics(metrics, dist_ctx, average=True)
         running_g = 0.9 * running_g + 0.1 * metrics["generator_total"]
 
-        if step == 1 or step % log_cfg["log_interval"] == 0:
+        if dist_ctx.is_main_process and (step == 1 or step % log_cfg["log_interval"] == 0):
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
             writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
             if "refined_query_patch_l1" in metrics:
@@ -737,59 +849,64 @@ def train(cfg, args):
         eval_interval = log_cfg.get("eval_interval", 0)
         if eval_loader is not None and eval_interval and step % eval_interval == 0:
             empty_device_cache(device)
+            if eval_sampler is not None:
+                eval_sampler.set_epoch(step)
             val_metrics = validate_model(
                 model,
                 eval_loader,
                 device,
                 cfg["training"]["mixed_precision"],
                 model_image_size,
+                dist_ctx,
                 max_batches=log_cfg.get("eval_batches", 8),
             )
-            writer.add_scalar("val/lr_masked_l1_coarse", val_metrics["masked_l1_lr_coarse"], step)
-            writer.add_scalar("val/lr_masked_l1_refined", val_metrics["masked_l1_lr_refined"], step)
-            if val_metrics["lr_gain_pct"] is not None:
-                writer.add_scalar("val/lr_gain_pct", val_metrics["lr_gain_pct"], step)
-            writer.add_scalar("val/hr_masked_l1_coarse_baseline", val_metrics["masked_l1_hr_coarse_baseline"], step)
-            writer.add_scalar("val/hr_masked_l1_refined", val_metrics["masked_l1_hr_refined"], step)
-            if val_metrics["hr_gain_pct"] is not None:
-                writer.add_scalar("val/hr_gain_pct", val_metrics["hr_gain_pct"], step)
-            write_validation_history(log_cfg["log_dir"], step, val_metrics)
-            progress_bar.write(
-                f"Validation step {step}: "
-                f"LR {val_metrics['masked_l1_lr_coarse']:.4f} -> {val_metrics['masked_l1_lr_refined']:.4f} "
-                f"(gain {val_metrics['lr_gain_pct']:.2f}%) | "
-                f"HR {val_metrics['masked_l1_hr_coarse_baseline']:.4f} -> {val_metrics['masked_l1_hr_refined']:.4f} "
-                f"(gain {val_metrics['hr_gain_pct']:.2f}%)\n"
-                f"  {format_train_metric_snapshot(metrics)}"
-            )
-            current_best_metric = val_metrics.get(best_metric_name)
-            if save_best_checkpoint and is_better_metric(current_best_metric, best_metric_value, best_metric_mode):
-                best_metric_value = float(current_best_metric)
-                best_metric_step = step
-                best_path = ckpt_dir / "best.pth"
-                best_metrics = build_checkpoint_metrics(
-                    metrics,
-                    best_metric_name,
-                    best_metric_mode,
-                    best_metric_value,
-                    best_metric_step,
-                )
-                save_checkpoint(
-                    model,
-                    optimizer_g,
-                    scaler,
-                    step,
-                    best_metrics,
-                    cfg,
-                    best_path,
-                )
+            if dist_ctx.is_main_process:
+                writer.add_scalar("val/lr_masked_l1_coarse", val_metrics["masked_l1_lr_coarse"], step)
+                writer.add_scalar("val/lr_masked_l1_refined", val_metrics["masked_l1_lr_refined"], step)
+                if val_metrics["lr_gain_pct"] is not None:
+                    writer.add_scalar("val/lr_gain_pct", val_metrics["lr_gain_pct"], step)
+                writer.add_scalar("val/hr_masked_l1_coarse_baseline", val_metrics["masked_l1_hr_coarse_baseline"], step)
+                writer.add_scalar("val/hr_masked_l1_refined", val_metrics["masked_l1_hr_refined"], step)
+                if val_metrics["hr_gain_pct"] is not None:
+                    writer.add_scalar("val/hr_gain_pct", val_metrics["hr_gain_pct"], step)
+                write_validation_history(log_cfg["log_dir"], step, val_metrics)
                 progress_bar.write(
-                    f"Saved best checkpoint: {best_path} "
-                    f"({best_metric_name}={best_metric_value:.6f} at step {best_metric_step})"
+                    f"Validation step {step}: "
+                    f"LR {val_metrics['masked_l1_lr_coarse']:.4f} -> {val_metrics['masked_l1_lr_refined']:.4f} "
+                    f"(gain {val_metrics['lr_gain_pct']:.2f}%) | "
+                    f"HR {val_metrics['masked_l1_hr_coarse_baseline']:.4f} -> {val_metrics['masked_l1_hr_refined']:.4f} "
+                    f"(gain {val_metrics['hr_gain_pct']:.2f}%)\n"
+                    f"  {format_train_metric_snapshot(metrics)}"
                 )
+                current_best_metric = val_metrics.get(best_metric_name)
+                if save_best_checkpoint and is_better_metric(current_best_metric, best_metric_value, best_metric_mode):
+                    best_metric_value = float(current_best_metric)
+                    best_metric_step = step
+                    best_path = ckpt_dir / "best.pth"
+                    best_metrics = build_checkpoint_metrics(
+                        metrics,
+                        best_metric_name,
+                        best_metric_mode,
+                        best_metric_value,
+                        best_metric_step,
+                    )
+                    save_checkpoint(
+                        model,
+                        optimizer_g,
+                        scaler,
+                        step,
+                        best_metrics,
+                        cfg,
+                        best_path,
+                    )
+                    progress_bar.write(
+                        f"Saved best checkpoint: {best_path} "
+                        f"({best_metric_name}={best_metric_value:.6f} at step {best_metric_step})"
+                    )
             empty_device_cache(device)
+            barrier(dist_ctx)
 
-        if step % log_cfg["vis_interval"] == 0 and last_batch_views is not None:
+        if dist_ctx.is_main_process and step % log_cfg["vis_interval"] == 0 and last_batch_views is not None:
             save_vis(writer, last_batch_views, last_coarse, last_refined, step, log_dir=log_cfg["log_dir"])
 
         checkpoint_steps = log_cfg.get("checkpoint_steps")
@@ -799,7 +916,7 @@ def train(cfg, args):
         elif log_cfg.get("save_checkpoints", True):
             should_save = step % log_cfg["save_interval"] == 0
 
-        if should_save:
+        if dist_ctx.is_main_process and should_save:
             ckpt_path = ckpt_dir / f"step_{step}.pth"
             checkpoint_metrics = build_checkpoint_metrics(
                 metrics,
@@ -820,7 +937,7 @@ def train(cfg, args):
             progress_bar.write(f"Saved checkpoint: {ckpt_path}")
 
     final_path = ckpt_dir / f"step_{total_steps}.pth"
-    if log_cfg.get("save_final_checkpoint", True):
+    if dist_ctx.is_main_process and log_cfg.get("save_final_checkpoint", True):
         final_metrics = build_checkpoint_metrics(
             metrics,
             best_metric_name,
@@ -838,10 +955,11 @@ def train(cfg, args):
             final_path,
         )
         progress_bar.write(f"Training complete. Final checkpoint: {final_path}")
-    else:
+    elif dist_ctx.is_main_process:
         progress_bar.write("Training complete. Final checkpoint saving disabled.")
     progress_bar.close()
     writer.close()
+    barrier(dist_ctx)
 
 
 def main():
@@ -863,10 +981,14 @@ def main():
     with open(args.config, "r", encoding="utf-8") as handle:
         cfg = yaml.safe_load(handle)
 
-    if args.eval_only:
-        run_eval_only(cfg, args)
-    else:
-        train(cfg, args)
+    dist_ctx = init_distributed(args.device)
+    try:
+        if args.eval_only:
+            run_eval_only(cfg, args, dist_ctx)
+        else:
+            train(cfg, args, dist_ctx)
+    finally:
+        destroy_distributed(dist_ctx)
 
 
 if __name__ == "__main__":

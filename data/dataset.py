@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import functional as TF
 
 from data.masks import FreeFormMaskGenerator
@@ -251,6 +252,10 @@ def get_dataloader(
     fixed_mask_seed: int = 0,
     force_random_masks: bool = False,
     shuffle_override: Optional[bool] = None,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+    sampler_seed: int = 0,
 ):
     """Create a DataLoader for inpainting training/evaluation."""
     dataset = InpaintingDataset(
@@ -269,11 +274,22 @@ def get_dataloader(
     loader_kwargs = {
         "dataset": dataset,
         "batch_size": batch_size,
-        "shuffle": (split == "train") if shuffle_override is None else shuffle_override,
         "num_workers": num_workers,
         "pin_memory": True,
         "drop_last": ((split == "train") if shuffle_override is None else shuffle_override),
     }
+    shuffle = (split == "train") if shuffle_override is None else shuffle_override
+    if distributed:
+        loader_kwargs["sampler"] = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=int(sampler_seed),
+            drop_last=loader_kwargs["drop_last"],
+        )
+    else:
+        loader_kwargs["shuffle"] = shuffle
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = (
             persistent_workers if persistent_workers is not None else True
