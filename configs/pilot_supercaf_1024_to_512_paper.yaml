@@ -42,7 +42,6 @@ model:
     detach_coarse_rgb: false
     final_conv: false
     attention_masking: true
-    supervision_band_radius: 1
 
 data:
   root_dir: "."

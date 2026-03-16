@@ -52,7 +52,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_masking: bool = True,
         final_conv: bool = False,
         positional_grid_size: int = 32,
-        supervision_band_radius: int = 1,
         use_conv_unfold: bool = False,
         model,
     ):
@@ -156,7 +155,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             )
         self.attention_warmup_steps = max(0, int(attention_warmup_steps))
         self.attention_gumbel_hard_start_step = max(0, int(attention_gumbel_hard_start_step))
-        self.supervision_band_radius = max(0, int(supervision_band_radius))
         self.current_training_step = 0
 
         self.encoder_decoder = model
@@ -396,10 +394,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         key_tokens = self.pre_attention_norm(key_tokens)
 
         token_hw = patch_map.shape[-2:]
-        supervision_band_mask_flat = None
         attention_supervision_entries = None
         if return_aux:
-            supervision_band_mask_flat, attention_supervision_entries = self.build_attention_supervision_entries(
+            attention_supervision_entries = self.build_attention_supervision_entries(
                 query_tokens,
                 key_tokens,
                 query_mask_flat,
@@ -448,7 +445,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "value_patch_size": self.value_patch_size,
                 "value_patch_padding": self.value_patch_padding,
                 "token_hw": token_hw,
-                "supervision_band_mask_flat": supervision_band_mask_flat,
                 "attention_supervision_entries": attention_supervision_entries,
             }
             return refined, masked_attention, coarse_raw, aux

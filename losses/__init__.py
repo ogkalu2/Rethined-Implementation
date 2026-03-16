@@ -296,6 +296,14 @@ class InpaintingLoss(nn.Module):
             metrics["retrieval_recall32"] = torch.stack(retrieval_recall32).mean().item()
         return loss_terms, metrics
 
+    def attention_supervision_metrics(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> dict[str, float]:
+        _, metrics = self._attention_supervision_losses(refined_target, attention_aux)
+        return metrics
+
     def generator_loss(
         self,
         coarse_raw: torch.Tensor,
