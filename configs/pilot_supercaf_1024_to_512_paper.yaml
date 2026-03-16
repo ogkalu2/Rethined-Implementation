@@ -81,7 +81,7 @@ loss:
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 1.0
   reranker_loss_weight: 0.0
-  retrieval_teacher_patch_padding: 8
+  retrieval_teacher_patch_padding: 4
   retrieval_teacher_temperature: 1.0
   boundary_identity_weight: 0.25
   coordinate_loss_weight: 0.2
