@@ -72,39 +72,12 @@ def masked_gradient_l1_loss(
     return 0.5 * (dx_mean.mean() + dy_mean.mean())
 
 
-class FocalFrequencyLoss(nn.Module):
-    """Compact Focal Frequency Loss implementation for image restoration."""
-
-    def __init__(self, alpha: float = 1.0, log_matrix: bool = False, eps: float = 1e-8):
-        super().__init__()
-        self.alpha = float(alpha)
-        self.log_matrix = bool(log_matrix)
-        self.eps = float(eps)
-
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        pred_freq = torch.fft.fft2(pred.float(), norm="ortho")
-        target_freq = torch.fft.fft2(target.float(), norm="ortho")
-        distance = (pred_freq.real - target_freq.real).pow(2) + (pred_freq.imag - target_freq.imag).pow(2)
-
-        weight = distance.detach().clamp_min(self.eps)
-        if self.log_matrix:
-            weight = torch.log1p(weight)
-        weight = weight.pow(self.alpha)
-        weight = weight / weight.mean(dim=(1, 2, 3), keepdim=True).clamp_min(self.eps)
-        return (weight * distance).mean()
-
-
 class InpaintingLoss(nn.Module):
-    """Generator and discriminator losses."""
+    """Training losses for refinement and retrieval supervision."""
 
     SCHEDULED_WEIGHT_NAMES = (
         "retrieval_loss_weight",
-        "boundary_identity_weight",
-        "coordinate_loss_weight",
-        "coherence_loss_weight",
-        "frequency_weight",
         "perceptual_weight",
-        "adversarial_weight",
     )
 
     def __init__(
@@ -114,27 +87,13 @@ class InpaintingLoss(nn.Module):
         refined_query_patch_l1_weight: float = 0.0,
         retrieval_loss_weight: float = 0.0,
         retrieval_hard_ce_weight: float = 0.0,
-        reranker_loss_weight: float = 0.0,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
-        boundary_identity_weight: float = 0.0,
-        coordinate_loss_weight: float = 0.0,
-        coherence_loss_weight: float = 0.0,
         loss_schedule_focus_steps: int = 0,
         loss_schedule_transition_steps: int = 0,
         retrieval_loss_weight_start: float | None = None,
-        boundary_identity_weight_start: float | None = None,
-        coordinate_loss_weight_start: float | None = None,
-        coherence_loss_weight_start: float | None = None,
-        frequency_weight_start: float | None = None,
         perceptual_weight_start: float | None = None,
-        adversarial_weight_start: float | None = None,
-        frequency_weight: float = 1.0,
         perceptual_weight: float = 0.1,
-        adversarial_weight: float = 0.02,
-        adversarial_mode: str = "hinge",
-        focal_alpha: float = 1.0,
-        focal_log_matrix: bool = False,
     ):
         super().__init__()
         self.coarse_l2_weight = float(coarse_l2_weight)
@@ -142,26 +101,14 @@ class InpaintingLoss(nn.Module):
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
-        self.reranker_loss_weight = float(reranker_loss_weight)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
-        self.boundary_identity_weight = float(boundary_identity_weight)
-        self.coordinate_loss_weight = float(coordinate_loss_weight)
-        self.coherence_loss_weight = float(coherence_loss_weight)
         self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
         self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
-        self.frequency_weight = float(frequency_weight)
         self.perceptual_weight = float(perceptual_weight)
-        self.adversarial_weight = float(adversarial_weight)
-        self.adversarial_mode = str(adversarial_mode).lower()
-        if self.adversarial_mode not in {"bce", "hinge"}:
-            raise ValueError(
-                f"Unsupported adversarial_mode: {adversarial_mode}. Expected 'bce' or 'hinge'."
-            )
         if self.retrieval_teacher_temperature <= 0:
             raise ValueError("retrieval_teacher_temperature must be positive.")
 
-        self.frequency_loss = FocalFrequencyLoss(alpha=focal_alpha, log_matrix=focal_log_matrix)
         self.perceptual_loss = PerceptualLoss()
         self.current_training_step = 0
         self._base_weight_values = {
@@ -174,35 +121,10 @@ class InpaintingLoss(nn.Module):
                 if retrieval_loss_weight_start is None
                 else float(retrieval_loss_weight_start)
             ),
-            "boundary_identity_weight": (
-                self._base_weight_values["boundary_identity_weight"]
-                if boundary_identity_weight_start is None
-                else float(boundary_identity_weight_start)
-            ),
-            "coordinate_loss_weight": (
-                self._base_weight_values["coordinate_loss_weight"]
-                if coordinate_loss_weight_start is None
-                else float(coordinate_loss_weight_start)
-            ),
-            "coherence_loss_weight": (
-                self._base_weight_values["coherence_loss_weight"]
-                if coherence_loss_weight_start is None
-                else float(coherence_loss_weight_start)
-            ),
-            "frequency_weight": (
-                self._base_weight_values["frequency_weight"]
-                if frequency_weight_start is None
-                else float(frequency_weight_start)
-            ),
             "perceptual_weight": (
                 self._base_weight_values["perceptual_weight"]
                 if perceptual_weight_start is None
                 else float(perceptual_weight_start)
-            ),
-            "adversarial_weight": (
-                self._base_weight_values["adversarial_weight"]
-                if adversarial_weight_start is None
-                else float(adversarial_weight_start)
             ),
         }
 
@@ -280,71 +202,6 @@ class InpaintingLoss(nn.Module):
     def _normalize_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         return patch_tokens.float()
 
-    def _token_coords(
-        self,
-        indices: torch.Tensor,
-        token_hw: tuple[int, int],
-        *,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        height, width = token_hw
-        ys = torch.div(indices, width, rounding_mode="floor").to(dtype=dtype)
-        xs = (indices % width).to(dtype=dtype)
-        if height > 1:
-            ys = ys / float(height - 1)
-        if width > 1:
-            xs = xs / float(width - 1)
-        return torch.stack([xs, ys], dim=-1)
-
-    def _relative_coord_coherence_loss(
-        self,
-        pred_coords: torch.Tensor,
-        teacher_coords: torch.Tensor,
-        query_indices: torch.Tensor,
-        token_hw: tuple[int, int],
-    ) -> torch.Tensor | None:
-        if query_indices.numel() < 2:
-            return None
-
-        num_tokens = token_hw[0] * token_hw[1]
-        width = token_hw[1]
-        local_lookup = torch.full((num_tokens,), -1, dtype=torch.long, device=query_indices.device)
-        local_indices = torch.arange(query_indices.numel(), dtype=torch.long, device=query_indices.device)
-        local_lookup[query_indices] = local_indices
-
-        qx = query_indices % width
-        pair_src = []
-        pair_dst = []
-
-        right_local = torch.full_like(query_indices, -1)
-        right_mask = qx + 1 < width
-        if right_mask.any():
-            right_global = query_indices[right_mask] + 1
-            right_local[right_mask] = local_lookup[right_global]
-        valid_right = right_local >= 0
-        if valid_right.any():
-            pair_src.append(local_indices[valid_right])
-            pair_dst.append(right_local[valid_right])
-
-        down_local = torch.full_like(query_indices, -1)
-        down_mask = query_indices + width < num_tokens
-        if down_mask.any():
-            down_global = query_indices[down_mask] + width
-            down_local[down_mask] = local_lookup[down_global]
-        valid_down = down_local >= 0
-        if valid_down.any():
-            pair_src.append(local_indices[valid_down])
-            pair_dst.append(down_local[valid_down])
-
-        if not pair_src:
-            return None
-
-        src = torch.cat(pair_src, dim=0)
-        dst = torch.cat(pair_dst, dim=0)
-        pred_delta = pred_coords[src] - pred_coords[dst]
-        teacher_delta = teacher_coords[src] - teacher_coords[dst]
-        return F.l1_loss(pred_delta, teacher_delta)
-
     def _attention_supervision_losses(
         self,
         refined_target: torch.Tensor,
@@ -354,19 +211,11 @@ class InpaintingLoss(nn.Module):
         loss_terms = {
             "retrieval": zero,
             "retrieval_hard_ce": zero,
-            "reranker": zero,
-            "boundary_identity": zero,
-            "coordinate": zero,
-            "coherence": zero,
         }
         metrics = {
             "retrieval_recall1": 0.0,
             "retrieval_recall8": 0.0,
             "retrieval_recall32": 0.0,
-            "reranker_recall1": 0.0,
-            "reranker_shortlist_acc": 0.0,
-            "retrieval_coord_error": 0.0,
-            "boundary_identity_acc": 0.0,
         }
         if attention_aux is None:
             return loss_terms, metrics
@@ -374,13 +223,10 @@ class InpaintingLoss(nn.Module):
         kernel_size = int(attention_aux.get("kernel_size", 0))
         query_mask_flat = attention_aux.get("query_mask_flat")
         supervision_entries = attention_aux.get("attention_supervision_entries")
-        token_hw = attention_aux.get("token_hw")
-        copy_aux = attention_aux.get("copy_aux")
         if (
             kernel_size <= 0
             or query_mask_flat is None
             or supervision_entries is None
-            or token_hw is None
         ):
             return loss_terms, metrics
 
@@ -395,17 +241,9 @@ class InpaintingLoss(nn.Module):
 
         retrieval_losses = []
         retrieval_hard_ce_losses = []
-        reranker_losses = []
-        boundary_losses = []
-        coordinate_losses = []
-        coherence_losses = []
         retrieval_recall1 = []
         retrieval_recall8 = []
         retrieval_recall32 = []
-        reranker_recall1 = []
-        reranker_shortlist_acc = []
-        retrieval_coord_errors = []
-        boundary_accs = []
 
         for batch_idx, entry in enumerate(supervision_entries):
             query_indices = entry["query_indices"]
@@ -425,42 +263,11 @@ class InpaintingLoss(nn.Module):
             ).squeeze(0) / max(query_teacher_tokens.shape[-1], 1)
             teacher_logits = teacher_logits / self.retrieval_teacher_temperature
             teacher_probs = F.softmax(teacher_logits, dim=-1)
-            boundary_mask = ~batch_query_mask
-            if boundary_mask.any():
-                boundary_query_indices = query_indices[boundary_mask]
-                target_positions = torch.searchsorted(key_indices, boundary_query_indices)
-                valid_targets = target_positions < key_indices.numel()
-                if valid_targets.any():
-                    valid_positions = target_positions[valid_targets]
-                    valid_targets = valid_targets.clone()
-                    valid_targets[valid_targets.clone()] = (
-                        key_indices[valid_positions] == boundary_query_indices[valid_targets]
-                    )
-                if valid_targets.any():
-                    teacher_probs_boundary = torch.zeros_like(teacher_probs[boundary_mask][valid_targets])
-                    teacher_probs_boundary.scatter_(1, target_positions[valid_targets].unsqueeze(-1), 1.0)
-                    teacher_probs[boundary_mask.nonzero(as_tuple=False).flatten()[valid_targets]] = teacher_probs_boundary
             pred_log_probs = F.log_softmax(raw_logits, dim=-1)
-            pred_probs = pred_log_probs.exp()
-
-            key_coords = self._token_coords(key_indices, token_hw, dtype=pred_probs.dtype)
-            pred_coords = torch.matmul(pred_probs, key_coords)
-            teacher_coords = torch.matmul(teacher_probs, key_coords)
-            coordinate_losses.append(F.l1_loss(pred_coords, teacher_coords))
-
-            coherence_loss = self._relative_coord_coherence_loss(
-                pred_coords,
-                teacher_coords,
-                query_indices,
-                token_hw,
-            )
-            if coherence_loss is not None:
-                coherence_losses.append(coherence_loss)
 
             if batch_query_mask.any():
                 masked_teacher_probs = teacher_probs[batch_query_mask]
                 masked_pred_log_probs = pred_log_probs[batch_query_mask]
-                masked_pred_probs = pred_probs[batch_query_mask]
                 masked_raw_logits = raw_logits[batch_query_mask]
                 masked_teacher_best = masked_teacher_probs.argmax(dim=-1)
                 retrieval_losses.append(
@@ -475,87 +282,11 @@ class InpaintingLoss(nn.Module):
                     metric_name.append(
                         (topk == masked_teacher_best.unsqueeze(-1)).any(dim=-1).float().mean()
                     )
-                masked_teacher_coords = torch.matmul(masked_teacher_probs, key_coords)
-                masked_pred_coords = torch.matmul(masked_pred_probs, key_coords)
-                retrieval_coord_errors.append(
-                    (masked_pred_coords - masked_teacher_coords).abs().sum(dim=-1).mean()
-                )
-                if copy_aux is not None and batch_idx < len(copy_aux):
-                    rerank_entry = copy_aux[batch_idx]
-                    if rerank_entry:
-                        rerank_query_indices = rerank_entry["query_indices"]
-                        candidate_key_indices = rerank_entry["candidate_key_indices"]
-                        rerank_logits = rerank_entry["rerank_logits"].float()
-                        query_positions = torch.searchsorted(query_indices, rerank_query_indices)
-                        valid_queries = query_positions < query_indices.numel()
-                        if valid_queries.any():
-                            valid_positions = query_positions[valid_queries]
-                            valid_queries = valid_queries.clone()
-                            valid_queries[valid_queries.clone()] = (
-                                query_indices[valid_positions] == rerank_query_indices[valid_queries]
-                            )
-                        if valid_queries.any():
-                            valid_rerank_query_indices = rerank_query_indices[valid_queries]
-                            valid_candidate_key_indices = candidate_key_indices[valid_queries]
-                            valid_rerank_logits = rerank_logits[valid_queries]
-                            valid_query_teacher_tokens = teacher_tokens[batch_idx, valid_rerank_query_indices]
-                            candidate_teacher_tokens = teacher_tokens[batch_idx, valid_candidate_key_indices]
-                            candidate_teacher_logits = -(candidate_teacher_tokens - valid_query_teacher_tokens.unsqueeze(1)).abs().mean(dim=-1)
-                            candidate_teacher_logits = (
-                                candidate_teacher_logits / self.retrieval_teacher_temperature
-                            )
-                            candidate_teacher_probs = F.softmax(candidate_teacher_logits, dim=-1)
-                            rerank_log_probs = F.log_softmax(valid_rerank_logits, dim=-1)
-                            reranker_losses.append(
-                                (-(candidate_teacher_probs * rerank_log_probs).sum(dim=-1)).mean()
-                            )
-                            shortlist_teacher_best = candidate_teacher_probs.argmax(dim=-1)
-                            rerank_pred_best = valid_rerank_logits.argmax(dim=-1)
-                            reranker_shortlist_acc.append(
-                                (rerank_pred_best == shortlist_teacher_best).float().mean()
-                            )
-                            teacher_best_global = key_indices[
-                                teacher_probs[valid_positions].argmax(dim=-1)
-                            ]
-                            rerank_best_global = valid_candidate_key_indices.gather(
-                                1,
-                                rerank_pred_best.unsqueeze(-1),
-                            ).squeeze(-1)
-                            reranker_recall1.append(
-                                (rerank_best_global == teacher_best_global).float().mean()
-                            )
-
-            if boundary_mask.any():
-                boundary_query_indices = query_indices[boundary_mask]
-                boundary_logits = raw_logits[boundary_mask]
-                target_positions = torch.searchsorted(key_indices, boundary_query_indices)
-                valid_targets = target_positions < key_indices.numel()
-                if valid_targets.any():
-                    valid_positions = target_positions[valid_targets]
-                    valid_targets = valid_targets.clone()
-                    valid_targets[valid_targets.clone()] = (
-                        key_indices[valid_positions] == boundary_query_indices[valid_targets]
-                    )
-                if valid_targets.any():
-                    valid_boundary_logits = boundary_logits[valid_targets]
-                    valid_boundary_targets = target_positions[valid_targets]
-                    boundary_losses.append(F.cross_entropy(valid_boundary_logits, valid_boundary_targets))
-                    boundary_accs.append(
-                        (valid_boundary_logits.argmax(dim=-1) == valid_boundary_targets).float().mean()
-                    )
 
         if retrieval_losses:
             loss_terms["retrieval"] = torch.stack(retrieval_losses).mean()
         if retrieval_hard_ce_losses:
             loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
-        if reranker_losses:
-            loss_terms["reranker"] = torch.stack(reranker_losses).mean()
-        if boundary_losses:
-            loss_terms["boundary_identity"] = torch.stack(boundary_losses).mean()
-        if coordinate_losses:
-            loss_terms["coordinate"] = torch.stack(coordinate_losses).mean()
-        if coherence_losses:
-            loss_terms["coherence"] = torch.stack(coherence_losses).mean()
 
         if retrieval_recall1:
             metrics["retrieval_recall1"] = torch.stack(retrieval_recall1).mean().item()
@@ -563,14 +294,6 @@ class InpaintingLoss(nn.Module):
             metrics["retrieval_recall8"] = torch.stack(retrieval_recall8).mean().item()
         if retrieval_recall32:
             metrics["retrieval_recall32"] = torch.stack(retrieval_recall32).mean().item()
-        if reranker_recall1:
-            metrics["reranker_recall1"] = torch.stack(reranker_recall1).mean().item()
-        if reranker_shortlist_acc:
-            metrics["reranker_shortlist_acc"] = torch.stack(reranker_shortlist_acc).mean().item()
-        if retrieval_coord_errors:
-            metrics["retrieval_coord_error"] = torch.stack(retrieval_coord_errors).mean().item()
-        if boundary_accs:
-            metrics["boundary_identity_acc"] = torch.stack(boundary_accs).mean().item()
         return loss_terms, metrics
 
     def generator_loss(
@@ -580,26 +303,13 @@ class InpaintingLoss(nn.Module):
         coarse_target: torch.Tensor,
         refined_target: torch.Tensor,
         mask: torch.Tensor,
-        fake_logits: list[torch.Tensor] | None = None,
         attention_aux: dict[str, object] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         coarse_l2 = masked_mse_loss(coarse_raw, coarse_target, mask)
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         attention_loss_terms, attention_metrics = self._attention_supervision_losses(refined_target, attention_aux)
-        frequency = self.frequency_loss(refined, refined_target)
         perceptual = self.perceptual_loss(refined, refined_target)
-
-        adversarial = refined.new_zeros(())
-        if fake_logits is not None:
-            if self.adversarial_mode == "hinge":
-                scale_losses = [(-l).mean() for l in fake_logits]
-            else:
-                scale_losses = [
-                    F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
-                    for l in fake_logits
-                ]
-            adversarial = torch.stack(scale_losses).mean()
 
         scheduled_weights = {
             name: self._get_scheduled_weight(name)
@@ -611,13 +321,7 @@ class InpaintingLoss(nn.Module):
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
             + self.retrieval_hard_ce_weight * attention_loss_terms["retrieval_hard_ce"]
-            + self.reranker_loss_weight * attention_loss_terms["reranker"]
-            + scheduled_weights["boundary_identity_weight"] * attention_loss_terms["boundary_identity"]
-            + scheduled_weights["coordinate_loss_weight"] * attention_loss_terms["coordinate"]
-            + scheduled_weights["coherence_loss_weight"] * attention_loss_terms["coherence"]
-            + scheduled_weights["frequency_weight"] * frequency
             + scheduled_weights["perceptual_weight"] * perceptual
-            + scheduled_weights["adversarial_weight"] * adversarial
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
@@ -625,13 +329,7 @@ class InpaintingLoss(nn.Module):
             "refined_query_patch_l1": refined_query_patch_l1.item(),
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
             "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
-            "reranker_loss": attention_loss_terms["reranker"].item(),
-            "boundary_identity_loss": attention_loss_terms["boundary_identity"].item(),
-            "coordinate_loss": attention_loss_terms["coordinate"].item(),
-            "coherence_loss": attention_loss_terms["coherence"].item(),
-            "frequency": frequency.item(),
             "perceptual": perceptual.item(),
-            "adversarial_g": adversarial.item(),
             "generator_total": total.item(),
         }
         loss_dict.update({
@@ -639,35 +337,4 @@ class InpaintingLoss(nn.Module):
             for name, value in scheduled_weights.items()
         })
         loss_dict.update(attention_metrics)
-        return total, loss_dict
-
-    def discriminator_loss(
-        self,
-        real_logits: list[torch.Tensor],
-        fake_logits: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, dict[str, float]]:
-        if self.adversarial_mode == "hinge":
-            real_loss = torch.stack([
-                F.relu(1 - l).mean()
-                for l in real_logits
-            ]).mean()
-            fake_loss = torch.stack([
-                F.relu(1 + l).mean()
-                for l in fake_logits
-            ]).mean()
-        else:
-            real_loss = torch.stack([
-                F.binary_cross_entropy_with_logits(l, torch.ones_like(l))
-                for l in real_logits
-            ]).mean()
-            fake_loss = torch.stack([
-                F.binary_cross_entropy_with_logits(l, torch.zeros_like(l))
-                for l in fake_logits
-            ]).mean()
-        total = 0.5 * (real_loss + fake_loss)
-        loss_dict = {
-            "adversarial_d_real": real_loss.item(),
-            "adversarial_d_fake": fake_loss.item(),
-            "discriminator_total": total.item(),
-        }
         return total, loss_dict

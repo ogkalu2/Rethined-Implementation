@@ -24,7 +24,6 @@ from device_utils import (
     is_amp_enabled,
     resolve_device,
 )
-from discriminator import PatchDiscriminator
 from hr import AttentionUpscaling
 from losses import InpaintingLoss
 from model import InpaintingModel
@@ -156,17 +155,9 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
 
 
-def set_discriminator_requires_grad(discriminator: torch.nn.Module, enabled: bool):
-    for param in discriminator.parameters():
-        param.requires_grad = enabled
-
-
-
 def save_checkpoint(
     model,
-    discriminator,
     optimizer_g,
-    optimizer_d,
     scaler,
     step,
     metrics,
@@ -177,9 +168,7 @@ def save_checkpoint(
         {
             "step": step,
             "model_state_dict": model.state_dict(),
-            "discriminator_state_dict": discriminator.state_dict(),
             "optimizer_g_state_dict": optimizer_g.state_dict(),
-            "optimizer_d_state_dict": optimizer_d.state_dict(),
             "scaler_state_dict": scaler.state_dict(),
             "metrics": metrics,
             "config": cfg,
@@ -195,7 +184,10 @@ def load_model_checkpoint(model, state_dict):
         if ".transport_" not in key and "transport_" not in key
     }
     missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=False)
-    unexpected_non_transport = [key for key in unexpected_keys if "transport_" not in key]
+    unexpected_non_transport = [
+        key for key in unexpected_keys
+        if "transport_" not in key
+    ]
     if missing_keys or unexpected_non_transport:
         raise RuntimeError(
             "Checkpoint is incompatible with the current attention-only model. "
@@ -214,9 +206,7 @@ def load_eval_checkpoint(path, model, device):
 def load_training_checkpoint(
     path,
     model,
-    discriminator,
     optimizer_g,
-    optimizer_d,
     scaler,
     device,
 ):
@@ -224,18 +214,14 @@ def load_training_checkpoint(
     required_keys = (
         "step",
         "model_state_dict",
-        "discriminator_state_dict",
         "optimizer_g_state_dict",
-        "optimizer_d_state_dict",
         "scaler_state_dict",
     )
     missing_keys = [key for key in required_keys if key not in ckpt]
     if missing_keys:
         raise KeyError(f"Expected a full training checkpoint, missing keys: {', '.join(missing_keys)}")
     load_model_checkpoint(model, ckpt["model_state_dict"])
-    discriminator.load_state_dict(ckpt["discriminator_state_dict"], strict=True)
     optimizer_g.load_state_dict(ckpt["optimizer_g_state_dict"])
-    optimizer_d.load_state_dict(ckpt["optimizer_d_state_dict"])
     scaler.load_state_dict(ckpt["scaler_state_dict"])
     metrics = ckpt.get("metrics", {}) or {}
     return {
@@ -282,27 +268,17 @@ def build_checkpoint_metrics(train_metrics, best_metric_name, best_metric_mode, 
 def format_train_metric_snapshot(metrics):
     summary = (
         f"train g={metrics['generator_total']:.4f}, "
-        f"d={metrics['discriminator_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
-        f"ff={metrics['frequency']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
     if "refined_query_patch_l1" in metrics:
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
     if "retrieval_recall1" in metrics:
         summary += f", r1={metrics['retrieval_recall1']:.3f}"
-    if "reranker_recall1" in metrics:
-        summary += f", rr1={metrics['reranker_recall1']:.3f}"
-    if "reranker_shortlist_acc" in metrics:
-        summary += f", rsa={metrics['reranker_shortlist_acc']:.3f}"
     if "retrieval_recall8" in metrics:
         summary += f", r8={metrics['retrieval_recall8']:.3f}"
     if "retrieval_recall32" in metrics:
         summary += f", r32={metrics['retrieval_recall32']:.3f}"
-    if "retrieval_coord_error" in metrics:
-        summary += f", coord={metrics['retrieval_coord_error']:.3f}"
-    if "boundary_identity_acc" in metrics:
-        summary += f", bia={metrics['boundary_identity_acc']:.3f}"
     return summary
 
 
@@ -541,7 +517,6 @@ def train(cfg, args):
     seed_everything(cfg["training"]["seed"])
 
     model = InpaintingModel(build_model_config(cfg)).to(device)
-    discriminator = PatchDiscriminator(**cfg["discriminator"]).to(device)
     loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
     criterion = InpaintingLoss(**loss_cfg).to(device)
 
@@ -574,11 +549,9 @@ def train(cfg, args):
     min_lr = cfg["training"]["min_lr"]
     warmup_steps = cfg["training"]["warmup_steps"]
     grad_clip_g = cfg["training"].get("grad_clip", 1.0)
-    grad_clip_d = cfg["training"].get("discriminator_grad_clip", grad_clip_g)
     model_image_size = model.generator.image_size
 
     print(f"Generator parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Discriminator parameters: {sum(p.numel() for p in discriminator.parameters()):,}")
     print(f"Effective batch size: {cfg['data']['batch_size'] * grad_accum}")
 
     log_dir = Path(log_cfg["log_dir"])
@@ -596,9 +569,7 @@ def train(cfg, args):
         resume_state = load_training_checkpoint(
             args.resume,
             model,
-            discriminator,
             optimizer_g,
-            optimizer_d,
             scaler,
             device,
         )
@@ -611,7 +582,6 @@ def train(cfg, args):
     amp_device_type = get_autocast_device_type(device)
     data_iter = iter(train_loader)
     running_g = 0.0
-    running_d = 0.0
     last_batch_views = None
     last_coarse = None
     last_refined = None
@@ -627,16 +597,11 @@ def train(cfg, args):
             step,
             warmup_steps,
             total_steps,
-            cfg["training"].get("discriminator_lr", max_lr),
-            cfg["training"].get("discriminator_min_lr", min_lr),
         )
         for pg in optimizer_g.param_groups:
             pg["lr"] = lr_g
-        for pg in optimizer_d.param_groups:
-            pg["lr"] = lr_d
 
         optimizer_g.zero_grad(set_to_none=True)
-        optimizer_d.zero_grad(set_to_none=True)
         metric_sums = defaultdict(float)
         step_has_nonfinite = False
 
@@ -665,30 +630,14 @@ def train(cfg, args):
                     value_image=refine_target,
                     return_aux=True,
                 )
-                refined_vis = refined_raw.clamp(0, 1) 
+                refined_vis = refined_raw.clamp(0, 1)
                 coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
-
-                set_discriminator_requires_grad(discriminator, True)
-                real_logits = discriminator(refine_target)
-                fake_logits_d = discriminator(refined_vis.detach()) 
-                d_loss, d_metrics = criterion.discriminator_loss(real_logits, fake_logits_d)
-
-            if not torch.isfinite(d_loss):
-                step_has_nonfinite = True
-                break
-
-            scaler.scale(d_loss / grad_accum).backward()
-
-            with torch.amp.autocast(amp_device_type, enabled=use_amp):
-                set_discriminator_requires_grad(discriminator, False)
-                fake_logits_g = discriminator(refined_vis) 
                 g_loss, g_metrics = criterion.generator_loss(
                     coarse_raw,
                     refined_raw,
                     image,
                     refine_target,
                     mask,
-                    fake_logits_g,
                     attention_aux=attention_aux,
                 )
 
@@ -705,8 +654,6 @@ def train(cfg, args):
 
             for key, value in g_metrics.items():
                 metric_sums[key] += value
-            for key, value in d_metrics.items():
-                metric_sums[key] += value
             for key, value in attn_metrics.items():
                 metric_sums[key] += value
 
@@ -716,23 +663,17 @@ def train(cfg, args):
 
         if step_has_nonfinite:
             optimizer_g.zero_grad(set_to_none=True)
-            optimizer_d.zero_grad(set_to_none=True)
             progress_bar.write(f"Skipping non-finite step {step}")
             continue
 
-        scaler.unscale_(optimizer_d)
-        torch.nn.utils.clip_grad_norm_(discriminator.parameters(), grad_clip_d)
         scaler.unscale_(optimizer_g)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_g)
-        scaler.step(optimizer_d)
         scaler.step(optimizer_g)
         scaler.update()
         optimizer_g.zero_grad(set_to_none=True)
-        optimizer_d.zero_grad(set_to_none=True)
 
         metrics = {key: value / grad_accum for key, value in metric_sums.items()}
         running_g = 0.9 * running_g + 0.1 * metrics["generator_total"]
-        running_d = 0.9 * running_d + 0.1 * metrics["discriminator_total"]
 
         if step == 1 or step % log_cfg["log_interval"] == 0:
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
@@ -741,57 +682,24 @@ def train(cfg, args):
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
             if "retrieval_loss" in metrics:
                 writer.add_scalar("loss/retrieval", metrics["retrieval_loss"], step)
-            if "reranker_loss" in metrics:
-                writer.add_scalar("loss/reranker", metrics["reranker_loss"], step)
-            if "boundary_identity_loss" in metrics:
-                writer.add_scalar("loss/boundary_identity", metrics["boundary_identity_loss"], step)
-            if "coordinate_loss" in metrics:
-                writer.add_scalar("loss/coordinate", metrics["coordinate_loss"], step)
-            if "coherence_loss" in metrics:
-                writer.add_scalar("loss/coherence", metrics["coherence_loss"], step)
-            writer.add_scalar("loss/frequency", metrics["frequency"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
-            writer.add_scalar("loss/adversarial_g", metrics["adversarial_g"], step)
-            writer.add_scalar("loss/adversarial_d_real", metrics["adversarial_d_real"], step)
-            writer.add_scalar("loss/adversarial_d_fake", metrics["adversarial_d_fake"], step)
             writer.add_scalar("loss/generator_total", metrics["generator_total"], step)
-            writer.add_scalar("loss/discriminator_total", metrics["discriminator_total"], step)
             writer.add_scalar("loss/running_generator", running_g, step)
-            writer.add_scalar("loss/running_discriminator", running_d, step)
             writer.add_scalar("attention/top1", metrics["attention_top1"], step)
             writer.add_scalar("attention/top4", metrics["attention_top4"], step)
             writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
             writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
             if "retrieval_recall1" in metrics:
                 writer.add_scalar("retrieval/recall1", metrics["retrieval_recall1"], step)
-            if "reranker_recall1" in metrics:
-                writer.add_scalar("retrieval/rerank_recall1", metrics["reranker_recall1"], step)
             if "retrieval_recall8" in metrics:
                 writer.add_scalar("retrieval/recall8", metrics["retrieval_recall8"], step)
             if "retrieval_recall32" in metrics:
                 writer.add_scalar("retrieval/recall32", metrics["retrieval_recall32"], step)
-            if "reranker_shortlist_acc" in metrics:
-                writer.add_scalar("retrieval/rerank_shortlist_acc", metrics["reranker_shortlist_acc"], step)
-            if "retrieval_coord_error" in metrics:
-                writer.add_scalar("retrieval/coord_error", metrics["retrieval_coord_error"], step)
-            if "boundary_identity_acc" in metrics:
-                writer.add_scalar("retrieval/boundary_identity_acc", metrics["boundary_identity_acc"], step)
             if "weight/retrieval_loss" in metrics:
                 writer.add_scalar("loss_weight/retrieval", metrics["weight/retrieval_loss"], step)
-            if "weight/boundary_identity" in metrics:
-                writer.add_scalar("loss_weight/boundary_identity", metrics["weight/boundary_identity"], step)
-            if "weight/coordinate" in metrics:
-                writer.add_scalar("loss_weight/coordinate", metrics["weight/coordinate"], step)
-            if "weight/coherence" in metrics:
-                writer.add_scalar("loss_weight/coherence", metrics["weight/coherence"], step)
-            if "weight/frequency" in metrics:
-                writer.add_scalar("loss_weight/frequency", metrics["weight/frequency"], step)
             if "weight/perceptual" in metrics:
                 writer.add_scalar("loss_weight/perceptual", metrics["weight/perceptual"], step)
-            if "weight/adversarial" in metrics:
-                writer.add_scalar("loss_weight/adversarial", metrics["weight/adversarial"], step)
             writer.add_scalar("lr/generator", lr_g, step)
-            writer.add_scalar("lr/discriminator", lr_d, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
             if peak_memory_gb is not None:
                 writer.add_scalar("accelerator_mem_gb", peak_memory_gb, step)
@@ -799,15 +707,12 @@ def train(cfg, args):
             if log_cfg.get("print_train_metrics", False):
                 progress_bar.set_postfix(
                     g=f"{metrics['generator_total']:.4f}",
-                    d=f"{metrics['discriminator_total']:.4f}",
                     l1=f"{metrics['refined_l1']:.4f}",
                     qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
-                    rr1=(f"{metrics['reranker_recall1']:.3f}" if "reranker_recall1" in metrics else "n/a"),
-                    rsa=(f"{metrics['reranker_shortlist_acc']:.3f}" if "reranker_shortlist_acc" in metrics else "n/a"),
+                    r1=(f"{metrics['retrieval_recall1']:.3f}" if "retrieval_recall1" in metrics else "n/a"),
                     r8=(f"{metrics['retrieval_recall8']:.3f}" if "retrieval_recall8" in metrics else "n/a"),
                     r32=(f"{metrics['retrieval_recall32']:.3f}" if "retrieval_recall32" in metrics else "n/a"),
-                    coord=(f"{metrics['retrieval_coord_error']:.3f}" if "retrieval_coord_error" in metrics else "n/a"),
-                    ff=f"{metrics['frequency']:.4f}",
+                    perc=f"{metrics['perceptual']:.4f}",
                     refresh=False,
                 )
 
@@ -853,9 +758,7 @@ def train(cfg, args):
                 )
                 save_checkpoint(
                     model,
-                    discriminator,
                     optimizer_g,
-                    optimizer_d,
                     scaler,
                     step,
                     best_metrics,
@@ -889,9 +792,7 @@ def train(cfg, args):
             )
             save_checkpoint(
                 model,
-                discriminator,
                 optimizer_g,
-                optimizer_d,
                 scaler,
                 step,
                 checkpoint_metrics,
@@ -911,9 +812,7 @@ def train(cfg, args):
         )
         save_checkpoint(
             model,
-            discriminator,
             optimizer_g,
-            optimizer_d,
             scaler,
             total_steps,
             final_metrics,

@@ -19,10 +19,6 @@ model:
     attention_gumbel_hard_start_step: 1800
     matching_descriptor_dim: 256
     matching_hidden_dim: 384
-    reranker_hidden_dim: 0
-    reranker_query_chunk_size: 256
-    reranker_source_context_radius: 1
-    reranker_stage1_logit_scale: 0.0
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
     query_image_context_matching: false
@@ -65,12 +61,9 @@ training:
   total_steps: 3000
   grad_accum_steps: 4
   lr: 0.001
-  discriminator_lr: 0.0002
   warmup_steps: 200
   min_lr: 0.000001
-  discriminator_min_lr: 0.0000001
   grad_clip: 1.0
-  discriminator_grad_clip: 1.0
   mixed_precision: true
   seed: 42
   betas: [0.9, 0.999]
@@ -81,26 +74,11 @@ loss:
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 0.5
   retrieval_hard_ce_weight: 1.0
-  reranker_loss_weight: 0
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.15
-  boundary_identity_weight: 0
-  coordinate_loss_weight: 0
-  coherence_loss_weight: 0
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
-  frequency_weight: 0
   perceptual_weight: 0.15
-  adversarial_weight: 0
-  adversarial_mode: "hinge"
-  focal_alpha: 1.0
-  focal_log_matrix: false
-
-discriminator:
-  in_channels: 3
-  base_channels: 64
-  n_layers: 3
-  num_scales: 1 
 
 logging:
   log_dir: "logs/pilot_supercaf_1024_to_512_paper"

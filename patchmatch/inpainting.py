@@ -11,81 +11,6 @@ from .helpers import PatchmatchHelpersMixin
 from .patch_ops import PatchOpsMixin
 
 
-class TopKReranker(nn.Module):
-    def __init__(self, token_dim: int, hidden_dim: int, query_chunk_size: int = 256):
-        super().__init__()
-        hidden_dim = int(hidden_dim)
-        self.query_chunk_size = max(0, int(query_chunk_size))
-        self.query_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
-        self.key_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
-        self.source_context_proj = nn.Linear(int(token_dim), hidden_dim, bias=False)
-        self.net = nn.Sequential(
-            nn.Linear(4 * hidden_dim + 4, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def _forward_chunk(
-        self,
-        query_tokens: torch.Tensor,
-        candidate_tokens: torch.Tensor,
-        source_context_tokens: torch.Tensor,
-        stage1_logits: torch.Tensor,
-        relative_coords: torch.Tensor,
-        source_context_density: torch.Tensor,
-    ) -> torch.Tensor:
-        query_features = self.query_proj(query_tokens).unsqueeze(1)
-        candidate_features = self.key_proj(candidate_tokens)
-        source_context_features = self.source_context_proj(source_context_tokens)
-        features = torch.cat(
-            [
-                query_features * candidate_features,
-                (query_features - candidate_features).abs(),
-                candidate_features * source_context_features,
-                (candidate_features - source_context_features).abs(),
-                stage1_logits.unsqueeze(-1),
-                relative_coords,
-                source_context_density.unsqueeze(-1),
-            ],
-            dim=-1,
-        )
-        return self.net(features).squeeze(-1)
-
-    def forward(
-        self,
-        query_tokens: torch.Tensor,
-        candidate_tokens: torch.Tensor,
-        source_context_tokens: torch.Tensor,
-        stage1_logits: torch.Tensor,
-        relative_coords: torch.Tensor,
-        source_context_density: torch.Tensor,
-    ) -> torch.Tensor:
-        if self.query_chunk_size <= 0 or query_tokens.shape[0] <= self.query_chunk_size:
-            return self._forward_chunk(
-                query_tokens,
-                candidate_tokens,
-                source_context_tokens,
-                stage1_logits,
-                relative_coords,
-                source_context_density,
-            )
-
-        outputs = []
-        for start in range(0, query_tokens.shape[0], self.query_chunk_size):
-            end = start + self.query_chunk_size
-            outputs.append(
-                self._forward_chunk(
-                    query_tokens[start:end],
-                    candidate_tokens[start:end],
-                    source_context_tokens[start:end],
-                    stage1_logits[start:end],
-                    relative_coords[start:end],
-                    source_context_density[start:end],
-                )
-            )
-        return torch.cat(outputs, dim=0)
-
-
 class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
     def __init__(
         self,
@@ -103,11 +28,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
-        reranker_hidden_dim: int = 0,
-        reranker_top_k: int | None = None,
-        reranker_query_chunk_size: int = 256,
-        reranker_source_context_radius: int = 1,
-        reranker_stage1_logit_scale: float = 0.0,
         match_coarse_rgb: bool = True,
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
@@ -152,13 +72,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_hidden_dim = None if matching_hidden_dim is None else int(matching_hidden_dim)
         if self.matching_hidden_dim is not None and self.matching_hidden_dim <= 0:
             self.matching_hidden_dim = None
-        self.reranker_hidden_dim = max(0, int(reranker_hidden_dim))
-        self.reranker_top_k = None if reranker_top_k is None else int(reranker_top_k)
-        if self.reranker_top_k is not None and self.reranker_top_k <= 0:
-            self.reranker_top_k = None
-        self.reranker_query_chunk_size = max(0, int(reranker_query_chunk_size))
-        self.reranker_source_context_radius = max(0, int(reranker_source_context_radius))
-        self.reranker_stage1_logit_scale = float(reranker_stage1_logit_scale)
         self.match_coarse_rgb = bool(match_coarse_rgb)
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
@@ -258,7 +171,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_descriptor_head = None
         self.key_descriptor_head = None
         self.matching_descriptor_head = None
-        self.patch_reranker = None
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
@@ -308,12 +220,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
         )
-        if self.reranker_hidden_dim > 0:
-            self.patch_reranker = TopKReranker(
-                self.patch_token_dim,
-                self.reranker_hidden_dim,
-                query_chunk_size=self.reranker_query_chunk_size,
-            )
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
             nn.Parameter(
@@ -503,13 +409,12 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.attention_masking:
-            mixed_patches_flat, masked_attention, copy_aux = self.direct_patch_mix_masked_queries(
+            mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
                 patch_values,
                 query_mask_flat,
                 key_valid_flat,
-                token_hw=token_hw,
             )
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(
@@ -519,7 +424,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 direct_patch_mixing=True,
                 query_mask_flat=query_mask_flat,
             )
-            copy_aux = None
 
         mixed_image = self.fold_native(
             mixed_patches_flat,
@@ -546,7 +450,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "token_hw": token_hw,
                 "supervision_band_mask_flat": supervision_band_mask_flat,
                 "attention_supervision_entries": attention_supervision_entries,
-                "copy_aux": copy_aux,
             }
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw
