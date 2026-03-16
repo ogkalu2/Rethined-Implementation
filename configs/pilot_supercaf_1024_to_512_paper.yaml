@@ -81,17 +81,17 @@ loss:
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 0.5
   retrieval_hard_ce_weight: 1.0
-  reranker_loss_weight: 0.0
+  reranker_loss_weight: 0
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.15
   boundary_identity_weight: 0.25
-  coordinate_loss_weight: 0.2
-  coherence_loss_weight: 0.1
+  coordinate_loss_weight: 0
+  coherence_loss_weight: 0
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
-  frequency_weight: 0.0
+  frequency_weight: 0
   perceptual_weight: 0.15
-  adversarial_weight: 0.0
+  adversarial_weight: 0
   adversarial_mode: "hinge"
   focal_alpha: 1.0
   focal_log_matrix: false
