@@ -187,4 +187,7 @@ class MultiHeadAttention(nn.Module):
         output = mixed.transpose(1, 2).contiguous().view(batch_size, len_q, -1)
         if not direct_patch_mixing:
             output = self.fc(output)
-        return output, attn_probs
+        # For direct patch mixing, downstream consumers (e.g. HR upscaling) must reuse
+        # the exact weights used to form `mixed`, not a softer probability variant.
+        returned_attention = attn if direct_patch_mixing else attn_probs
+        return output, returned_attention
