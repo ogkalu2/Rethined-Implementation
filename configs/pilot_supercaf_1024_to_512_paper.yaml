@@ -14,9 +14,9 @@ model:
     attention_selection: "gumbel"
     attention_gumbel_tau: 1.0
     attention_warmup_selection: "softmax"
-    attention_warmup_steps: 1200
+    attention_warmup_steps: 4000
     attention_warmup_top_k: null
-    attention_gumbel_hard_start_step: 1800
+    attention_gumbel_hard_start_step: 4000
     matching_descriptor_dim: 256
     matching_hidden_dim: 384
     match_coarse_rgb: true
