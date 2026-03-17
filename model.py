@@ -45,14 +45,26 @@ class InpaintingModel(nn.Module):
         image = self.inpainter.final_gaussian_blur(image)
         return F.interpolate(image, size=(out_size, out_size), mode="bicubic", align_corners=False)
 
-    def forward(self, image, mask, value_image=None, return_aux=False, return_final=False):
-        if not return_final:
+    def forward(
+        self, 
+        image, 
+        mask, 
+        value_image=None, 
+        return_aux=False, 
+        return_final=False,
+        ):
+
+        model_image_size = int(self.inpainter.image_size)
+        # In eval mode, default to returning a single final image tensor.
+        # Training keeps the multi-output path unless explicitly overridden.
+        use_final_path = return_final or ((not self.training) and (not return_aux))
+
+        if not use_final_path:
             return self.inpainter(image, mask, value_image=value_image, return_aux=return_aux)
 
         if return_aux:
-            raise ValueError("return_aux and return_final cannot both be True.")
+            raise ValueError("return_aux is not supported when using the final-image HR path.")
 
-        model_image_size = int(self.inpainter.image_size)
         if image.shape[-2:] == (model_image_size, model_image_size):
             refined, _, _ = self.inpainter(image, mask, value_image=value_image, return_aux=False)
             return refined
