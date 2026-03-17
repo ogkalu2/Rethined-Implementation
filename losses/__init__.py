@@ -300,9 +300,13 @@ class InpaintingLoss(nn.Module):
                 )
 
                 if self.retrieval_usage_weight > 0.0:
-                    # Penalize uneven usage of keys by taking variance across key usage probabilities.
-                    key_usage = masked_pred_probs.sum(dim=0)
-                    retrieval_usage_losses.append(torch.var(key_usage))
+                    # Penalize uneven usage of keys by minimizing negative entropy of key usage distribution.
+                    key_usage = masked_pred_probs.mean(dim=0) # [valid_keys] -> probability distribution
+                    usage_entropy = -(key_usage * key_usage.clamp_min(1e-8).log()).sum()
+                    # To act as a loss, we want to minimize the negative entropy (i.e. maximize entropy)
+                    # For stability, we subtract from max possible entropy: log(num_valid_keys)
+                    max_entropy = torch.log(torch.tensor(key_usage.shape[-1], dtype=key_usage.dtype, device=key_usage.device))
+                    retrieval_usage_losses.append(max_entropy - usage_entropy)
 
                 masked_exact_targets = exact_targets_mask[batch_query_mask]
                 for top_k, tolerant_metric in (
