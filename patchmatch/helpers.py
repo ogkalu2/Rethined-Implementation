@@ -176,36 +176,37 @@ class PatchmatchHelpersMixin:
         default_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_patches, _ = query_tokens_full.shape
-        mixed = patch_values.clone() if default_tokens is None else default_tokens.clone()
+        mixed_default = patch_values if default_tokens is None else default_tokens
+        mixed_default = mixed_default.clone()
         eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
         dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
         valid_keys = key_valid_flat > 0.5
+        has_valid_keys = valid_keys.any(dim=1, keepdim=True)
+        safe_valid_keys = torch.where(has_valid_keys, valid_keys, torch.ones_like(valid_keys))
+        key_mask = safe_valid_keys.to(dtype=query_tokens_full.dtype).unsqueeze(1).unsqueeze(1)
 
-        for batch_idx in range(batch_size):
-            query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
-            if query_indices.numel() == 0:
-                continue
+        mixed_all, probs_all = self.multihead_attention(
+            query_tokens_full,
+            key_tokens_full,
+            patch_values,
+            post_softmax_mask=key_mask,
+            direct_patch_mixing=True,
+            query_mask_flat=query_mask_flat,
+        )
+        mixed_all = mixed_all.to(dtype=mixed_default.dtype)
+        probs_all = probs_all.to(dtype=dense_attn.dtype)
 
-            key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
-            replacement_rows = patch_values.new_zeros((query_indices.numel(), num_patches))
-            if key_indices.numel() > 0:
-                query_tokens = query_tokens_full[batch_idx : batch_idx + 1, query_indices]
-                key_tokens = key_tokens_full[batch_idx : batch_idx + 1, key_indices]
-                value_tokens = patch_values[batch_idx : batch_idx + 1, key_indices]
-                masked_attention, masked_probs = self.multihead_attention(
-                    query_tokens,
-                    key_tokens,
-                    value_tokens,
-                    direct_patch_mixing=True,
-                )
-                mixed_queries = masked_attention.squeeze(0).to(dtype=mixed.dtype)
-                masked_attention = masked_probs.squeeze(0).squeeze(0).to(dtype=replacement_rows.dtype)
-                replacement_rows[:, key_indices] = masked_attention
-                mixed[batch_idx].index_copy_(0, query_indices, mixed_queries)
+        active_queries = masked_queries & has_valid_keys
+        mixed = torch.where(active_queries.unsqueeze(-1), mixed_all, mixed_default)
 
-            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
-
+        dense_attn = torch.where(active_queries.unsqueeze(1).unsqueeze(-1), probs_all, dense_attn)
+        empty_key_queries = masked_queries & (~has_valid_keys)
+        dense_attn = torch.where(
+            empty_key_queries.unsqueeze(1).unsqueeze(-1),
+            torch.zeros_like(dense_attn),
+            dense_attn,
+        )
         return mixed, dense_attn
 
     def build_attention_mask(
