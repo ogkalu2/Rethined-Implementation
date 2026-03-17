@@ -18,8 +18,9 @@ test_*.py
 demo_*.py
 
 # Misc Folders
+tests/
 dataset/manifests/
 datasets/
 logs/
 results/
-rethined_paper/
+paper/

@@ -27,7 +27,7 @@ from device_utils import (
     is_amp_enabled,
 )
 from distributed_utils import barrier, destroy_distributed, init_distributed, reduce_metrics, reduce_scalar, unwrap_model
-from hr import AttentionUpscaling
+from upscale import AttentionUpscaling
 from losses import InpaintingLoss
 from model import InpaintingModel
 

@@ -4,7 +4,7 @@ from torch.nn import functional as F
 from typing import Any
 
 from coarse import COARSE_MODEL_REGISTRY
-from hr import AttentionUpscaling
+from upscale import AttentionUpscaling
 from patchmatch import PatchInpainting
 
 
