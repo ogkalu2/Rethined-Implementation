@@ -10,12 +10,9 @@ model:
     value_patch_size: 8
     attention_temperature: 0.5
     attention_top_k: 32
-    attention_selection: "gumbel"
+    attention_selection: "softmax"
+    attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
-    attention_warmup_selection: "softmax"
-    attention_warmup_steps: 6000
-    attention_warmup_top_k: null
-    attention_gumbel_hard_start_step: 9000
     matching_descriptor_dim: 256
     matching_hidden_dim: 384
     match_coarse_rgb: true

@@ -20,12 +20,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_temperature: float = 1.0,
         attention_top_k: int | None = None,
         attention_selection: str = "softmax",
+        attention_eval_selection: str | None = None,
         attention_gumbel_tau: float = 1.0,
         attention_gumbel_hard: bool = True,
-        attention_warmup_selection: str | None = None,
-        attention_warmup_steps: int = 0,
-        attention_warmup_top_k: int | None = None,
-        attention_gumbel_hard_start_step: int = 0,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
         match_coarse_rgb: bool = True,
@@ -139,23 +136,15 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             else self.matching_descriptor_dim
         )
         self.positional_grid_size = max(1, min(int(positional_grid_size), self.token_grid_size))
-        self.base_attention_selection = str(attention_selection).lower()
-        self.attention_warmup_selection = (
-            None if attention_warmup_selection is None else str(attention_warmup_selection).lower()
+        self.attention_selection = str(attention_selection).lower()
+        self.attention_eval_selection = (
+            self.attention_selection
+            if attention_eval_selection is None
+            else str(attention_eval_selection).lower()
         )
-        self.base_attention_top_k = None if attention_top_k is None else int(attention_top_k)
-        if self.base_attention_top_k is not None and self.base_attention_top_k <= 0:
-            self.base_attention_top_k = None
-        self.attention_warmup_top_k = None if attention_warmup_top_k is None else int(attention_warmup_top_k)
-        if self.attention_warmup_top_k is not None and self.attention_warmup_top_k <= 0:
-            self.attention_warmup_top_k = None
-        if self.attention_warmup_selection not in {None, "softmax", "gumbel", "argmax"}:
-            raise ValueError(
-                "attention_warmup_selection must be one of {None, 'softmax', 'gumbel', 'argmax'}."
-            )
-        self.attention_warmup_steps = max(0, int(attention_warmup_steps))
-        self.attention_gumbel_hard_start_step = max(0, int(attention_gumbel_hard_start_step))
-        self.current_training_step = 0
+        self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
+        if self.attention_top_k is not None and self.attention_top_k <= 0:
+            self.attention_top_k = None
 
         self.encoder_decoder = model
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -213,8 +202,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             dropout=float(dropout),
             d_qk=int(embed_dim),
             attention_temperature=float(attention_temperature),
-            attention_top_k=self.base_attention_top_k,
-            attention_selection=attention_selection,
+            attention_top_k=self.attention_top_k,
+            attention_selection=self.attention_selection,
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
         )
@@ -262,16 +251,12 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             self._compute_unfolding_weights(self.kernel_size, 1),
             persistent=False,
         )
-        self._apply_attention_schedule()
+        self._apply_attention_mode()
 
     def train(self, mode: bool = True):
         super().train(mode)
-        self._apply_attention_schedule()
+        self._apply_attention_mode()
         return self
-
-    def set_training_step(self, step: int):
-        self.current_training_step = max(0, int(step))
-        self._apply_attention_schedule()
 
     def forward(
         self,

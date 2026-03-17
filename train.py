@@ -591,7 +591,6 @@ def run_eval_only(cfg, args, dist_ctx):
     if not args.resume:
         raise ValueError("--eval-only requires --resume CHECKPOINT")
     checkpoint_step = load_eval_checkpoint(args.resume, model, device)
-    unwrap_model(model).generator.set_training_step(checkpoint_step)
     eval_loader = build_eval_loader(cfg, args, dist_ctx)
     if eval_loader is None:
         raise ValueError("No evaluation loader configured.")
@@ -755,7 +754,6 @@ def train(cfg, args, dist_ctx):
     )
     for step_idx in progress_bar:
         step = step_idx + 1
-        raw_model.generator.set_training_step(step)
         criterion.set_training_step(step)
         lr_g = get_lr(step, warmup_steps, total_steps, max_lr, min_lr)
         lr_scorer = get_lr(step, warmup_steps, total_steps, scorer_lr, scorer_min_lr)

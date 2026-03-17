@@ -61,30 +61,11 @@ class LightweightContextEncoder(nn.Module):
 
 
 class PatchmatchHelpersMixin:
-    def _apply_attention_schedule(self):
-        if not self.training:
-            self.multihead_attention.attention_selection = self.base_attention_selection
-            self.multihead_attention.attention_top_k = self.base_attention_top_k
-            self.multihead_attention.attention_gumbel_hard = True
-            return
-
-        if (
-            self.attention_warmup_selection is not None
-            and self.current_training_step < self.attention_warmup_steps
-        ):
-            self.multihead_attention.attention_selection = self.attention_warmup_selection
-            self.multihead_attention.attention_top_k = self.attention_warmup_top_k
-            self.multihead_attention.attention_gumbel_hard = False
-            return
-
-        self.multihead_attention.attention_selection = self.base_attention_selection
-        self.multihead_attention.attention_top_k = self.base_attention_top_k
-        if self.base_attention_selection == "gumbel":
-            self.multihead_attention.attention_gumbel_hard = (
-                self.current_training_step >= self.attention_gumbel_hard_start_step
-            )
-        else:
-            self.multihead_attention.attention_gumbel_hard = True
+    def _apply_attention_mode(self):
+        self.multihead_attention.attention_selection = (
+            self.attention_selection if self.training else self.attention_eval_selection
+        )
+        self.multihead_attention.attention_top_k = self.attention_top_k
 
     def _apply_branch_dropout(self, branch: torch.Tensor, drop_prob: float) -> torch.Tensor:
         if (not self.training) or drop_prob <= 0:
