@@ -77,11 +77,20 @@ class AttentionUpscaling(nn.Module):
         hr_patch_size = self.patch_inpainting.value_patch_size * scale_h
         hr_padding = self.patch_inpainting.value_patch_padding * scale_h
         hr_base = F.interpolate(x_lr_inpainted, size=(hr_h, hr_w), mode="bicubic", align_corners=False)
-        source = x_hr if mask_hr is None else x_hr * (1 - mask_hr)
-        source_blurred = self.patch_inpainting.final_gaussian_blur(source)
+        if mask_hr is None:
+            source_known = x_hr
+            source_context = x_hr
+        else:
+            mask_hr = mask_hr.to(dtype=x_hr.dtype)
+            source_known = x_hr * (1 - mask_hr)
+            # Fill the hole with the LR prediction before computing HR high-frequency residuals.
+            # Blurring a zero-filled hole injects artificial edge energy that gets copied into the
+            # missing region as tiled artifacts.
+            source_context = source_known + hr_base.to(dtype=x_hr.dtype) * mask_hr
+        source_blurred = self.patch_inpainting.final_gaussian_blur(source_context)
 
         source_patches, _ = self.patch_inpainting.extract_patches(
-            source,
+            source_context,
             hr_patch_size,
             stride=hr_stride,
             padding=hr_padding,
@@ -121,5 +130,5 @@ class AttentionUpscaling(nn.Module):
         if mask_hr is None:
             return output
         mask_hr = mask_hr.to(dtype=output.dtype)
-        known = x_hr.to(dtype=output.dtype) * (1 - mask_hr)
+        known = source_known.to(dtype=output.dtype)
         return output * mask_hr + known
