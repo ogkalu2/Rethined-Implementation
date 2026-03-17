@@ -1,6 +1,7 @@
 import torch
 from torch import nn
 from torch.nn import functional as F
+from typing import Any
 
 from coarse import COARSE_MODEL_REGISTRY
 from hr import AttentionUpscaling
@@ -8,7 +9,7 @@ from patchmatch import PatchInpainting
 
 
 class InpaintingModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
         coarse_class_name = config["coarse_model"].get("class", "CoarseModel")
         coarse_class = COARSE_MODEL_REGISTRY.get(coarse_class_name)
@@ -46,25 +47,21 @@ class InpaintingModel(nn.Module):
         return F.interpolate(image, size=(out_size, out_size), mode="bicubic", align_corners=False)
 
     def forward(
-        self, 
-        image, 
-        mask, 
-        value_image=None, 
-        return_aux=False, 
-        return_final=False,
-        ):
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+        value_image: torch.Tensor | None = None,
+        return_aux: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
+        return self.inpainter(image, mask, value_image=value_image, return_aux=return_aux)
 
+    def predict(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+        value_image: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         model_image_size = int(self.inpainter.image_size)
-        # In eval mode, default to returning a single final image tensor.
-        # Training keeps the multi-output path unless explicitly overridden.
-        use_final_path = return_final or ((not self.training) and (not return_aux))
-
-        if not use_final_path:
-            return self.inpainter(image, mask, value_image=value_image, return_aux=return_aux)
-
-        if return_aux:
-            raise ValueError("return_aux is not supported when using the final-image HR path.")
-
         if image.shape[-2:] == (model_image_size, model_image_size):
             refined, _, _ = self.inpainter(image, mask, value_image=value_image, return_aux=False)
             return refined
@@ -93,7 +90,7 @@ class InpaintingModel(nn.Module):
         final_hr = self.hr_upscaler(masked_hr, refined_lr, attn_map, mask_hr=mask)
         return final_hr.clamp(0, 1)
 
-    def reparameterize(self):
+    def reparameterize(self) -> "InpaintingModel":
         """Apply any model-specific inference-time reparameterization."""
         if hasattr(self.coarse_model, "reparameterize"):
             self.coarse_model.reparameterize()
