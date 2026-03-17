@@ -87,6 +87,7 @@ class InpaintingLoss(nn.Module):
         refined_query_patch_l1_weight: float = 0.0,
         retrieval_loss_weight: float = 0.0,
         retrieval_hard_ce_weight: float = 0.0,
+        retrieval_usage_weight: float = 0.0,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
         retrieval_target_margin_pct: float = 0.03,
@@ -102,6 +103,7 @@ class InpaintingLoss(nn.Module):
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
+        self.retrieval_usage_weight = float(retrieval_usage_weight)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
@@ -213,6 +215,7 @@ class InpaintingLoss(nn.Module):
         loss_terms = {
             "retrieval": zero,
             "retrieval_hard_ce": zero,
+            "retrieval_usage": zero,
         }
         metrics = {
             "retrieval_recall1_exact": 0.0,
@@ -244,6 +247,7 @@ class InpaintingLoss(nn.Module):
 
         retrieval_losses = []
         retrieval_hard_ce_losses = []
+        retrieval_usage_losses = []
         retrieval_recall1_exact = []
         retrieval_recall1 = []
         retrieval_recall8 = []
@@ -295,6 +299,11 @@ class InpaintingLoss(nn.Module):
                     -valid_probs_sum.log().mean()
                 )
 
+                if self.retrieval_usage_weight > 0.0:
+                    # Penalize uneven usage of keys by taking variance across key usage probabilities.
+                    key_usage = masked_pred_probs.sum(dim=0)
+                    retrieval_usage_losses.append(torch.var(key_usage))
+
                 masked_exact_targets = exact_targets_mask[batch_query_mask]
                 for top_k, tolerant_metric in (
                     (1, retrieval_recall1),
@@ -313,6 +322,8 @@ class InpaintingLoss(nn.Module):
             loss_terms["retrieval"] = torch.stack(retrieval_losses).mean()
         if retrieval_hard_ce_losses:
             loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
+        if retrieval_usage_losses:
+            loss_terms["retrieval_usage"] = torch.stack(retrieval_usage_losses).mean()
 
         if retrieval_recall1_exact:
             metrics["retrieval_recall1_exact"] = torch.stack(retrieval_recall1_exact).mean().item()
@@ -357,6 +368,7 @@ class InpaintingLoss(nn.Module):
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
             + self.retrieval_hard_ce_weight * attention_loss_terms["retrieval_hard_ce"]
+            + self.retrieval_usage_weight * attention_loss_terms["retrieval_usage"]
             + scheduled_weights["perceptual_weight"] * perceptual
         )
         loss_dict = {
@@ -365,6 +377,7 @@ class InpaintingLoss(nn.Module):
             "refined_query_patch_l1": refined_query_patch_l1.item(),
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
             "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
+            "retrieval_usage_loss": attention_loss_terms["retrieval_usage"].item(),
             "perceptual": perceptual.item(),
             "inpainter_total": total.item(),
         }

@@ -287,6 +287,8 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
     if include_retrieval and "retrieval_recall1_exact" in metrics:
         summary += f", r1_exact={metrics['retrieval_recall1_exact']:.3f}"
+    if include_retrieval and "retrieval_usage_loss" in metrics:
+        summary += f", usg={metrics['retrieval_usage_loss']:.3f}"
     if include_retrieval and "retrieval_recall1" in metrics:
         summary += f", r1_{retrieval_margin_label}={metrics['retrieval_recall1']:.3f}"
     if include_retrieval and "retrieval_recall8" in metrics:
@@ -849,6 +851,8 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
             if "retrieval_loss" in metrics:
                 writer.add_scalar("loss/retrieval", metrics["retrieval_loss"], step)
+            if "retrieval_usage_loss" in metrics:
+                writer.add_scalar("loss/retrieval_usage", metrics["retrieval_usage_loss"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/inpainter_total", metrics["inpainter_total"], step)
             writer.add_scalar("loss/running_inpainter", running_g, step)
