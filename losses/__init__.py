@@ -256,11 +256,17 @@ class InpaintingLoss(nn.Module):
             batch_query_mask = query_mask_flat[batch_idx, query_indices] > 0.5
             query_teacher_tokens = teacher_tokens[batch_idx, query_indices]
             key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
-            teacher_logits = -torch.cdist(
+            teacher_distances = torch.cdist(
                 query_teacher_tokens.unsqueeze(0),
                 key_teacher_tokens.unsqueeze(0),
                 p=1,
-            ).squeeze(0) / max(query_teacher_tokens.shape[-1], 1)
+            ).squeeze(0)
+            
+            # Find all target patches that are essentially identical to the absolute best patch
+            min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
+            valid_targets_mask = teacher_distances <= (min_teacher_dist + 1e-4)
+            
+            teacher_logits = -teacher_distances / max(query_teacher_tokens.shape[-1], 1)
             teacher_logits = teacher_logits / self.retrieval_teacher_temperature
             teacher_probs = F.softmax(teacher_logits, dim=-1)
             pred_log_probs = F.log_softmax(raw_logits, dim=-1)
@@ -269,18 +275,25 @@ class InpaintingLoss(nn.Module):
                 masked_teacher_probs = teacher_probs[batch_query_mask]
                 masked_pred_log_probs = pred_log_probs[batch_query_mask]
                 masked_raw_logits = raw_logits[batch_query_mask]
-                masked_teacher_best = masked_teacher_probs.argmax(dim=-1)
+                masked_valid_targets = valid_targets_mask[batch_query_mask]
+
                 retrieval_losses.append(
                     (-(masked_teacher_probs * masked_pred_log_probs).sum(dim=-1)).mean()
                 )
+                
+                # Multi-target Cross Entropy: maximize the sum of probabilities of all identical valid patches
+                masked_pred_probs = F.softmax(masked_raw_logits, dim=-1)
+                valid_probs_sum = (masked_pred_probs * masked_valid_targets.float()).sum(dim=-1).clamp_min(1e-8)
                 retrieval_hard_ce_losses.append(
-                    F.cross_entropy(masked_raw_logits, masked_teacher_best)
+                    -valid_probs_sum.log().mean()
                 )
+                
                 for top_k, metric_name in ((1, retrieval_recall1), (8, retrieval_recall8), (32, retrieval_recall32)):
                     k = min(top_k, masked_raw_logits.shape[-1])
                     topk = masked_raw_logits.topk(k=k, dim=-1).indices
+                    is_correct = masked_valid_targets.gather(1, topk).any(dim=-1)
                     metric_name.append(
-                        (topk == masked_teacher_best.unsqueeze(-1)).any(dim=-1).float().mean()
+                        is_correct.float().mean()
                     )
 
         if retrieval_losses:
