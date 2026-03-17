@@ -301,11 +301,8 @@ class InpaintingLoss(nn.Module):
 
                 if self.retrieval_usage_weight > 0.0:
                     # Penalize uneven usage of valid keys by minimizing negative entropy of key usage distribution.
-                    # Exclude invalid keys that were masked out from max_entropy scaling
-                    valid_keys_only = batch_idx
-                    masked_probs_valid = masked_pred_probs[:, entry["key_indices"]]
-                    if masked_probs_valid.shape[-1] > 1:
-                        key_usage = masked_probs_valid.mean(dim=0)
+                    if masked_pred_probs.shape[-1] > 1:
+                        key_usage = masked_pred_probs.mean(dim=0)
                         usage_entropy = -(key_usage * key_usage.clamp_min(1e-8).log()).sum()
                         max_entropy = torch.log(torch.tensor(key_usage.shape[-1], dtype=key_usage.dtype, device=key_usage.device))
                         retrieval_usage_losses.append(max_entropy - usage_entropy)
