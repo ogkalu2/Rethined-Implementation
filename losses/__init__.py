@@ -263,8 +263,9 @@ class InpaintingLoss(nn.Module):
             ).squeeze(0)
             
             # Find all target patches that are essentially identical to the absolute best patch
+            # We consider any patch with an L1 distance within 5% of the minimum distance to be a valid target
             min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
-            valid_targets_mask = teacher_distances <= (min_teacher_dist + 1e-4)
+            valid_targets_mask = teacher_distances <= (min_teacher_dist * 1.05 + 1e-4)
             
             teacher_logits = -teacher_distances / max(query_teacher_tokens.shape[-1], 1)
             teacher_logits = teacher_logits / self.retrieval_teacher_temperature
