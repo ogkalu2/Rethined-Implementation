@@ -107,6 +107,34 @@ class PatchOpsMixin:
                 f"Patch dimension {patch_dim} is not divisible by kernel footprint {kernel_size * kernel_size}."
             )
 
+        # Fast path for non-overlapping patch reconstruction.
+        if stride == kernel_size and padding == 0 and not use_window:
+            out_h, out_w = int(output_size[0]), int(output_size[1])
+            if out_h % kernel_size != 0 or out_w % kernel_size != 0:
+                raise ValueError(
+                    f"Output size {output_size} must be divisible by kernel_size {kernel_size} "
+                    "for no-overlap PixelShuffle reconstruction."
+                )
+            expected_n_h = out_h // kernel_size
+            expected_n_w = out_w // kernel_size
+
+            if patches.dim() == 4:
+                if n_h != expected_n_h or n_w != expected_n_w:
+                    raise ValueError(
+                        "Patch grid shape does not match output size for no-overlap reconstruction: "
+                        f"grid {(n_h, n_w)} vs expected {(expected_n_h, expected_n_w)}."
+                    )
+                patch_map = patches
+            else:
+                if num_patches != expected_n_h * expected_n_w:
+                    raise ValueError(
+                        "Number of patches does not match output size for no-overlap reconstruction: "
+                        f"got {num_patches}, expected {expected_n_h * expected_n_w}."
+                    )
+                patch_map = cols.view(batch_size, patch_dim, expected_n_h, expected_n_w)
+
+            return F.pixel_shuffle(patch_map, kernel_size)
+
         padded_output = (output_size[0] + 2 * padding, output_size[1] + 2 * padding)
 
         if use_window and (stride != kernel_size or padding > 0):
