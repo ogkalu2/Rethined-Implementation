@@ -100,6 +100,5 @@ logging:
   save_best_metric: "masked_l1_hr_refined"
   save_best_mode: "min"
   save_final_checkpoint: true
-  checkpoint_steps: [10000, 20000, 30000]
   keep_last_checkpoints: 3
   print_train_metrics: false
