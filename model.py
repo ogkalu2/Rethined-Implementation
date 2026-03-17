@@ -15,37 +15,37 @@ class InpaintingModel(nn.Module):
             raise ValueError(f"Unsupported coarse model class: {coarse_class_name}")
 
         self.coarse_model = coarse_class(**config["coarse_model"]["parameters"])
-        generator_params = dict(config["generator"]["params"])
+        inpainter_params = dict(config["inpainter"]["params"])
 
-        if generator_params.get("concat_features", True):
-            feature_i = generator_params.get("feature_i", 3)
+        if inpainter_params.get("concat_features", True):
+            feature_i = inpainter_params.get("feature_i", 3)
             feature_channels = self.coarse_model.feature_channels
             if feature_i < 0 or feature_i >= len(feature_channels):
                 raise ValueError(
-                    f"model.generator.feature_i={feature_i} is out of range for coarse feature maps"
+                    f"model.inpainter.feature_i={feature_i} is out of range for coarse feature maps"
                 )
 
             inferred_feature_dim = feature_channels[feature_i]
-            configured_feature_dim = generator_params.get("feature_dim")
+            configured_feature_dim = inpainter_params.get("feature_dim")
             if configured_feature_dim is None:
-                generator_params["feature_dim"] = inferred_feature_dim
+                inpainter_params["feature_dim"] = inferred_feature_dim
             elif configured_feature_dim != inferred_feature_dim:
                 raise ValueError(
-                    "model.generator.feature_dim does not match the selected coarse feature map: "
+                    "model.inpainter.feature_dim does not match the selected coarse feature map: "
                     f"got {configured_feature_dim}, expected {inferred_feature_dim} for feature_i={feature_i}"
                 )
 
-        self.generator = PatchInpainting(**generator_params, model=self.coarse_model)
+        self.inpainter = PatchInpainting(**inpainter_params, model=self.coarse_model)
 
     def forward(self, image, mask, value_image=None, return_aux=False):
-        return self.generator(image, mask, value_image=value_image, return_aux=return_aux)
+        return self.inpainter(image, mask, value_image=value_image, return_aux=return_aux)
 
     def reparameterize(self):
         """Apply any model-specific inference-time reparameterization."""
         if hasattr(self.coarse_model, "reparameterize"):
             self.coarse_model.reparameterize()
-        if hasattr(self.generator, "reparameterize"):
-            self.generator.reparameterize()
+        if hasattr(self.inpainter, "reparameterize"):
+            self.inpainter.reparameterize()
         return self
 
 __all__ = ["InpaintingModel"]

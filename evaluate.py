@@ -79,7 +79,7 @@ def save_eval_image(tensor, path):
 @torch.no_grad()
 def evaluate_quality(model, dataloader, device, model_image_size, num_images=200):
     lpips_fn = lpips.LPIPS(net="alex").to(device)
-    attn_upscaler = AttentionUpscaling(model.generator)
+    attn_upscaler = AttentionUpscaling(model.inpainter)
     amp_enabled = is_amp_enabled(device, True)
 
     metrics = {
@@ -109,7 +109,7 @@ def evaluate_quality(model, dataloader, device, model_image_size, num_images=200
                 batch,
                 device,
                 model_image_size,
-                blur_layer=model.generator.final_gaussian_blur,
+                blur_layer=model.inpainter.final_gaussian_blur,
             )
             coarse_eval, refined_eval, target, eval_mask = run_inference(
                 model,
@@ -163,7 +163,7 @@ def evaluate_quality(model, dataloader, device, model_image_size, num_images=200
 
 @torch.no_grad()
 def benchmark_speed(model, device, num_runs=50, warmup=10):
-    resolution = model.generator.image_size
+    resolution = model.inpainter.image_size
     amp_enabled = is_amp_enabled(device, True)
     dummy_img = torch.randn(1, 3, resolution, resolution, device=device)
     dummy_mask = torch.zeros(1, 1, resolution, resolution, device=device)
@@ -191,8 +191,8 @@ def benchmark_speed(model, device, num_runs=50, warmup=10):
 
 @torch.no_grad()
 def benchmark_upscaling(model, device, hr_resolutions, num_runs=30, warmup=5):
-    lr_res = model.generator.image_size
-    attn_upscaler = AttentionUpscaling(model.generator)
+    lr_res = model.inpainter.image_size
+    attn_upscaler = AttentionUpscaling(model.inpainter)
     amp_enabled = is_amp_enabled(device, True)
 
     dummy_lr = torch.randn(1, 3, lr_res, lr_res, device=device)
@@ -242,7 +242,7 @@ def benchmark_upscaling(model, device, hr_resolutions, num_runs=30, warmup=5):
 
 @torch.no_grad()
 def test_upscaling_quality(model, dataloader, device, hr_res=2048, num_images=50):
-    attn_upscaler = AttentionUpscaling(model.generator)
+    attn_upscaler = AttentionUpscaling(model.inpainter)
     amp_enabled = is_amp_enabled(device, True)
     l1_values = []
     count = 0
@@ -254,8 +254,8 @@ def test_upscaling_quality(model, dataloader, device, hr_res=2048, num_images=50
         batch_views = prepare_multiscale_batch(
             batch,
             device,
-            model.generator.image_size,
-            blur_layer=model.generator.final_gaussian_blur,
+            model.inpainter.image_size,
+            blur_layer=model.inpainter.final_gaussian_blur,
         )
         with torch.amp.autocast(device.type, enabled=amp_enabled):
             refined_lr, attn_map, _ = model(
@@ -352,9 +352,9 @@ def main():
     results["upscaling_speed"] = up_speed
     for res, info in up_speed.items():
         if "mean_ms" in info:
-            print(f"  LR={model.generator.image_size} -> HR={res}: {info['mean_ms']:.2f}ms")
+            print(f"  LR={model.inpainter.image_size} -> HR={res}: {info['mean_ms']:.2f}ms")
         else:
-            print(f"  LR={model.generator.image_size} -> HR={res}: {info}")
+            print(f"  LR={model.inpainter.image_size} -> HR={res}: {info}")
 
     if args.speed_only:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
@@ -382,7 +382,7 @@ def main():
         mask_generator_kwargs=cfg["data"].get("mask_generator"),
         shuffle_override=False,
     )
-    quality = evaluate_quality(model, val_loader, device, model.generator.image_size, num_images=args.num_images)
+    quality = evaluate_quality(model, val_loader, device, model.inpainter.image_size, num_images=args.num_images)
     results["quality"] = quality
     print(f"  {'Metric':<20} {'Coarse':>10} {'Refined':>10} {'Improvement':>12}")
     print(f"  {'-' * 58}")
@@ -399,7 +399,7 @@ def main():
 
     print("\n--- AttentionUpscaling Quality ---")
     for hr_res in hr_resolutions:
-        if hr_res <= model.generator.image_size:
+        if hr_res <= model.inpainter.image_size:
             continue
         up_quality = test_upscaling_quality(model, val_loader, device, hr_res=hr_res, num_images=min(args.num_images, 50))
         results[f"upscaling_quality_{hr_res}"] = up_quality

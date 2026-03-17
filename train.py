@@ -76,9 +76,9 @@ def create_summary_writer(log_dir: Path):
 
 def build_model_config(cfg):
     coarse_cfg = cfg["model"]["coarse_model"]
-    generator_params = {
+    inpainter_params = {
         k: v
-        for k, v in cfg["model"]["generator"].items()
+        for k, v in cfg["model"]["inpainter"].items()
         if k != "copy_mode" and not k.startswith("transport_")
     }
     return {
@@ -86,9 +86,9 @@ def build_model_config(cfg):
             "class": coarse_cfg.get("class", "CoarseModel"),
             "parameters": {k: v for k, v in coarse_cfg.items() if k != "class"},
         },
-        "generator": {
-            "generator_class": "PatchInpainting",
-            "params": generator_params,
+        "inpainter": {
+            "inpainter_class": "PatchInpainting",
+            "params": inpainter_params,
         },
     }
 
@@ -288,7 +288,7 @@ def build_checkpoint_metrics(train_metrics, best_metric_name, best_metric_mode, 
 
 def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_margin_label="3pct"):
     summary = (
-        f"train g={metrics['generator_total']:.4f}, "
+        f"train i={metrics['inpainter_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
@@ -337,7 +337,7 @@ def save_vis(writer, batch, coarse, refined, step, log_dir=None):
 def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ctx, criterion=None, max_batches=8):
     model.eval()
     raw_model = unwrap_model(model)
-    attn_upscaler = AttentionUpscaling(raw_model.generator)
+    attn_upscaler = AttentionUpscaling(raw_model.inpainter)
     amp_device_type = get_autocast_device_type(device)
     amp_enabled = is_amp_enabled(device, use_amp)
 
@@ -352,7 +352,7 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
             batch,
             device,
             model_image_size,
-            blur_layer=raw_model.generator.final_gaussian_blur,
+            blur_layer=raw_model.inpainter.final_gaussian_blur,
         )
         mask = batch_views["mask"]
         masked_image = batch_views["masked_image"]
@@ -606,7 +606,7 @@ def run_eval_only(cfg, args, dist_ctx):
         eval_loader,
         device,
         cfg["training"]["mixed_precision"],
-        unwrap_model(model).generator.image_size,
+        unwrap_model(model).inpainter.image_size,
         dist_ctx,
         criterion=criterion,
         max_batches=(args.eval_batches if args.eval_batches is not None else cfg.get("logging", {}).get("eval_batches", 8)),
@@ -720,10 +720,10 @@ def train(cfg, args, dist_ctx):
     min_lr = cfg["training"]["min_lr"]
     warmup_steps = cfg["training"]["warmup_steps"]
     grad_clip_g = cfg["training"].get("grad_clip", 1.0)
-    model_image_size = raw_model.generator.image_size
+    model_image_size = raw_model.inpainter.image_size
 
     if dist_ctx.is_main_process:
-        print(f"Generator parameters: {sum(p.numel() for p in raw_model.parameters()):,}")
+        print(f"Inpainter parameters: {sum(p.numel() for p in raw_model.parameters()):,}")
         print(f"  Base parameters: {sum(p.numel() for p in base_params):,}")
         print(f"  Scorer parameters: {sum(p.numel() for p in scorer_params):,} (LR: {scorer_lr})")
         print(f"Per-rank effective batch size: {cfg['data']['batch_size'] * grad_accum}")
@@ -781,7 +781,7 @@ def train(cfg, args, dist_ctx):
                 batch,
                 device,
                 model_image_size,
-                blur_layer=raw_model.generator.final_gaussian_blur,
+                blur_layer=raw_model.inpainter.final_gaussian_blur,
             )
             image = batch_views["image"]
             mask = batch_views["mask"]
@@ -799,7 +799,7 @@ def train(cfg, args, dist_ctx):
                     )
                     refined_vis = refined_raw.clamp(0, 1)
                     coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
-                    g_loss, g_metrics = criterion.generator_loss(
+                    g_loss, g_metrics = criterion.inpainter_loss(
                         coarse_raw,
                         refined_raw,
                         image,
@@ -821,9 +821,9 @@ def train(cfg, args, dist_ctx):
                 step_has_nonfinite = True
                 break
 
-            attn_metrics = raw_model.generator.summarize_attention(
+            attn_metrics = raw_model.inpainter.summarize_attention(
                 attn_map.detach(),
-                raw_model.generator.flatten_query_mask(mask).detach(),
+                raw_model.inpainter.flatten_query_mask(mask).detach(),
             )
 
             for key, value in g_metrics.items():
@@ -849,7 +849,7 @@ def train(cfg, args, dist_ctx):
 
         metrics = {key: value / grad_accum for key, value in metric_sums.items()}
         metrics = reduce_metrics(metrics, dist_ctx, average=True)
-        running_g = 0.9 * running_g + 0.1 * metrics["generator_total"]
+        running_g = 0.9 * running_g + 0.1 * metrics["inpainter_total"]
 
         if dist_ctx.is_main_process and (step == 1 or step % log_cfg["log_interval"] == 0):
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
@@ -859,8 +859,8 @@ def train(cfg, args, dist_ctx):
             if "retrieval_loss" in metrics:
                 writer.add_scalar("loss/retrieval", metrics["retrieval_loss"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
-            writer.add_scalar("loss/generator_total", metrics["generator_total"], step)
-            writer.add_scalar("loss/running_generator", running_g, step)
+            writer.add_scalar("loss/inpainter_total", metrics["inpainter_total"], step)
+            writer.add_scalar("loss/running_inpainter", running_g, step)
             writer.add_scalar("attention/top1", metrics["attention_top1"], step)
             writer.add_scalar("attention/top4", metrics["attention_top4"], step)
             writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
@@ -877,7 +877,7 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("loss_weight/retrieval", metrics["weight/retrieval_loss"], step)
             if "weight/perceptual" in metrics:
                 writer.add_scalar("loss_weight/perceptual", metrics["weight/perceptual"], step)
-            writer.add_scalar("lr/generator", lr_g, step)
+            writer.add_scalar("lr/inpainter", lr_g, step)
             peak_memory_gb = get_peak_memory_allocated_gb(device)
             if peak_memory_gb is not None:
                 writer.add_scalar("accelerator_mem_gb", peak_memory_gb, step)
@@ -885,7 +885,7 @@ def train(cfg, args, dist_ctx):
             if log_cfg.get("print_train_metrics", False):
                 progress_bar.set_postfix(
                     {
-                        "g": f"{metrics['generator_total']:.4f}",
+                        "i": f"{metrics['inpainter_total']:.4f}",
                         "l1": f"{metrics['refined_l1']:.4f}",
                         "qp": (
                             f"{metrics['refined_query_patch_l1']:.4f}"

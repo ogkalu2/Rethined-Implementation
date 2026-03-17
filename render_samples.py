@@ -63,7 +63,7 @@ def render_sample(model, attn_upscaler, batch, model_image_size: int):
     mask_hr = batch["mask"].unsqueeze(0)
     masked_hr = batch["masked_image"].unsqueeze(0)
 
-    blur_layer = model.generator.final_gaussian_blur
+    blur_layer = model.inpainter.final_gaussian_blur
     refine_target_lr = F.interpolate(image_hr, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
     image_lr = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
     mask_lr = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
@@ -121,8 +121,8 @@ def main():
 
     device = resolve_device(args.device)
     model, cfg = load_model_and_cfg(Path(args.checkpoint), Path(args.config), device)
-    model_image_size = model.generator.image_size
-    attn_upscaler = AttentionUpscaling(model.generator).to(device).eval()
+    model_image_size = model.inpainter.image_size
+    attn_upscaler = AttentionUpscaling(model.inpainter).to(device).eval()
 
     dataset = InpaintingDataset(
         root_dir=cfg["data"].get("root_dir"),

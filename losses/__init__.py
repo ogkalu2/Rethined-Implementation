@@ -332,7 +332,7 @@ class InpaintingLoss(nn.Module):
         _, metrics = self._attention_supervision_losses(refined_target, attention_aux)
         return metrics
 
-    def generator_loss(
+    def inpainter_loss(
         self,
         coarse_raw: torch.Tensor,
         refined: torch.Tensor,
@@ -366,7 +366,7 @@ class InpaintingLoss(nn.Module):
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
             "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
             "perceptual": perceptual.item(),
-            "generator_total": total.item(),
+            "inpainter_total": total.item(),
         }
         loss_dict.update({
             f"weight/{name.removesuffix('_weight')}": value

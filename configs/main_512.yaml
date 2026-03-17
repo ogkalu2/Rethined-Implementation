@@ -5,7 +5,7 @@ model:
     channels: [64, 128, 256, 384, 512]
     head_channels: 32
     use_rep_blocks: true
-  generator:
+  inpainter:
     kernel_size: 8
     value_patch_size: 8
     attention_temperature: 0.1
