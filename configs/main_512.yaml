@@ -35,7 +35,7 @@ model:
     feature_dim: null
     concat_features: true
     detach_coarse_rgb: false
-    final_conv: true
+    final_conv: false
     attention_masking: true
 
 data:
