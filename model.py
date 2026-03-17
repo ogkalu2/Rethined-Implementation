@@ -1,8 +1,9 @@
-"""Top-level model composition for the RETHINED implementation."""
-
+import torch
 from torch import nn
+from torch.nn import functional as F
 
 from coarse import COARSE_MODEL_REGISTRY
+from hr import AttentionUpscaling
 from patchmatch import PatchInpainting
 
 
@@ -36,9 +37,49 @@ class InpaintingModel(nn.Module):
                 )
 
         self.inpainter = PatchInpainting(**inpainter_params, model=self.coarse_model)
+        self.hr_upscaler = AttentionUpscaling(self.inpainter)
 
-    def forward(self, image, mask, value_image=None, return_aux=False):
-        return self.inpainter(image, mask, value_image=value_image, return_aux=return_aux)
+    def _prefilter_downsample(self, image: torch.Tensor, out_size: int) -> torch.Tensor:
+        if image.shape[-2:] == (out_size, out_size):
+            return image
+        image = self.inpainter.final_gaussian_blur(image)
+        return F.interpolate(image, size=(out_size, out_size), mode="bicubic", align_corners=False)
+
+    def forward(self, image, mask, value_image=None, return_aux=False, return_final=False):
+        if not return_final:
+            return self.inpainter(image, mask, value_image=value_image, return_aux=return_aux)
+
+        if return_aux:
+            raise ValueError("return_aux and return_final cannot both be True.")
+
+        model_image_size = int(self.inpainter.image_size)
+        if image.shape[-2:] == (model_image_size, model_image_size):
+            refined, _, _ = self.inpainter(image, mask, value_image=value_image, return_aux=False)
+            return refined
+
+        known_hr = image if value_image is None else value_image
+        refine_target_lr = F.interpolate(
+            known_hr,
+            size=(model_image_size, model_image_size),
+            mode="bicubic",
+            align_corners=False,
+        )
+        image_lr = self._prefilter_downsample(known_hr, model_image_size)
+        mask_lr = F.interpolate(mask, size=(model_image_size, model_image_size), mode="nearest")
+        mask_lr = (mask_lr > 0.5).to(image_lr.dtype)
+        masked_lr = image_lr * (1 - mask_lr)
+
+        refined_lr, attn_map, _ = self.inpainter(
+            masked_lr,
+            mask_lr,
+            value_image=refine_target_lr,
+            return_aux=False,
+        )
+        refined_lr = refined_lr.clamp(0, 1)
+
+        masked_hr = known_hr * (1 - mask)
+        final_hr = self.hr_upscaler(masked_hr, refined_lr, attn_map, mask_hr=mask)
+        return final_hr.clamp(0, 1)
 
     def reparameterize(self):
         """Apply any model-specific inference-time reparameterization."""
