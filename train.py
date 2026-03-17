@@ -79,7 +79,7 @@ def build_model_config(cfg):
     inpainter_params = {
         k: v
         for k, v in cfg["model"]["inpainter"].items()
-        if k != "copy_mode" and not k.startswith("transport_")
+        if k != "copy_mode"
     }
     return {
         "coarse_model": {
@@ -191,20 +191,11 @@ def load_model_checkpoint(model, state_dict):
     raw_model = unwrap_model(model)
     if state_dict and all(key.startswith("module.") for key in state_dict):
         state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
-    filtered_state_dict = {
-        key: value
-        for key, value in state_dict.items()
-        if ".transport_" not in key and "transport_" not in key
-    }
-    missing_keys, unexpected_keys = raw_model.load_state_dict(filtered_state_dict, strict=False)
-    unexpected_non_transport = [
-        key for key in unexpected_keys
-        if "transport_" not in key
-    ]
-    if missing_keys or unexpected_non_transport:
+    missing_keys, unexpected_keys = raw_model.load_state_dict(state_dict, strict=False)
+    if missing_keys or unexpected_keys:
         raise RuntimeError(
-            "Checkpoint is incompatible with the current attention-only model. "
-            f"Missing keys: {missing_keys}. Unexpected keys: {unexpected_non_transport}."
+            "Checkpoint is incompatible with the current model. "
+            f"Missing keys: {missing_keys}. Unexpected keys: {unexpected_keys}."
         )
 
 
@@ -599,7 +590,7 @@ def run_eval_only(cfg, args, dist_ctx):
     if isinstance(eval_sampler, DistributedSampler):
         eval_sampler.set_epoch(0)
 
-    loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
+    loss_cfg = dict(cfg["loss"])
     criterion = InpaintingLoss(**loss_cfg).to(device)
     health = validate_model(
         model,
@@ -633,7 +624,7 @@ def train(cfg, args, dist_ctx):
     seed_everything(cfg["training"]["seed"])
 
     raw_model = InpaintingModel(build_model_config(cfg)).to(device)
-    loss_cfg = {k: v for k, v in cfg["loss"].items() if not k.startswith("transport_")}
+    loss_cfg = dict(cfg["loss"])
     criterion = InpaintingLoss(**loss_cfg).to(device)
 
     scorer_param_names = {
