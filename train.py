@@ -730,7 +730,7 @@ def train(cfg, args, dist_ctx):
         print(f"Global effective batch size: {cfg['data']['batch_size'] * grad_accum * dist_ctx.world_size}")
 
     log_dir = Path(log_cfg["log_dir"])
-    ckpt_dir = log_dir / "checkpoints"
+    ckpt_dir = log_dir / "models"
     if dist_ctx.is_main_process:
         ckpt_dir.mkdir(parents=True, exist_ok=True)
     writer = create_summary_writer(log_dir / "tb") if dist_ctx.is_main_process else NullSummaryWriter()
