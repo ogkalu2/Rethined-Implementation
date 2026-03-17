@@ -10,6 +10,47 @@ class AttentionUpscaling(nn.Module):
         super().__init__()
         self.patch_inpainting = patch_inpainting_module
 
+    def _remask_attention_for_hr(
+        self,
+        attn_weights: torch.Tensor,
+        mask_hr: torch.Tensor | None,
+        *,
+        hr_stride: int,
+        hr_patch_size: int,
+        hr_padding: int,
+    ) -> torch.Tensor:
+        if mask_hr is None:
+            return attn_weights
+
+        query_mask_patch_map, _ = self.patch_inpainting.extract_patches(
+            mask_hr,
+            hr_stride,
+            stride=hr_stride,
+            padding=0,
+            pad_mode="constant",
+        )
+        key_mask_patch_map, _ = self.patch_inpainting.extract_patches(
+            mask_hr,
+            hr_patch_size,
+            stride=hr_stride,
+            padding=hr_padding,
+            pad_mode="constant",
+        )
+        query_mask_flat = (query_mask_patch_map.amax(dim=1) > 0.5).flatten(start_dim=1)
+        key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).flatten(start_dim=1)
+        expected_shape = (query_mask_flat.shape[1], key_valid_flat.shape[1])
+        if attn_weights.shape[-2:] != expected_shape:
+            raise ValueError(
+                "AttentionUpscaling HR remasking expected attention weights with shape "
+                f"{expected_shape}, got {tuple(attn_weights.shape[-2:])}."
+            )
+
+        filtered_weights = attn_weights * key_valid_flat.unsqueeze(1).to(dtype=attn_weights.dtype)
+        filtered_sums = filtered_weights.sum(dim=-1, keepdim=True)
+        masked_queries = query_mask_flat.unsqueeze(-1)
+        normalized_filtered = filtered_weights / filtered_sums.clamp_min(1e-8)
+        return torch.where(masked_queries, normalized_filtered, attn_weights)
+
     def forward(
         self,
         x_hr: torch.Tensor,
@@ -53,6 +94,13 @@ class AttentionUpscaling(nn.Module):
         )
         source_hf_flat = (source_patches - source_blurred_patches).flatten(start_dim=2).transpose(1, 2)
         attn_weights = attn_map.squeeze(1)
+        attn_weights = self._remask_attention_for_hr(
+            attn_weights,
+            mask_hr,
+            hr_stride=hr_stride,
+            hr_patch_size=hr_patch_size,
+            hr_padding=hr_padding,
+        )
         compute_dtype = torch.promote_types(attn_weights.dtype, source_hf_flat.dtype)
         if attn_weights.dtype != compute_dtype:
             attn_weights = attn_weights.to(dtype=compute_dtype)
