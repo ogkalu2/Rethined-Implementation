@@ -58,9 +58,15 @@ def make_dataset_sample(
 
 @torch.no_grad()
 def predict_with_intermediates(model: InpaintingModel, image: torch.Tensor, mask: torch.Tensor):
+    masked_image = image * (1 - mask)
     model_image_size = int(model.inpainter.image_size)
     if image.shape[-2:] == (model_image_size, model_image_size):
-        refined, attn_map, coarse_raw = model.inpainter(image, mask, value_image=None, return_aux=False)
+        refined, attn_map, coarse_raw = model.inpainter(
+            masked_image,
+            mask,
+            value_image=image,
+            return_aux=False,
+        )
         refined = refined.clamp(0, 1)
         coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
         refined_vis = refined
@@ -108,7 +114,7 @@ def render_sample(model, batch):
     mask_hr = batch["mask"].unsqueeze(0)
     masked_hr = batch["masked_image"].unsqueeze(0)
 
-    hr_final, coarse_vis, lr_refined_vis = predict_with_intermediates(model, masked_hr, mask_hr)
+    hr_final, coarse_vis, lr_refined_vis = predict_with_intermediates(model, image_hr, mask_hr)
     mask_rgb = mask_hr.repeat(1, 3, 1, 1)
 
     return torch.cat(
