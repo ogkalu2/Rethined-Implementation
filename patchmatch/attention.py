@@ -107,8 +107,8 @@ class MultiHeadAttention(nn.Module):
         q_proj = self.w_qs(q).view(batch_size, len_q, self.n_head, self.d_k).transpose(1, 2)
         k_proj = self.w_ks(k).view(batch_size, len_k, self.n_head, self.d_k).transpose(1, 2)
         
-        q_proj = F.normalize(q_proj, p=2, dim=-1)
-        k_proj = F.normalize(k_proj, p=2, dim=-1)
+        q_proj = F.normalize(q_proj.float(), p=2, dim=-1).to(q_proj.dtype)
+        k_proj = F.normalize(k_proj.float(), p=2, dim=-1).to(k_proj.dtype)
         
         attn_logits_raw = torch.matmul(q_proj, k_proj.transpose(2, 3)).float()
         if self.attention_temperature != 1.0:
