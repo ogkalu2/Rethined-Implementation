@@ -12,9 +12,8 @@ from torchvision.utils import save_image
 
 from data.dataset import InpaintingDataset
 from device_utils import resolve_device
-from upscale import AttentionUpscaling
 from model import InpaintingModel
-from train import build_model_config, composite_with_known, gaussian_prefilter_downsample, load_model_checkpoint
+from train import build_model_config, composite_with_known, load_model_checkpoint
 
 
 def load_model_and_cfg(checkpoint_path: Path, config_path: Path, device: torch.device):
@@ -58,45 +57,66 @@ def make_dataset_sample(
 
 
 @torch.no_grad()
-def render_sample(model, attn_upscaler, batch, model_image_size: int):
+def predict_with_intermediates(model: InpaintingModel, image: torch.Tensor, mask: torch.Tensor):
+    model_image_size = int(model.inpainter.image_size)
+    if image.shape[-2:] == (model_image_size, model_image_size):
+        refined, attn_map, coarse_raw = model.inpainter(image, mask, value_image=None, return_aux=False)
+        refined = refined.clamp(0, 1)
+        coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), image, mask)
+        refined_vis = refined
+        return refined, coarse_vis, refined_vis
+
+    known_hr = image
+    refine_target_lr = F.interpolate(
+        known_hr,
+        size=(model_image_size, model_image_size),
+        mode="bicubic",
+        align_corners=False,
+    )
+    image_lr = model._prefilter_downsample(known_hr, model_image_size)
+    mask_lr = F.interpolate(mask, size=(model_image_size, model_image_size), mode="nearest")
+    mask_lr = (mask_lr > 0.5).to(image_lr.dtype)
+    masked_lr = image_lr * (1 - mask_lr)
+
+    refined_lr, attn_map, coarse_raw = model.inpainter(
+        masked_lr,
+        mask_lr,
+        value_image=refine_target_lr,
+        return_aux=False,
+    )
+    refined_lr = refined_lr.clamp(0, 1)
+    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), refine_target_lr, mask_lr)
+
+    masked_hr = known_hr * (1 - mask)
+    final_hr = model.hr_upscaler(masked_hr, refined_lr, attn_map, mask_hr=mask).clamp(0, 1)
+    coarse_hr = composite_with_known(
+        F.interpolate(coarse_lr, size=known_hr.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),
+        known_hr,
+        mask,
+    )
+    lr_refined_hr = composite_with_known(
+        F.interpolate(refined_lr, size=known_hr.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),
+        known_hr,
+        mask,
+    )
+    return final_hr, coarse_hr, lr_refined_hr
+
+
+@torch.no_grad()
+def render_sample(model, batch):
     image_hr = batch["image"].unsqueeze(0)
     mask_hr = batch["mask"].unsqueeze(0)
     masked_hr = batch["masked_image"].unsqueeze(0)
 
-    blur_layer = model.inpainter.final_gaussian_blur
-    refine_target_lr = F.interpolate(image_hr, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
-    image_lr = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
-    mask_lr = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
-    mask_lr = (mask_lr > 0.5).to(image_lr.dtype)
-    masked_lr = image_lr * (1 - mask_lr)
-
-    refined_raw, attn_map, coarse_raw = model(masked_lr, mask_lr, value_image=refine_target_lr)
-    refined_lr = composite_with_known(refined_raw.clamp(0, 1), refine_target_lr, mask_lr)
-    coarse_lr = composite_with_known(coarse_raw.clamp(0, 1), refine_target_lr, mask_lr)
-
-    coarse_hr = composite_with_known(
-        F.interpolate(coarse_lr, size=image_hr.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),
-        image_hr,
-        mask_hr,
-    )
-    lr_refined_hr = composite_with_known(
-        F.interpolate(refined_lr, size=image_hr.shape[-2:], mode="bicubic", align_corners=False).clamp(0, 1),
-        image_hr,
-        mask_hr,
-    )
-    hr_final = composite_with_known(
-        attn_upscaler(masked_hr, refined_lr, attn_map, mask_hr=mask_hr).clamp(0, 1),
-        image_hr,
-        mask_hr,
-    )
+    hr_final, coarse_vis, lr_refined_vis = predict_with_intermediates(model, masked_hr, mask_hr)
     mask_rgb = mask_hr.repeat(1, 3, 1, 1)
 
     return torch.cat(
         [
             image_hr.cpu(),
             masked_hr.cpu(),
-            coarse_hr.cpu(),
-            lr_refined_hr.cpu(),
+            coarse_vis.cpu(),
+            lr_refined_vis.cpu(),
             hr_final.cpu(),
             mask_rgb.cpu(),
         ],
@@ -121,8 +141,6 @@ def main():
 
     device = resolve_device(args.device)
     model, cfg = load_model_and_cfg(Path(args.checkpoint), Path(args.config), device)
-    model_image_size = model.inpainter.image_size
-    attn_upscaler = AttentionUpscaling(model.inpainter).to(device).eval()
 
     dataset = InpaintingDataset(
         root_dir=cfg["data"].get("root_dir"),
@@ -157,7 +175,7 @@ def main():
         f"fixed_mask_seed: {args.fixed_mask_seed}",
         f"max_images: {args.max_images}",
         f"indices: {indices}",
-        "Columns: ground_truth | masked_input | coarse_x2 | lr_refined_x2 | hr_final | mask",
+        "Columns: ground_truth | masked_input | coarse_x2 | lr_refined_x2 | predict_final | mask",
         "",
     ]
 
@@ -170,7 +188,7 @@ def main():
             random_mask_seed=(args.fixed_mask_seed if args.deterministic else None),
         )
         batch = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
-        panel = render_sample(model, attn_upscaler, batch, model_image_size)
+        panel = render_sample(model, batch)
         panel_name = f"sample_{slot:02d}_idx_{idx}.png"
         save_image(panel, output_dir / panel_name)
         panels.append(panel)
