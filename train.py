@@ -255,6 +255,14 @@ def mean_metric(values):
     return float(sum(values) / len(values)) if values else None
 
 
+RETRIEVAL_RECALL_KEYS = (
+    "retrieval_recall1_exact",
+    "retrieval_recall1",
+    "retrieval_recall8",
+    "retrieval_recall32",
+)
+
+
 def is_better_metric(candidate, best, mode):
     if candidate is None:
         return False
@@ -278,7 +286,7 @@ def build_checkpoint_metrics(train_metrics, best_metric_name, best_metric_mode, 
     return checkpoint_metrics
 
 
-def format_train_metric_snapshot(metrics, include_retrieval=True):
+def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_margin_label="3pct"):
     summary = (
         f"train g={metrics['generator_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
@@ -286,23 +294,27 @@ def format_train_metric_snapshot(metrics, include_retrieval=True):
     )
     if "refined_query_patch_l1" in metrics:
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
+    if include_retrieval and "retrieval_recall1_exact" in metrics:
+        summary += f", r1_exact={metrics['retrieval_recall1_exact']:.3f}"
     if include_retrieval and "retrieval_recall1" in metrics:
-        summary += f", r1={metrics['retrieval_recall1']:.3f}"
+        summary += f", r1_{retrieval_margin_label}={metrics['retrieval_recall1']:.3f}"
     if include_retrieval and "retrieval_recall8" in metrics:
-        summary += f", r8={metrics['retrieval_recall8']:.3f}"
+        summary += f", r8_{retrieval_margin_label}={metrics['retrieval_recall8']:.3f}"
     if include_retrieval and "retrieval_recall32" in metrics:
-        summary += f", r32={metrics['retrieval_recall32']:.3f}"
+        summary += f", r32_{retrieval_margin_label}={metrics['retrieval_recall32']:.3f}"
     return summary
 
 
-def format_val_retrieval_snapshot(metrics):
+def format_val_retrieval_snapshot(metrics, retrieval_margin_label="3pct"):
     parts = []
+    if "retrieval_recall1_exact" in metrics:
+        parts.append(f"r1_exact={metrics['retrieval_recall1_exact']:.3f}")
     if "retrieval_recall1" in metrics:
-        parts.append(f"r1={metrics['retrieval_recall1']:.3f}")
+        parts.append(f"r1_{retrieval_margin_label}={metrics['retrieval_recall1']:.3f}")
     if "retrieval_recall8" in metrics:
-        parts.append(f"r8={metrics['retrieval_recall8']:.3f}")
+        parts.append(f"r8_{retrieval_margin_label}={metrics['retrieval_recall8']:.3f}")
     if "retrieval_recall32" in metrics:
-        parts.append(f"r32={metrics['retrieval_recall32']:.3f}")
+        parts.append(f"r32_{retrieval_margin_label}={metrics['retrieval_recall32']:.3f}")
     return ", ".join(parts)
 
 
@@ -406,7 +418,7 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
         metric_counts["hr_gain_abs"] += int(hr_gain.numel())
         if criterion is not None:
             retrieval_metrics = criterion.attention_supervision_metrics(refine_target, attention_aux)
-            for key in ("retrieval_recall1", "retrieval_recall8", "retrieval_recall32"):
+            for key in RETRIEVAL_RECALL_KEYS:
                 metric_sums[key] += float(retrieval_metrics[key])
                 metric_counts[key] += 1
 
@@ -458,7 +470,7 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
             else None
         ),
     }
-    for key in ("retrieval_recall1", "retrieval_recall8", "retrieval_recall32"):
+    for key in RETRIEVAL_RECALL_KEYS:
         value = mean_from(key)
         if value is not None:
             result[key] = value
@@ -702,6 +714,7 @@ def train(cfg, args, dist_ctx):
             print(f"Validation images: {len(eval_loader.dataset)}")
 
     log_cfg = cfg["logging"]
+    retrieval_margin_label = f"{int(round(100 * cfg['loss'].get('retrieval_target_margin_pct', 0.03)))}pct"
     total_steps = args.steps if args.steps else cfg["training"]["total_steps"]
     grad_accum = 1 if args.overfit else cfg["training"]["grad_accum_steps"]
     max_lr = cfg["training"]["lr"]
@@ -854,12 +867,14 @@ def train(cfg, args, dist_ctx):
             writer.add_scalar("attention/top4", metrics["attention_top4"], step)
             writer.add_scalar("attention/entropy", metrics["attention_entropy"], step)
             writer.add_scalar("attention/masked_ratio", metrics["attention_masked_ratio"], step)
+            if "retrieval_recall1_exact" in metrics:
+                writer.add_scalar("retrieval/recall1_exact", metrics["retrieval_recall1_exact"], step)
             if "retrieval_recall1" in metrics:
-                writer.add_scalar("retrieval/recall1", metrics["retrieval_recall1"], step)
+                writer.add_scalar(f"retrieval/recall1_{retrieval_margin_label}", metrics["retrieval_recall1"], step)
             if "retrieval_recall8" in metrics:
-                writer.add_scalar("retrieval/recall8", metrics["retrieval_recall8"], step)
+                writer.add_scalar(f"retrieval/recall8_{retrieval_margin_label}", metrics["retrieval_recall8"], step)
             if "retrieval_recall32" in metrics:
-                writer.add_scalar("retrieval/recall32", metrics["retrieval_recall32"], step)
+                writer.add_scalar(f"retrieval/recall32_{retrieval_margin_label}", metrics["retrieval_recall32"], step)
             if "weight/retrieval_loss" in metrics:
                 writer.add_scalar("loss_weight/retrieval", metrics["weight/retrieval_loss"], step)
             if "weight/perceptual" in metrics:
@@ -871,13 +886,31 @@ def train(cfg, args, dist_ctx):
             write_status(log_cfg["log_dir"], step, total_steps, metrics, lr_g)
             if log_cfg.get("print_train_metrics", False):
                 progress_bar.set_postfix(
-                    g=f"{metrics['generator_total']:.4f}",
-                    l1=f"{metrics['refined_l1']:.4f}",
-                    qp=(f"{metrics['refined_query_patch_l1']:.4f}" if "refined_query_patch_l1" in metrics else "n/a"),
-                    r1=(f"{metrics['retrieval_recall1']:.3f}" if "retrieval_recall1" in metrics else "n/a"),
-                    r8=(f"{metrics['retrieval_recall8']:.3f}" if "retrieval_recall8" in metrics else "n/a"),
-                    r32=(f"{metrics['retrieval_recall32']:.3f}" if "retrieval_recall32" in metrics else "n/a"),
-                    perc=f"{metrics['perceptual']:.4f}",
+                    {
+                        "g": f"{metrics['generator_total']:.4f}",
+                        "l1": f"{metrics['refined_l1']:.4f}",
+                        "qp": (
+                            f"{metrics['refined_query_patch_l1']:.4f}"
+                            if "refined_query_patch_l1" in metrics else "n/a"
+                        ),
+                        "r1_exact": (
+                            f"{metrics['retrieval_recall1_exact']:.3f}"
+                            if "retrieval_recall1_exact" in metrics else "n/a"
+                        ),
+                        f"r1_{retrieval_margin_label}": (
+                            f"{metrics['retrieval_recall1']:.3f}"
+                            if "retrieval_recall1" in metrics else "n/a"
+                        ),
+                        f"r8_{retrieval_margin_label}": (
+                            f"{metrics['retrieval_recall8']:.3f}"
+                            if "retrieval_recall8" in metrics else "n/a"
+                        ),
+                        f"r32_{retrieval_margin_label}": (
+                            f"{metrics['retrieval_recall32']:.3f}"
+                            if "retrieval_recall32" in metrics else "n/a"
+                        ),
+                        "perc": f"{metrics['perceptual']:.4f}",
+                    },
                     refresh=False,
                 )
 
@@ -905,14 +938,19 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("val/hr_masked_l1_refined", val_metrics["masked_l1_hr_refined"], step)
                 if val_metrics["hr_gain_pct"] is not None:
                     writer.add_scalar("val/hr_gain_pct", val_metrics["hr_gain_pct"], step)
+                if "retrieval_recall1_exact" in val_metrics:
+                    writer.add_scalar("val/retrieval_recall1_exact", val_metrics["retrieval_recall1_exact"], step)
                 if "retrieval_recall1" in val_metrics:
-                    writer.add_scalar("val/retrieval_recall1", val_metrics["retrieval_recall1"], step)
+                    writer.add_scalar(f"val/retrieval_recall1_{retrieval_margin_label}", val_metrics["retrieval_recall1"], step)
                 if "retrieval_recall8" in val_metrics:
-                    writer.add_scalar("val/retrieval_recall8", val_metrics["retrieval_recall8"], step)
+                    writer.add_scalar(f"val/retrieval_recall8_{retrieval_margin_label}", val_metrics["retrieval_recall8"], step)
                 if "retrieval_recall32" in val_metrics:
-                    writer.add_scalar("val/retrieval_recall32", val_metrics["retrieval_recall32"], step)
+                    writer.add_scalar(f"val/retrieval_recall32_{retrieval_margin_label}", val_metrics["retrieval_recall32"], step)
                 write_validation_history(log_cfg["log_dir"], step, val_metrics)
-                retrieval_snapshot = format_val_retrieval_snapshot(val_metrics)
+                retrieval_snapshot = format_val_retrieval_snapshot(
+                    val_metrics,
+                    retrieval_margin_label=retrieval_margin_label,
+                )
                 retrieval_suffix = f" | val {retrieval_snapshot}" if retrieval_snapshot else ""
                 progress_bar.write(
                     f"Validation step {step}: "
@@ -920,7 +958,7 @@ def train(cfg, args, dist_ctx):
                     f"(gain {val_metrics['lr_gain_pct']:.2f}%) | "
                     f"HR {val_metrics['masked_l1_hr_coarse_baseline']:.4f} -> {val_metrics['masked_l1_hr_refined']:.4f} "
                     f"(gain {val_metrics['hr_gain_pct']:.2f}%){retrieval_suffix}\n"
-                    f"  {format_train_metric_snapshot(metrics, include_retrieval=False)}"
+                    f"  {format_train_metric_snapshot(metrics, retrieval_margin_label=retrieval_margin_label)}"
                 )
                 current_best_metric = val_metrics.get(best_metric_name)
                 if save_best_checkpoint and is_better_metric(current_best_metric, best_metric_value, best_metric_mode):

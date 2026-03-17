@@ -89,6 +89,7 @@ class InpaintingLoss(nn.Module):
         retrieval_hard_ce_weight: float = 0.0,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
+        retrieval_target_margin_pct: float = 0.03,
         loss_schedule_focus_steps: int = 0,
         loss_schedule_transition_steps: int = 0,
         retrieval_loss_weight_start: float | None = None,
@@ -103,6 +104,7 @@ class InpaintingLoss(nn.Module):
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
+        self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
         self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
         self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
         self.perceptual_weight = float(perceptual_weight)
@@ -213,6 +215,7 @@ class InpaintingLoss(nn.Module):
             "retrieval_hard_ce": zero,
         }
         metrics = {
+            "retrieval_recall1_exact": 0.0,
             "retrieval_recall1": 0.0,
             "retrieval_recall8": 0.0,
             "retrieval_recall32": 0.0,
@@ -241,6 +244,7 @@ class InpaintingLoss(nn.Module):
 
         retrieval_losses = []
         retrieval_hard_ce_losses = []
+        retrieval_recall1_exact = []
         retrieval_recall1 = []
         retrieval_recall8 = []
         retrieval_recall32 = []
@@ -262,10 +266,12 @@ class InpaintingLoss(nn.Module):
                 p=1,
             ).squeeze(0)
             
-            # Find all target patches that are essentially identical to the absolute best patch
-            # We consider any patch with an L1 distance within 5% of the minimum distance to be a valid target
+            # Keep a strict best-match metric, but allow a small tolerance for near-tied targets.
             min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
-            valid_targets_mask = teacher_distances <= (min_teacher_dist * 1.05 + 1e-4)
+            exact_targets_mask = teacher_distances <= (min_teacher_dist + 1e-4)
+            valid_targets_mask = teacher_distances <= (
+                min_teacher_dist * (1.0 + self.retrieval_target_margin_pct) + 1e-4
+            )
             
             teacher_logits = -teacher_distances / max(query_teacher_tokens.shape[-1], 1)
             teacher_logits = teacher_logits / self.retrieval_teacher_temperature
@@ -282,26 +288,34 @@ class InpaintingLoss(nn.Module):
                     (-(masked_teacher_probs * masked_pred_log_probs).sum(dim=-1)).mean()
                 )
                 
-                # Multi-target Cross Entropy: maximize the sum of probabilities of all identical valid patches
+                # Multi-target cross entropy: maximize total mass over all near-equivalent targets.
                 masked_pred_probs = F.softmax(masked_raw_logits, dim=-1)
                 valid_probs_sum = (masked_pred_probs * masked_valid_targets.float()).sum(dim=-1).clamp_min(1e-8)
                 retrieval_hard_ce_losses.append(
                     -valid_probs_sum.log().mean()
                 )
-                
-                for top_k, metric_name in ((1, retrieval_recall1), (8, retrieval_recall8), (32, retrieval_recall32)):
+
+                masked_exact_targets = exact_targets_mask[batch_query_mask]
+                for top_k, tolerant_metric in (
+                    (1, retrieval_recall1),
+                    (8, retrieval_recall8),
+                    (32, retrieval_recall32),
+                ):
                     k = min(top_k, masked_raw_logits.shape[-1])
                     topk = masked_raw_logits.topk(k=k, dim=-1).indices
-                    is_correct = masked_valid_targets.gather(1, topk).any(dim=-1)
-                    metric_name.append(
-                        is_correct.float().mean()
-                    )
+                    tolerant_metric.append(masked_valid_targets.gather(1, topk).any(dim=-1).float().mean())
+                    if top_k == 1:
+                        retrieval_recall1_exact.append(
+                            masked_exact_targets.gather(1, topk).any(dim=-1).float().mean()
+                        )
 
         if retrieval_losses:
             loss_terms["retrieval"] = torch.stack(retrieval_losses).mean()
         if retrieval_hard_ce_losses:
             loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
 
+        if retrieval_recall1_exact:
+            metrics["retrieval_recall1_exact"] = torch.stack(retrieval_recall1_exact).mean().item()
         if retrieval_recall1:
             metrics["retrieval_recall1"] = torch.stack(retrieval_recall1).mean().item()
         if retrieval_recall8:
