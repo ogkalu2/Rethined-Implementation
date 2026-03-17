@@ -81,7 +81,7 @@ loss:
   perceptual_weight: 0.15
 
 logging:
-  log_dir: "logs/pilot_supercaf_1024_to_512_paper"
+  log_dir: "logs/pilot_512"
   log_interval: 25
   vis_interval: 250
   eval_interval: 250
