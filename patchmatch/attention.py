@@ -68,7 +68,11 @@ class MultiHeadAttention(nn.Module):
         top_k = min(self.attention_top_k, attn_logits.shape[-1])
         _, topk_indices = torch.topk(attn_logits, k=top_k, dim=-1)
         keep_mask = torch.zeros_like(attn_logits, dtype=torch.bool)
-        keep_mask.scatter_(-1, topk_indices, True)
+        keep_mask = keep_mask.scatter(
+            -1,
+            topk_indices,
+            torch.ones_like(topk_indices, dtype=torch.bool),
+        )
 
         masked_queries = self._build_masked_query_selector(attn_logits, query_mask_flat)
         keep_mask = torch.where(masked_queries, keep_mask, torch.ones_like(keep_mask))
@@ -77,7 +81,7 @@ class MultiHeadAttention(nn.Module):
     def _hard_attention_from_logits(self, attn_logits: torch.Tensor) -> torch.Tensor:
         attn = torch.zeros_like(attn_logits)
         top_indices = attn_logits.argmax(dim=-1, keepdim=True)
-        attn.scatter_(-1, top_indices, 1.0)
+        attn = attn.scatter(-1, top_indices, torch.ones_like(top_indices, dtype=attn.dtype))
         return attn
 
     def _normalize_attention_logits(self, attn_logits: torch.Tensor) -> torch.Tensor:
