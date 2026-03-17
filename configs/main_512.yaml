@@ -8,21 +8,20 @@ model:
   generator:
     kernel_size: 8
     value_patch_size: 8
-    attention_temperature: 0.5
+    attention_temperature: 0.1
     attention_top_k: 32
     attention_selection: "softmax"
     attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
-    matching_descriptor_dim: 256
-    matching_hidden_dim: 384
+    matching_descriptor_dim: 128
+    matching_hidden_dim: 192
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
     query_image_context_matching: false
     separate_query_key_matching: true
     shared_query_key_descriptor: false
-    query_context_channels: 48
-    query_context_residual_init: 0.0
-    key_context_channels: 48
+    query_context_channels: 32
+    key_context_channels: 32
     key_coarse_rgb_residual_init: 0.25
     key_feature_residual_init: 0.25
     nheads: 1
@@ -50,25 +49,27 @@ data:
   mask_min_coverage: 0.10
   mask_max_coverage: 0.35
   mask_generator:
-    style: "sparse_fashion"
-    min_capsule_length_ratio: 0.035
-    max_capsule_length_ratio: 0.16
-    min_capsule_width_ratio: 0.008
-    max_capsule_width_ratio: 0.035
-    min_component_count: 10
-    max_component_count: 28
-    articulated_probability: 0.25
-    connector_probability: 0.15
-    overlap_tolerance: 0.08
+    style: "freeform"
+    # min_capsule_length_ratio: 0.035
+    # max_capsule_length_ratio: 0.16
+    # min_capsule_width_ratio: 0.008
+    # max_capsule_width_ratio: 0.035
+    # min_component_count: 10
+    # max_component_count: 28
+    # articulated_probability: 0.25
+    # connector_probability: 0.15
+    # overlap_tolerance: 0.08
   force_random_masks_train: true
   force_random_masks_eval: true
 
 training:
-  total_steps: 178218
+  total_steps: 30000
   grad_accum_steps: 4
   lr: 0.001
-  warmup_steps: 3000
+  scorer_lr: 0.001
+  warmup_steps: 2000
   min_lr: 0.000001
+  scorer_min_lr: 0.000001
   grad_clip: 1.0
   mixed_precision: true
   seed: 42
@@ -81,7 +82,7 @@ loss:
   retrieval_loss_weight: 0.5
   retrieval_hard_ce_weight: 1.0
   retrieval_teacher_patch_padding: 8
-  retrieval_teacher_temperature: 0.15
+  retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
@@ -99,6 +100,6 @@ logging:
   save_best_metric: "masked_l1_hr_refined"
   save_best_mode: "min"
   save_final_checkpoint: true
-  checkpoint_steps: [50000, 100000, 178218]
+  checkpoint_steps: [10000, 20000, 30000]
   keep_last_checkpoints: 3
   print_train_metrics: false
