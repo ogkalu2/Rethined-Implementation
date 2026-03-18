@@ -23,6 +23,12 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_eval_selection: str | None = None,
         attention_gumbel_tau: float = 1.0,
         attention_gumbel_hard: bool = True,
+        use_transport: bool = False,
+        transport_epsilon: float = 0.05,
+        transport_iters: int = 12,
+        transport_capacity_scale: float = 1.25,
+        transport_train_hard: bool = False,
+        transport_eval_hard: bool = True,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
         match_coarse_rgb: bool = True,
@@ -142,9 +148,21 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             if attention_eval_selection is None
             else str(attention_eval_selection).lower()
         )
+        self.use_transport = bool(use_transport)
+        self.transport_epsilon = float(transport_epsilon)
+        self.transport_iters = int(transport_iters)
+        self.transport_capacity_scale = float(transport_capacity_scale)
+        self.transport_train_hard = bool(transport_train_hard)
+        self.transport_eval_hard = bool(transport_eval_hard)
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
         if self.attention_top_k is not None and self.attention_top_k <= 0:
             self.attention_top_k = None
+        if self.transport_epsilon <= 0:
+            raise ValueError("transport_epsilon must be positive.")
+        if self.transport_iters <= 0:
+            raise ValueError("transport_iters must be positive.")
+        if self.transport_capacity_scale <= 0:
+            raise ValueError("transport_capacity_scale must be positive.")
 
         self.encoder_decoder = model
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
@@ -380,7 +398,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         token_hw = patch_map.shape[-2:]
         attention_supervision_entries = None
-        if return_aux:
+        if return_aux and not self.use_transport:
             attention_supervision_entries = self.build_attention_supervision_entries(
                 query_tokens,
                 key_tokens,
@@ -390,7 +408,21 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             )
 
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
-        if self.attention_masking:
+        if self.use_transport:
+            transport_result = self.transport_patch_mix_masked_queries(
+                query_tokens,
+                key_tokens,
+                patch_values,
+                query_mask_flat,
+                key_valid_flat,
+                token_hw=token_hw,
+                return_aux_entries=return_aux,
+            )
+            if return_aux:
+                mixed_patches_flat, masked_attention, attention_supervision_entries = transport_result
+            else:
+                mixed_patches_flat, masked_attention = transport_result
+        elif self.attention_masking:
             mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,

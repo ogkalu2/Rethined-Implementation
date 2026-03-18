@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .transport import harden_transport_plan, solve_capacity_transport
+
 
 class LightweightContextBlock(nn.Module):
     def __init__(self, channels: int, dilation: int):
@@ -208,6 +210,98 @@ class PatchmatchHelpersMixin:
             dense_attn,
         )
         return mixed, dense_attn
+
+    def transport_patch_mix_masked_queries(
+        self,
+        query_tokens_full: torch.Tensor,
+        key_tokens_full: torch.Tensor,
+        patch_values: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        *,
+        token_hw: tuple[int, int] | None = None,
+        default_tokens: torch.Tensor | None = None,
+        return_aux_entries: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, list[dict[str, torch.Tensor | tuple[int, int]]]]:
+        batch_size, num_patches, _ = query_tokens_full.shape
+        mixed_default = patch_values if default_tokens is None else default_tokens
+        mixed_default = mixed_default.clone()
+        eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
+        dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        masked_queries = query_mask_flat > 0.5
+        valid_keys = key_valid_flat > 0.5
+        entries: list[dict[str, torch.Tensor | tuple[int, int]]] = []
+
+        for batch_idx in range(batch_size):
+            query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
+            key_indices = valid_keys[batch_idx].nonzero(as_tuple=False).flatten()
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                if return_aux_entries:
+                    entries.append(
+                        {
+                            "query_indices": query_indices,
+                            "key_indices": key_indices,
+                            "token_hw": token_hw,
+                            "raw_logits": query_tokens_full.new_empty((0, 0), dtype=torch.float32),
+                            "ranking_scores": query_tokens_full.new_empty((0, 0), dtype=torch.float32),
+                            "pred_probs": query_tokens_full.new_empty((0, 0), dtype=torch.float32),
+                            "pred_log_probs": query_tokens_full.new_empty((0, 0), dtype=torch.float32),
+                        }
+                    )
+                continue
+
+            raw_logits, masked_logits = self.multihead_attention.compute_attention_logits(
+                query_tokens_full[batch_idx : batch_idx + 1, query_indices],
+                key_tokens_full[batch_idx : batch_idx + 1, key_indices],
+                query_mask_flat=torch.ones(
+                    (1, query_indices.numel()),
+                    device=query_tokens_full.device,
+                    dtype=query_mask_flat.dtype,
+                ),
+            )
+            raw_logits = raw_logits.mean(dim=1).squeeze(0).float()
+            masked_logits = masked_logits.mean(dim=1).squeeze(0).float()
+            transport_plan = solve_capacity_transport(
+                masked_logits,
+                epsilon=self.transport_epsilon,
+                num_iters=self.transport_iters,
+                capacity_scale=self.transport_capacity_scale,
+            ).to(dtype=patch_values.dtype)
+
+            if self.training and self.transport_train_hard:
+                hard_plan = harden_transport_plan(transport_plan)
+                mix_plan = hard_plan - transport_plan.detach() + transport_plan
+                ranking_plan = hard_plan
+            elif (not self.training) and self.transport_eval_hard:
+                mix_plan = harden_transport_plan(transport_plan)
+                ranking_plan = mix_plan
+            else:
+                mix_plan = transport_plan
+                ranking_plan = transport_plan
+
+            mixed_subset = mix_plan @ patch_values[batch_idx, key_indices]
+            mixed_default[batch_idx, query_indices] = mixed_subset
+
+            dense_attn_batch = dense_attn[batch_idx, 0]
+            dense_attn_batch[query_indices] = 0
+            dense_attn_batch[query_indices.unsqueeze(1), key_indices.unsqueeze(0)] = mix_plan
+
+            if return_aux_entries:
+                entries.append(
+                    {
+                        "query_indices": query_indices,
+                        "key_indices": key_indices,
+                        "token_hw": token_hw,
+                        "raw_logits": raw_logits,
+                        "ranking_scores": ranking_plan.clamp_min(1e-8).log().float(),
+                        "pred_probs": transport_plan.float(),
+                        "pred_log_probs": transport_plan.clamp_min(1e-8).log().float(),
+                    }
+                )
+
+        if return_aux_entries:
+            return mixed_default, dense_attn, entries
+        return mixed_default, dense_attn
 
     def build_attention_mask(
         self,

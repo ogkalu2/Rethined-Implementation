@@ -91,6 +91,8 @@ class InpaintingLoss(nn.Module):
         retrieval_usage_mode: str = "teacher_kl",
         retrieval_top1_margin_weight: float = 0.0,
         retrieval_top1_margin: float = 0.0,
+        retrieval_coherence_weight: float = 0.0,
+        retrieval_coherence_sigma: float = 0.1,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
         retrieval_target_margin_pct: float = 0.03,
@@ -110,6 +112,8 @@ class InpaintingLoss(nn.Module):
         self.retrieval_usage_mode = str(retrieval_usage_mode).lower()
         self.retrieval_top1_margin_weight = float(retrieval_top1_margin_weight)
         self.retrieval_top1_margin = float(retrieval_top1_margin)
+        self.retrieval_coherence_weight = float(retrieval_coherence_weight)
+        self.retrieval_coherence_sigma = float(retrieval_coherence_sigma)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
@@ -122,6 +126,8 @@ class InpaintingLoss(nn.Module):
             raise ValueError("retrieval_teacher_temperature must be positive.")
         if self.retrieval_top1_margin < 0:
             raise ValueError("retrieval_top1_margin must be non-negative.")
+        if self.retrieval_coherence_sigma <= 0:
+            raise ValueError("retrieval_coherence_sigma must be positive.")
 
         self.perceptual_loss = PerceptualLoss()
         self.current_training_step = 0
@@ -216,6 +222,84 @@ class InpaintingLoss(nn.Module):
     def _normalize_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         return patch_tokens.float()
 
+    def _normalized_token_coords(
+        self,
+        indices: torch.Tensor,
+        token_hw: tuple[int, int],
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        height, width = token_hw
+        ys = torch.div(indices, width, rounding_mode="floor").to(dtype=dtype)
+        xs = (indices % width).to(dtype=dtype)
+        if width > 1:
+            xs = xs / float(width - 1)
+        if height > 1:
+            ys = ys / float(height - 1)
+        return torch.stack([xs, ys], dim=-1)
+
+    def _adjacent_query_pairs(
+        self,
+        query_indices: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if query_indices.numel() <= 1:
+            empty = query_indices.new_empty((0,), dtype=torch.long)
+            return empty, empty
+
+        height, width = token_hw
+        num_tokens = height * width
+        order = torch.full((num_tokens,), -1, device=query_indices.device, dtype=torch.long)
+        local_order = torch.arange(query_indices.numel(), device=query_indices.device)
+        order[query_indices] = local_order
+
+        right_mask = (query_indices % width) < (width - 1)
+        right_sources = local_order[right_mask]
+        right_targets = order[query_indices[right_mask] + 1]
+        right_valid = right_targets >= 0
+
+        down_mask = (query_indices + width) < num_tokens
+        down_sources = local_order[down_mask]
+        down_targets = order[query_indices[down_mask] + width]
+        down_valid = down_targets >= 0
+
+        src = torch.cat([right_sources[right_valid], down_sources[down_valid]], dim=0)
+        dst = torch.cat([right_targets[right_valid], down_targets[down_valid]], dim=0)
+        return src, dst
+
+    def _retrieval_coherence_loss(
+        self,
+        pred_probs: torch.Tensor,
+        query_indices: torch.Tensor,
+        key_indices: torch.Tensor,
+        query_teacher_tokens: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        if pred_probs.shape[0] <= 1 or pred_probs.shape[-1] <= 0:
+            return pred_probs.new_zeros(())
+
+        pair_src, pair_dst = self._adjacent_query_pairs(query_indices, token_hw)
+        if pair_src.numel() == 0:
+            return pred_probs.new_zeros(())
+
+        key_coords = self._normalized_token_coords(
+            key_indices,
+            token_hw,
+            dtype=pred_probs.dtype,
+        )
+        expected_source_coords = pred_probs @ key_coords
+
+        query_patch_dists = (
+            query_teacher_tokens[pair_src] - query_teacher_tokens[pair_dst]
+        ).abs().mean(dim=-1)
+        pair_weights = torch.exp(-query_patch_dists / self.retrieval_coherence_sigma)
+        coord_diffs = F.smooth_l1_loss(
+            expected_source_coords[pair_src],
+            expected_source_coords[pair_dst],
+            reduction="none",
+        ).mean(dim=-1)
+        return (coord_diffs * pair_weights).mean()
+
     def _attention_supervision_losses(
         self,
         refined_target: torch.Tensor,
@@ -227,6 +311,7 @@ class InpaintingLoss(nn.Module):
             "retrieval_hard_ce": zero,
             "retrieval_usage": zero,
             "retrieval_top1_margin": zero,
+            "retrieval_coherence": zero,
         }
         metrics = {
             "retrieval_recall1_exact": 0.0,
@@ -260,6 +345,7 @@ class InpaintingLoss(nn.Module):
         retrieval_hard_ce_losses = []
         retrieval_usage_losses = []
         retrieval_top1_margin_losses = []
+        retrieval_coherence_losses = []
         retrieval_recall1_exact = []
         retrieval_recall1 = []
         retrieval_recall8 = []
@@ -269,10 +355,14 @@ class InpaintingLoss(nn.Module):
             query_indices = entry["query_indices"]
             key_indices = entry["key_indices"]
             raw_logits = entry["raw_logits"]
+            ranking_scores = entry.get("ranking_scores")
+            pred_probs = entry.get("pred_probs")
+            pred_log_probs = entry.get("pred_log_probs")
             if raw_logits.numel() == 0 or query_indices.numel() == 0 or key_indices.numel() == 0:
                 continue
 
             raw_logits = raw_logits.float()
+            ranking_scores = raw_logits if ranking_scores is None else ranking_scores.float()
             batch_query_mask = query_mask_flat[batch_idx, query_indices] > 0.5
             query_teacher_tokens = teacher_tokens[batch_idx, query_indices]
             key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
@@ -292,21 +382,30 @@ class InpaintingLoss(nn.Module):
             teacher_logits = -teacher_distances / max(query_teacher_tokens.shape[-1], 1)
             teacher_logits = teacher_logits / self.retrieval_teacher_temperature
             teacher_probs = F.softmax(teacher_logits, dim=-1)
-            pred_log_probs = F.log_softmax(raw_logits, dim=-1)
+            if pred_probs is None:
+                pred_probs = F.softmax(raw_logits, dim=-1)
+            else:
+                pred_probs = pred_probs.float()
+            if pred_log_probs is None:
+                pred_log_probs = F.log_softmax(raw_logits, dim=-1)
+            else:
+                pred_log_probs = pred_log_probs.float()
 
             if batch_query_mask.any():
                 masked_teacher_probs = teacher_probs[batch_query_mask]
                 masked_pred_log_probs = pred_log_probs[batch_query_mask]
-                masked_raw_logits = raw_logits[batch_query_mask]
+                masked_raw_logits = ranking_scores[batch_query_mask]
                 masked_exact_targets = exact_targets_mask[batch_query_mask]
                 masked_valid_targets = valid_targets_mask[batch_query_mask]
+                masked_query_indices = query_indices[batch_query_mask]
+                masked_query_teacher_tokens = query_teacher_tokens[batch_query_mask]
 
                 retrieval_losses.append(
                     (-(masked_teacher_probs * masked_pred_log_probs).sum(dim=-1)).mean()
                 )
                 
                 # Multi-target cross entropy: maximize total mass over all near-equivalent targets.
-                masked_pred_probs = F.softmax(masked_raw_logits, dim=-1)
+                masked_pred_probs = pred_probs[batch_query_mask]
                 valid_probs_sum = (masked_pred_probs * masked_valid_targets.float()).sum(dim=-1).clamp_min(1e-8)
                 retrieval_hard_ce_losses.append(
                     -valid_probs_sum.log().mean()
@@ -339,6 +438,19 @@ class InpaintingLoss(nn.Module):
                                     )
                                 ).sum()
                             )
+
+                if self.retrieval_coherence_weight > 0.0:
+                    token_hw = entry.get("token_hw") or attention_aux.get("token_hw")
+                    if token_hw is not None:
+                        retrieval_coherence_losses.append(
+                            self._retrieval_coherence_loss(
+                                masked_pred_probs,
+                                masked_query_indices,
+                                key_indices,
+                                masked_query_teacher_tokens,
+                                tuple(token_hw),
+                            )
+                        )
 
                 if self.retrieval_top1_margin_weight > 0.0 and masked_raw_logits.shape[-1] > 1:
                     # Align the margin with the tolerant valid-target set so near-equivalent
@@ -377,6 +489,8 @@ class InpaintingLoss(nn.Module):
             loss_terms["retrieval_usage"] = torch.stack(retrieval_usage_losses).mean()
         if retrieval_top1_margin_losses:
             loss_terms["retrieval_top1_margin"] = torch.stack(retrieval_top1_margin_losses).mean()
+        if retrieval_coherence_losses:
+            loss_terms["retrieval_coherence"] = torch.stack(retrieval_coherence_losses).mean()
 
         if retrieval_recall1_exact:
             metrics["retrieval_recall1_exact"] = torch.stack(retrieval_recall1_exact).mean().item()
@@ -423,6 +537,7 @@ class InpaintingLoss(nn.Module):
             + self.retrieval_hard_ce_weight * attention_loss_terms["retrieval_hard_ce"]
             + self.retrieval_usage_weight * attention_loss_terms["retrieval_usage"]
             + self.retrieval_top1_margin_weight * attention_loss_terms["retrieval_top1_margin"]
+            + self.retrieval_coherence_weight * attention_loss_terms["retrieval_coherence"]
             + scheduled_weights["perceptual_weight"] * perceptual
         )
         loss_dict = {
@@ -433,6 +548,7 @@ class InpaintingLoss(nn.Module):
             "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
             "retrieval_usage_loss": attention_loss_terms["retrieval_usage"].item(),
             "retrieval_top1_margin_loss": attention_loss_terms["retrieval_top1_margin"].item(),
+            "retrieval_coherence_loss": attention_loss_terms["retrieval_coherence"].item(),
             "perceptual": perceptual.item(),
             "inpainter_total": total.item(),
         }

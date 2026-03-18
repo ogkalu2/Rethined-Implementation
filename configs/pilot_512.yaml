@@ -14,6 +14,12 @@ model:
     attention_selection: "softmax"
     attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
+    use_transport: true
+    transport_epsilon: 0.05
+    transport_iters: 12
+    transport_capacity_scale: 1.25
+    transport_train_hard: false
+    transport_eval_hard: true
     matching_descriptor_dim: 128
     matching_hidden_dim: 192
     match_coarse_rgb: true
@@ -72,11 +78,13 @@ loss:
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 0.5
-  retrieval_hard_ce_weight: 1.0
-  retrieval_usage_weight: 0.5
+  retrieval_hard_ce_weight: 0.5
+  retrieval_usage_weight: 0.0
   retrieval_usage_mode: "teacher_kl"
-  retrieval_top1_margin_weight: 1.0
+  retrieval_top1_margin_weight: 0.0
   retrieval_top1_margin: 0.5
+  retrieval_coherence_weight: 0.0
+  retrieval_coherence_sigma: 0.10
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
