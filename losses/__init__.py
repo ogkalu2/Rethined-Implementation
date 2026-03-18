@@ -341,14 +341,16 @@ class InpaintingLoss(nn.Module):
                             )
 
                 if self.retrieval_top1_margin_weight > 0.0 and masked_raw_logits.shape[-1] > 1:
-                    has_negative = (~masked_exact_targets).any(dim=-1)
+                    # Align the margin with the tolerant valid-target set so near-equivalent
+                    # teacher matches do not keep the top-1 objective artificially active.
+                    has_negative = (~masked_valid_targets).any(dim=-1)
                     if has_negative.any():
                         pos_logits = masked_raw_logits.masked_fill(
-                            ~masked_exact_targets,
+                            ~masked_valid_targets,
                             torch.finfo(masked_raw_logits.dtype).min,
                         ).max(dim=-1).values
                         neg_logits = masked_raw_logits.masked_fill(
-                            masked_exact_targets,
+                            masked_valid_targets,
                             torch.finfo(masked_raw_logits.dtype).min,
                         ).max(dim=-1).values
                         per_query_margin = F.relu(neg_logits - pos_logits + self.retrieval_top1_margin)
