@@ -88,6 +88,9 @@ class InpaintingLoss(nn.Module):
         retrieval_loss_weight: float = 0.0,
         retrieval_hard_ce_weight: float = 0.0,
         retrieval_usage_weight: float = 0.0,
+        retrieval_usage_mode: str = "teacher_kl",
+        retrieval_top1_margin_weight: float = 0.0,
+        retrieval_top1_margin: float = 0.0,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
         retrieval_target_margin_pct: float = 0.03,
@@ -104,14 +107,21 @@ class InpaintingLoss(nn.Module):
         self.retrieval_loss_weight = float(retrieval_loss_weight)
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
         self.retrieval_usage_weight = float(retrieval_usage_weight)
+        self.retrieval_usage_mode = str(retrieval_usage_mode).lower()
+        self.retrieval_top1_margin_weight = float(retrieval_top1_margin_weight)
+        self.retrieval_top1_margin = float(retrieval_top1_margin)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
         self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
         self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
         self.perceptual_weight = float(perceptual_weight)
+        if self.retrieval_usage_mode not in {"teacher_kl", "entropy"}:
+            raise ValueError("retrieval_usage_mode must be one of {'teacher_kl', 'entropy'}.")
         if self.retrieval_teacher_temperature <= 0:
             raise ValueError("retrieval_teacher_temperature must be positive.")
+        if self.retrieval_top1_margin < 0:
+            raise ValueError("retrieval_top1_margin must be non-negative.")
 
         self.perceptual_loss = PerceptualLoss()
         self.current_training_step = 0
@@ -216,6 +226,7 @@ class InpaintingLoss(nn.Module):
             "retrieval": zero,
             "retrieval_hard_ce": zero,
             "retrieval_usage": zero,
+            "retrieval_top1_margin": zero,
         }
         metrics = {
             "retrieval_recall1_exact": 0.0,
@@ -248,6 +259,7 @@ class InpaintingLoss(nn.Module):
         retrieval_losses = []
         retrieval_hard_ce_losses = []
         retrieval_usage_losses = []
+        retrieval_top1_margin_losses = []
         retrieval_recall1_exact = []
         retrieval_recall1 = []
         retrieval_recall8 = []
@@ -286,6 +298,7 @@ class InpaintingLoss(nn.Module):
                 masked_teacher_probs = teacher_probs[batch_query_mask]
                 masked_pred_log_probs = pred_log_probs[batch_query_mask]
                 masked_raw_logits = raw_logits[batch_query_mask]
+                masked_exact_targets = exact_targets_mask[batch_query_mask]
                 masked_valid_targets = valid_targets_mask[batch_query_mask]
 
                 retrieval_losses.append(
@@ -300,14 +313,47 @@ class InpaintingLoss(nn.Module):
                 )
 
                 if self.retrieval_usage_weight > 0.0:
-                    # Penalize uneven usage of valid keys by minimizing negative entropy of key usage distribution.
                     if masked_pred_probs.shape[-1] > 1:
-                        key_usage = masked_pred_probs.mean(dim=0)
-                        usage_entropy = -(key_usage * key_usage.clamp_min(1e-8).log()).sum()
-                        max_entropy = torch.log(torch.tensor(key_usage.shape[-1], dtype=key_usage.dtype, device=key_usage.device))
-                        retrieval_usage_losses.append(max_entropy - usage_entropy)
+                        if self.retrieval_usage_mode == "entropy":
+                            key_usage = masked_pred_probs.mean(dim=0)
+                            usage_entropy = -(key_usage * key_usage.clamp_min(1e-8).log()).sum()
+                            max_entropy = torch.log(
+                                torch.tensor(
+                                    key_usage.shape[-1],
+                                    dtype=key_usage.dtype,
+                                    device=key_usage.device,
+                                )
+                            )
+                            retrieval_usage_losses.append(max_entropy - usage_entropy)
+                        else:
+                            teacher_key_usage = masked_teacher_probs.mean(dim=0)
+                            pred_key_usage = masked_pred_probs.mean(dim=0)
+                            teacher_key_usage = teacher_key_usage / teacher_key_usage.sum().clamp_min(1e-8)
+                            pred_key_usage = pred_key_usage / pred_key_usage.sum().clamp_min(1e-8)
+                            retrieval_usage_losses.append(
+                                (
+                                    teacher_key_usage
+                                    * (
+                                        teacher_key_usage.clamp_min(1e-8).log()
+                                        - pred_key_usage.clamp_min(1e-8).log()
+                                    )
+                                ).sum()
+                            )
 
-                masked_exact_targets = exact_targets_mask[batch_query_mask]
+                if self.retrieval_top1_margin_weight > 0.0 and masked_raw_logits.shape[-1] > 1:
+                    has_negative = (~masked_exact_targets).any(dim=-1)
+                    if has_negative.any():
+                        pos_logits = masked_raw_logits.masked_fill(
+                            ~masked_exact_targets,
+                            torch.finfo(masked_raw_logits.dtype).min,
+                        ).max(dim=-1).values
+                        neg_logits = masked_raw_logits.masked_fill(
+                            masked_exact_targets,
+                            torch.finfo(masked_raw_logits.dtype).min,
+                        ).max(dim=-1).values
+                        per_query_margin = F.relu(neg_logits - pos_logits + self.retrieval_top1_margin)
+                        retrieval_top1_margin_losses.append(per_query_margin[has_negative].mean())
+
                 for top_k, tolerant_metric in (
                     (1, retrieval_recall1),
                     (8, retrieval_recall8),
@@ -327,6 +373,8 @@ class InpaintingLoss(nn.Module):
             loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
         if retrieval_usage_losses:
             loss_terms["retrieval_usage"] = torch.stack(retrieval_usage_losses).mean()
+        if retrieval_top1_margin_losses:
+            loss_terms["retrieval_top1_margin"] = torch.stack(retrieval_top1_margin_losses).mean()
 
         if retrieval_recall1_exact:
             metrics["retrieval_recall1_exact"] = torch.stack(retrieval_recall1_exact).mean().item()
@@ -372,6 +420,7 @@ class InpaintingLoss(nn.Module):
             + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
             + self.retrieval_hard_ce_weight * attention_loss_terms["retrieval_hard_ce"]
             + self.retrieval_usage_weight * attention_loss_terms["retrieval_usage"]
+            + self.retrieval_top1_margin_weight * attention_loss_terms["retrieval_top1_margin"]
             + scheduled_weights["perceptual_weight"] * perceptual
         )
         loss_dict = {
@@ -381,6 +430,7 @@ class InpaintingLoss(nn.Module):
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
             "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
             "retrieval_usage_loss": attention_loss_terms["retrieval_usage"].item(),
+            "retrieval_top1_margin_loss": attention_loss_terms["retrieval_top1_margin"].item(),
             "perceptual": perceptual.item(),
             "inpainter_total": total.item(),
         }

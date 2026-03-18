@@ -74,6 +74,9 @@ loss:
   retrieval_loss_weight: 0.5
   retrieval_hard_ce_weight: 1.0
   retrieval_usage_weight: 0.5
+  retrieval_usage_mode: "teacher_kl"
+  retrieval_top1_margin_weight: 0.25
+  retrieval_top1_margin: 0.5
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
