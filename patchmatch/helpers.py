@@ -280,11 +280,14 @@ class PatchmatchHelpersMixin:
                 ranking_plan = transport_plan
 
             mixed_subset = mix_plan @ patch_values[batch_idx, key_indices]
+            mixed_subset = mixed_subset.to(dtype=mixed_default.dtype)
             mixed_default[batch_idx, query_indices] = mixed_subset
 
             dense_attn_batch = dense_attn[batch_idx, 0]
             dense_attn_batch[query_indices] = 0
-            dense_attn_batch[query_indices.unsqueeze(1), key_indices.unsqueeze(0)] = mix_plan
+            dense_attn_batch[query_indices.unsqueeze(1), key_indices.unsqueeze(0)] = mix_plan.to(
+                dtype=dense_attn_batch.dtype
+            )
 
             if return_aux_entries:
                 entries.append(
