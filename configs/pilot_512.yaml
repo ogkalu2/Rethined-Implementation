@@ -15,12 +15,13 @@ model:
     attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
     use_transport: true
-    transport_epsilon: 1.0
-    transport_iters: 24
-    transport_capacity_scale: 1.25
-    transport_mass_penalty: 1.0
-    transport_train_hard: true
-    transport_eval_hard: true
+    transport_hidden_channels: 64
+    transport_refine_steps: 2
+    transport_offset_scale: 1.0
+    transport_refine_scale: 0.25
+    transport_self_supervision_ratio: 0.125
+    transport_fallback_validity_threshold: 0.1
+    transport_snap_to_valid_eval: true
     matching_descriptor_dim: 128
     matching_hidden_dim: 192
     match_coarse_rgb: true
@@ -78,10 +79,8 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
-  retrieval_loss_weight: 0.5
-  retrieval_hard_ce_weight: 0.5
-  retrieval_usage_weight: 0.0
-  retrieval_usage_mode: "teacher_kl"
+  retrieval_loss_weight: 0.0
+  retrieval_hard_ce_weight: 0.0
   retrieval_top1_margin_weight: 0.0
   retrieval_top1_margin: 0.5
   retrieval_coherence_weight: 0.0
@@ -89,6 +88,14 @@ loss:
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
+  transport_patch_weight: 1.0
+  transport_validity_weight: 0.1
+  transport_self_patch_weight: 0.5
+  transport_self_validity_weight: 0.05
+  transport_offset_smoothness_weight: 0.02
+  transport_cycle_consistency_weight: 0.1
+  transport_confidence_weight: 0.05
+  transport_offset_edge_scale: 5.0
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
   perceptual_weight: 0.15

@@ -287,8 +287,6 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
         summary += f", qp={metrics['refined_query_patch_l1']:.4f}"
     if include_retrieval and "retrieval_recall1_exact" in metrics:
         summary += f", r1_exact={metrics['retrieval_recall1_exact']:.3f}"
-    if include_retrieval and "retrieval_usage_loss" in metrics:
-        summary += f", usg={metrics['retrieval_usage_loss']:.3f}"
     if include_retrieval and "retrieval_coherence_loss" in metrics:
         summary += f", coh={metrics['retrieval_coherence_loss']:.3f}"
     if include_retrieval and "retrieval_top1_margin_loss" in metrics:
@@ -299,6 +297,17 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
         summary += f", r8_{retrieval_margin_label}={metrics['retrieval_recall8']:.3f}"
     if include_retrieval and "retrieval_recall32" in metrics:
         summary += f", r32_{retrieval_margin_label}={metrics['retrieval_recall32']:.3f}"
+    if "transport_patch" in metrics:
+        summary += (
+            f", tp={metrics['transport_patch']:.4f}"
+            f", tvr={metrics['transport_valid_ratio']:.3f}"
+            f", tfr={metrics['transport_fallback_ratio']:.3f}"
+            f", tsp={metrics['transport_self_patch']:.4f}"
+            f", tsvr={metrics['transport_self_valid_ratio']:.3f}"
+            f", tsm={metrics['transport_offset_smoothness']:.4f}"
+            f", tcy={metrics['transport_cycle_consistency']:.4f}"
+            f", tcm={metrics['transport_confidence_mean']:.3f}"
+        )
     return summary
 
 
@@ -855,12 +864,24 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
             if "retrieval_loss" in metrics:
                 writer.add_scalar("loss/retrieval", metrics["retrieval_loss"], step)
-            if "retrieval_usage_loss" in metrics:
-                writer.add_scalar("loss/retrieval_usage", metrics["retrieval_usage_loss"], step)
             if "retrieval_coherence_loss" in metrics:
                 writer.add_scalar("loss/retrieval_coherence", metrics["retrieval_coherence_loss"], step)
             if "retrieval_top1_margin_loss" in metrics:
                 writer.add_scalar("loss/retrieval_top1_margin", metrics["retrieval_top1_margin_loss"], step)
+            if "transport_patch" in metrics:
+                writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
+                writer.add_scalar("loss/transport_validity", metrics["transport_validity"], step)
+                writer.add_scalar("transport/valid_ratio", metrics["transport_valid_ratio"], step)
+                writer.add_scalar("transport/fallback_ratio", metrics["transport_fallback_ratio"], step)
+                writer.add_scalar("loss/transport_self_patch", metrics["transport_self_patch"], step)
+                writer.add_scalar("loss/transport_self_validity", metrics["transport_self_validity"], step)
+                writer.add_scalar("transport/self_valid_ratio", metrics["transport_self_valid_ratio"], step)
+                writer.add_scalar("loss/transport_offset_smoothness", metrics["transport_offset_smoothness"], step)
+                writer.add_scalar("transport/offset_curvature", metrics["transport_offset_curvature"], step)
+                writer.add_scalar("loss/transport_cycle_consistency", metrics["transport_cycle_consistency"], step)
+                writer.add_scalar("transport/cycle_error", metrics["transport_cycle_error"], step)
+                writer.add_scalar("loss/transport_confidence", metrics["transport_confidence"], step)
+                writer.add_scalar("transport/confidence_mean", metrics["transport_confidence_mean"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/inpainter_total", metrics["inpainter_total"], step)
             writer.add_scalar("loss/running_inpainter", running_g, step)

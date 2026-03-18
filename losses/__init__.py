@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from losses.perceptual import PerceptualLoss
+from losses.transport import TransportLossMixin
 
 
 def composite_with_known(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -72,8 +73,8 @@ def masked_gradient_l1_loss(
     return 0.5 * (dx_mean.mean() + dy_mean.mean())
 
 
-class InpaintingLoss(nn.Module):
-    """Training losses for refinement and retrieval supervision."""
+class InpaintingLoss(TransportLossMixin, nn.Module):
+    """Training losses for refinement, retrieval, and transport supervision."""
 
     SCHEDULED_WEIGHT_NAMES = (
         "retrieval_loss_weight",
@@ -87,8 +88,6 @@ class InpaintingLoss(nn.Module):
         refined_query_patch_l1_weight: float = 0.0,
         retrieval_loss_weight: float = 0.0,
         retrieval_hard_ce_weight: float = 0.0,
-        retrieval_usage_weight: float = 0.0,
-        retrieval_usage_mode: str = "teacher_kl",
         retrieval_top1_margin_weight: float = 0.0,
         retrieval_top1_margin: float = 0.0,
         retrieval_coherence_weight: float = 0.0,
@@ -96,6 +95,14 @@ class InpaintingLoss(nn.Module):
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
         retrieval_target_margin_pct: float = 0.03,
+        transport_patch_weight: float = 0.0,
+        transport_validity_weight: float = 0.0,
+        transport_self_patch_weight: float = 0.0,
+        transport_self_validity_weight: float = 0.0,
+        transport_offset_smoothness_weight: float = 0.0,
+        transport_cycle_consistency_weight: float = 0.0,
+        transport_confidence_weight: float = 0.0,
+        transport_offset_edge_scale: float = 5.0,
         loss_schedule_focus_steps: int = 0,
         loss_schedule_transition_steps: int = 0,
         retrieval_loss_weight_start: float | None = None,
@@ -108,8 +115,6 @@ class InpaintingLoss(nn.Module):
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
-        self.retrieval_usage_weight = float(retrieval_usage_weight)
-        self.retrieval_usage_mode = str(retrieval_usage_mode).lower()
         self.retrieval_top1_margin_weight = float(retrieval_top1_margin_weight)
         self.retrieval_top1_margin = float(retrieval_top1_margin)
         self.retrieval_coherence_weight = float(retrieval_coherence_weight)
@@ -117,17 +122,39 @@ class InpaintingLoss(nn.Module):
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
+        self.transport_patch_weight = float(transport_patch_weight)
+        self.transport_validity_weight = float(transport_validity_weight)
+        self.transport_self_patch_weight = float(transport_self_patch_weight)
+        self.transport_self_validity_weight = float(transport_self_validity_weight)
+        self.transport_offset_smoothness_weight = float(transport_offset_smoothness_weight)
+        self.transport_cycle_consistency_weight = float(transport_cycle_consistency_weight)
+        self.transport_confidence_weight = float(transport_confidence_weight)
+        self.transport_offset_edge_scale = float(transport_offset_edge_scale)
         self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
         self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
         self.perceptual_weight = float(perceptual_weight)
-        if self.retrieval_usage_mode not in {"teacher_kl", "entropy"}:
-            raise ValueError("retrieval_usage_mode must be one of {'teacher_kl', 'entropy'}.")
         if self.retrieval_teacher_temperature <= 0:
             raise ValueError("retrieval_teacher_temperature must be positive.")
         if self.retrieval_top1_margin < 0:
             raise ValueError("retrieval_top1_margin must be non-negative.")
         if self.retrieval_coherence_sigma <= 0:
             raise ValueError("retrieval_coherence_sigma must be positive.")
+        if self.transport_patch_weight < 0:
+            raise ValueError("transport_patch_weight must be non-negative.")
+        if self.transport_validity_weight < 0:
+            raise ValueError("transport_validity_weight must be non-negative.")
+        if self.transport_self_patch_weight < 0:
+            raise ValueError("transport_self_patch_weight must be non-negative.")
+        if self.transport_self_validity_weight < 0:
+            raise ValueError("transport_self_validity_weight must be non-negative.")
+        if self.transport_offset_smoothness_weight < 0:
+            raise ValueError("transport_offset_smoothness_weight must be non-negative.")
+        if self.transport_cycle_consistency_weight < 0:
+            raise ValueError("transport_cycle_consistency_weight must be non-negative.")
+        if self.transport_confidence_weight < 0:
+            raise ValueError("transport_confidence_weight must be non-negative.")
+        if self.transport_offset_edge_scale < 0:
+            raise ValueError("transport_offset_edge_scale must be non-negative.")
 
         self.perceptual_loss = PerceptualLoss()
         self.current_training_step = 0
@@ -309,7 +336,6 @@ class InpaintingLoss(nn.Module):
         loss_terms = {
             "retrieval": zero,
             "retrieval_hard_ce": zero,
-            "retrieval_usage": zero,
             "retrieval_top1_margin": zero,
             "retrieval_coherence": zero,
         }
@@ -343,7 +369,6 @@ class InpaintingLoss(nn.Module):
 
         retrieval_losses = []
         retrieval_hard_ce_losses = []
-        retrieval_usage_losses = []
         retrieval_top1_margin_losses = []
         retrieval_coherence_losses = []
         retrieval_recall1_exact = []
@@ -411,34 +436,6 @@ class InpaintingLoss(nn.Module):
                     -valid_probs_sum.log().mean()
                 )
 
-                if self.retrieval_usage_weight > 0.0:
-                    if masked_pred_probs.shape[-1] > 1:
-                        if self.retrieval_usage_mode == "entropy":
-                            key_usage = masked_pred_probs.mean(dim=0)
-                            usage_entropy = -(key_usage * key_usage.clamp_min(1e-8).log()).sum()
-                            max_entropy = torch.log(
-                                torch.tensor(
-                                    key_usage.shape[-1],
-                                    dtype=key_usage.dtype,
-                                    device=key_usage.device,
-                                )
-                            )
-                            retrieval_usage_losses.append(max_entropy - usage_entropy)
-                        else:
-                            teacher_key_usage = masked_teacher_probs.mean(dim=0)
-                            pred_key_usage = masked_pred_probs.mean(dim=0)
-                            teacher_key_usage = teacher_key_usage / teacher_key_usage.sum().clamp_min(1e-8)
-                            pred_key_usage = pred_key_usage / pred_key_usage.sum().clamp_min(1e-8)
-                            retrieval_usage_losses.append(
-                                (
-                                    teacher_key_usage
-                                    * (
-                                        teacher_key_usage.clamp_min(1e-8).log()
-                                        - pred_key_usage.clamp_min(1e-8).log()
-                                    )
-                                ).sum()
-                            )
-
                 if self.retrieval_coherence_weight > 0.0:
                     token_hw = entry.get("token_hw") or attention_aux.get("token_hw")
                     if token_hw is not None:
@@ -485,8 +482,6 @@ class InpaintingLoss(nn.Module):
             loss_terms["retrieval"] = torch.stack(retrieval_losses).mean()
         if retrieval_hard_ce_losses:
             loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
-        if retrieval_usage_losses:
-            loss_terms["retrieval_usage"] = torch.stack(retrieval_usage_losses).mean()
         if retrieval_top1_margin_losses:
             loss_terms["retrieval_top1_margin"] = torch.stack(retrieval_top1_margin_losses).mean()
         if retrieval_coherence_losses:
@@ -523,6 +518,27 @@ class InpaintingLoss(nn.Module):
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         attention_loss_terms, attention_metrics = self._attention_supervision_losses(refined_target, attention_aux)
+        transport_patch_loss, transport_patch_metrics = self._transport_patch_loss(refined_target, attention_aux)
+        transport_validity_loss, transport_validity_metrics = self._transport_validity_loss(refined_target, attention_aux)
+        transport_self_patch_loss, transport_self_patch_metrics = self._transport_self_patch_loss(
+            refined_target,
+            attention_aux,
+        )
+        transport_self_validity_loss, transport_self_validity_metrics = self._transport_self_validity_loss(
+            refined_target,
+            attention_aux,
+        )
+        transport_offset_smoothness_loss, transport_offset_smoothness_metrics = self._transport_offset_smoothness_loss(
+            refined_target,
+            attention_aux,
+        )
+        transport_cycle_consistency_loss, transport_cycle_consistency_metrics = (
+            self._transport_cycle_consistency_loss(refined_target, attention_aux)
+        )
+        transport_confidence_loss, transport_confidence_metrics = self._transport_confidence_loss(
+            refined_target,
+            attention_aux,
+        )
         perceptual = self.perceptual_loss(refined, refined_target)
 
         scheduled_weights = {
@@ -535,9 +551,15 @@ class InpaintingLoss(nn.Module):
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
             + self.retrieval_hard_ce_weight * attention_loss_terms["retrieval_hard_ce"]
-            + self.retrieval_usage_weight * attention_loss_terms["retrieval_usage"]
             + self.retrieval_top1_margin_weight * attention_loss_terms["retrieval_top1_margin"]
             + self.retrieval_coherence_weight * attention_loss_terms["retrieval_coherence"]
+            + self.transport_patch_weight * transport_patch_loss
+            + self.transport_validity_weight * transport_validity_loss
+            + self.transport_self_patch_weight * transport_self_patch_loss
+            + self.transport_self_validity_weight * transport_self_validity_loss
+            + self.transport_offset_smoothness_weight * transport_offset_smoothness_loss
+            + self.transport_cycle_consistency_weight * transport_cycle_consistency_loss
+            + self.transport_confidence_weight * transport_confidence_loss
             + scheduled_weights["perceptual_weight"] * perceptual
         )
         loss_dict = {
@@ -546,9 +568,21 @@ class InpaintingLoss(nn.Module):
             "refined_query_patch_l1": refined_query_patch_l1.item(),
             "retrieval_loss": attention_loss_terms["retrieval"].item(),
             "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
-            "retrieval_usage_loss": attention_loss_terms["retrieval_usage"].item(),
             "retrieval_top1_margin_loss": attention_loss_terms["retrieval_top1_margin"].item(),
             "retrieval_coherence_loss": attention_loss_terms["retrieval_coherence"].item(),
+            "transport_patch": transport_patch_metrics["transport_patch"],
+            "transport_validity": transport_validity_metrics["transport_validity"],
+            "transport_valid_ratio": transport_validity_metrics["transport_valid_ratio"],
+            "transport_fallback_ratio": transport_validity_metrics["transport_fallback_ratio"],
+            "transport_self_patch": transport_self_patch_metrics["transport_self_patch"],
+            "transport_self_validity": transport_self_validity_metrics["transport_self_validity"],
+            "transport_self_valid_ratio": transport_self_validity_metrics["transport_self_valid_ratio"],
+            "transport_offset_smoothness": transport_offset_smoothness_metrics["transport_offset_smoothness"],
+            "transport_offset_curvature": transport_offset_smoothness_metrics["transport_offset_curvature"],
+            "transport_cycle_consistency": transport_cycle_consistency_metrics["transport_cycle_consistency"],
+            "transport_cycle_error": transport_cycle_consistency_metrics["transport_cycle_error"],
+            "transport_confidence": transport_confidence_metrics["transport_confidence"],
+            "transport_confidence_mean": transport_confidence_metrics["transport_confidence_mean"],
             "perceptual": perceptual.item(),
             "inpainter_total": total.item(),
         }
