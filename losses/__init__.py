@@ -327,6 +327,59 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         ).mean(dim=-1)
         return (coord_diffs * pair_weights).mean()
 
+    def _build_transport_supervision_entries(
+        self,
+        attention_aux: dict[str, object],
+    ) -> list[dict[str, torch.Tensor | tuple[int, int]]] | None:
+        if attention_aux.get("copy_mode") != "transport":
+            return None
+
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        key_valid_flat = attention_aux.get("key_valid_flat")
+        transport_coords = attention_aux.get("transport_coords")
+        token_hw = attention_aux.get("token_hw")
+        if (
+            query_mask_flat is None
+            or key_valid_flat is None
+            or transport_coords is None
+            or token_hw is None
+        ):
+            return None
+
+        token_hw = tuple(token_hw)
+        masked_query_mask = query_mask_flat > 0.5
+        valid_key_mask = key_valid_flat > 0.5
+        supervision_entries: list[dict[str, torch.Tensor | tuple[int, int]]] = []
+
+        for batch_idx in range(transport_coords.shape[0]):
+            query_indices = masked_query_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            key_indices = valid_key_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            entry: dict[str, torch.Tensor | tuple[int, int]] = {
+                "query_indices": query_indices,
+                "key_indices": key_indices,
+                "token_hw": token_hw,
+            }
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                entry["raw_logits"] = transport_coords.new_empty((0, 0), dtype=torch.float32)
+                supervision_entries.append(entry)
+                continue
+
+            query_coords = transport_coords[batch_idx, query_indices].float()
+            key_coords = self._normalized_token_coords(
+                key_indices,
+                token_hw,
+                dtype=query_coords.dtype,
+            )
+            coord_distances = torch.cdist(
+                query_coords.unsqueeze(0),
+                key_coords.unsqueeze(0),
+                p=2,
+            ).squeeze(0)
+            entry["raw_logits"] = (-coord_distances).to(dtype=torch.float32)
+            supervision_entries.append(entry)
+
+        return supervision_entries
+
     def _attention_supervision_losses(
         self,
         refined_target: torch.Tensor,
@@ -351,6 +404,10 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         kernel_size = int(attention_aux.get("kernel_size", 0))
         query_mask_flat = attention_aux.get("query_mask_flat")
         supervision_entries = attention_aux.get("attention_supervision_entries")
+        compute_retrieval_losses = True
+        if supervision_entries is None and attention_aux.get("copy_mode") == "transport":
+            supervision_entries = self._build_transport_supervision_entries(attention_aux)
+            compute_retrieval_losses = False
         if (
             kernel_size <= 0
             or query_mask_flat is None
@@ -425,45 +482,46 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 masked_query_indices = query_indices[batch_query_mask]
                 masked_query_teacher_tokens = query_teacher_tokens[batch_query_mask]
 
-                retrieval_losses.append(
-                    (-(masked_teacher_probs * masked_pred_log_probs).sum(dim=-1)).mean()
-                )
-                
-                # Multi-target cross entropy: maximize total mass over all near-equivalent targets.
                 masked_pred_probs = pred_probs[batch_query_mask]
-                valid_probs_sum = (masked_pred_probs * masked_valid_targets.float()).sum(dim=-1).clamp_min(1e-8)
-                retrieval_hard_ce_losses.append(
-                    -valid_probs_sum.log().mean()
-                )
+                if compute_retrieval_losses:
+                    retrieval_losses.append(
+                        (-(masked_teacher_probs * masked_pred_log_probs).sum(dim=-1)).mean()
+                    )
 
-                if self.retrieval_coherence_weight > 0.0:
-                    token_hw = entry.get("token_hw") or attention_aux.get("token_hw")
-                    if token_hw is not None:
-                        retrieval_coherence_losses.append(
-                            self._retrieval_coherence_loss(
-                                masked_pred_probs,
-                                masked_query_indices,
-                                key_indices,
-                                masked_query_teacher_tokens,
-                                tuple(token_hw),
+                    # Multi-target cross entropy: maximize total mass over all near-equivalent targets.
+                    valid_probs_sum = (masked_pred_probs * masked_valid_targets.float()).sum(dim=-1).clamp_min(1e-8)
+                    retrieval_hard_ce_losses.append(
+                        -valid_probs_sum.log().mean()
+                    )
+
+                    if self.retrieval_coherence_weight > 0.0:
+                        token_hw = entry.get("token_hw") or attention_aux.get("token_hw")
+                        if token_hw is not None:
+                            retrieval_coherence_losses.append(
+                                self._retrieval_coherence_loss(
+                                    masked_pred_probs,
+                                    masked_query_indices,
+                                    key_indices,
+                                    masked_query_teacher_tokens,
+                                    tuple(token_hw),
+                                )
                             )
-                        )
 
-                if self.retrieval_top1_margin_weight > 0.0 and masked_raw_logits.shape[-1] > 1:
-                    # Align the margin with the tolerant valid-target set so near-equivalent
-                    # teacher matches do not keep the top-1 objective artificially active.
-                    has_negative = (~masked_valid_targets).any(dim=-1)
-                    if has_negative.any():
-                        pos_logits = masked_raw_logits.masked_fill(
-                            ~masked_valid_targets,
-                            torch.finfo(masked_raw_logits.dtype).min,
-                        ).max(dim=-1).values
-                        neg_logits = masked_raw_logits.masked_fill(
-                            masked_valid_targets,
-                            torch.finfo(masked_raw_logits.dtype).min,
-                        ).max(dim=-1).values
-                        per_query_margin = F.relu(neg_logits - pos_logits + self.retrieval_top1_margin)
-                        retrieval_top1_margin_losses.append(per_query_margin[has_negative].mean())
+                    if self.retrieval_top1_margin_weight > 0.0 and masked_raw_logits.shape[-1] > 1:
+                        # Align the margin with the tolerant valid-target set so near-equivalent
+                        # teacher matches do not keep the top-1 objective artificially active.
+                        has_negative = (~masked_valid_targets).any(dim=-1)
+                        if has_negative.any():
+                            pos_logits = masked_raw_logits.masked_fill(
+                                ~masked_valid_targets,
+                                torch.finfo(masked_raw_logits.dtype).min,
+                            ).max(dim=-1).values
+                            neg_logits = masked_raw_logits.masked_fill(
+                                masked_valid_targets,
+                                torch.finfo(masked_raw_logits.dtype).min,
+                            ).max(dim=-1).values
+                            per_query_margin = F.relu(neg_logits - pos_logits + self.retrieval_top1_margin)
+                            retrieval_top1_margin_losses.append(per_query_margin[has_negative].mean())
 
                 for top_k, tolerant_metric in (
                     (1, retrieval_recall1),

@@ -323,8 +323,11 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             padding=self.value_patch_padding,
         )
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
+        # The transport field should match against stable context signals, not coarse RGB
+        # hallucinations inside the hole.
+        use_coarse_rgb_matching = self.match_coarse_rgb and (not self.use_transport)
         coarse_match_map = None
-        if self.match_coarse_rgb:
+        if use_coarse_rgb_matching:
             coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
             coarse_match_map = self._prepare_matching_branch(
                 coarse_match_map,
@@ -357,13 +360,13 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             )
 
             query_token_inputs = [query_context_map, visible_patch_map]
-            if self.match_coarse_rgb:
+            if use_coarse_rgb_matching:
                 query_token_inputs.append(coarse_match_map)
             if self.concat_features:
                 query_token_inputs.append(coarse_features)
 
             key_token_inputs = [key_context_map, visible_patch_map]
-            if self.match_coarse_rgb:
+            if use_coarse_rgb_matching:
                 key_token_inputs.append(self.key_coarse_rgb_scale * coarse_match_map)
             if self.concat_features:
                 key_token_inputs.append(self.key_feature_scale * coarse_features)
@@ -381,7 +384,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             key_tokens = key_matching_tokens
         else:
             token_inputs = []
-            if self.match_coarse_rgb:
+            if use_coarse_rgb_matching:
                 token_inputs.append(coarse_match_map)
             if self.concat_features:
                 token_inputs.append(coarse_features)
@@ -427,13 +430,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         patch_values = source_patch_map.flatten(start_dim=2).transpose(1, 2)
         if self.use_transport:
-            coarse_value_map, _ = self.extract_patches(
-                coarse_composite,
-                self.value_patch_size,
-                stride=self.kernel_size,
-                padding=self.value_patch_padding,
-            )
-            default_patch_values = coarse_value_map.flatten(start_dim=2).transpose(1, 2)
             transport_result = self.transport_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
@@ -441,7 +437,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 query_mask_flat,
                 key_valid_flat,
                 token_hw=token_hw,
-                default_tokens=default_patch_values,
+                default_tokens=None,
                 return_aux_entries=return_aux,
             )
             if return_aux:
@@ -516,7 +512,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                             transport_self_keys,
                             token_hw,
                             self_transport_state,
-                            default_tokens=default_patch_values,
+                            default_tokens=None,
                             return_diagnostics=False,
                         )
                         aux["transport_self_aux"] = transport_self_aux
