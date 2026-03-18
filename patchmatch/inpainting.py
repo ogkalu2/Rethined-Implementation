@@ -24,10 +24,11 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_gumbel_tau: float = 1.0,
         attention_gumbel_hard: bool = True,
         use_transport: bool = False,
-        transport_epsilon: float = 0.05,
-        transport_iters: int = 12,
+        transport_epsilon: float = 1.0,
+        transport_iters: int = 24,
         transport_capacity_scale: float = 1.25,
-        transport_train_hard: bool = False,
+        transport_mass_penalty: float = 1.0,
+        transport_train_hard: bool = True,
         transport_eval_hard: bool = True,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
@@ -152,6 +153,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_epsilon = float(transport_epsilon)
         self.transport_iters = int(transport_iters)
         self.transport_capacity_scale = float(transport_capacity_scale)
+        self.transport_mass_penalty = float(transport_mass_penalty)
         self.transport_train_hard = bool(transport_train_hard)
         self.transport_eval_hard = bool(transport_eval_hard)
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
@@ -163,6 +165,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             raise ValueError("transport_iters must be positive.")
         if self.transport_capacity_scale <= 0:
             raise ValueError("transport_capacity_scale must be positive.")
+        if self.transport_mass_penalty <= 0:
+            raise ValueError("transport_mass_penalty must be positive.")
 
         self.encoder_decoder = model
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))

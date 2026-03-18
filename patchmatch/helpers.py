@@ -261,23 +261,22 @@ class PatchmatchHelpersMixin:
             )
             raw_logits = raw_logits.mean(dim=1).squeeze(0).float()
             masked_logits = masked_logits.mean(dim=1).squeeze(0).float()
-            transport_plan = solve_capacity_transport(
+            transport_scores, transport_log_probs, transport_plan = solve_capacity_transport(
                 masked_logits,
                 epsilon=self.transport_epsilon,
                 num_iters=self.transport_iters,
                 capacity_scale=self.transport_capacity_scale,
-            ).to(dtype=patch_values.dtype)
+                mass_penalty=self.transport_mass_penalty,
+            )
+            transport_plan_for_mix = transport_plan.to(dtype=patch_values.dtype)
 
             if self.training and self.transport_train_hard:
-                hard_plan = harden_transport_plan(transport_plan)
-                mix_plan = hard_plan - transport_plan.detach() + transport_plan
-                ranking_plan = hard_plan
+                hard_plan = harden_transport_plan(transport_plan_for_mix)
+                mix_plan = hard_plan - transport_plan_for_mix.detach() + transport_plan_for_mix
             elif (not self.training) and self.transport_eval_hard:
-                mix_plan = harden_transport_plan(transport_plan)
-                ranking_plan = mix_plan
+                mix_plan = harden_transport_plan(transport_plan_for_mix)
             else:
-                mix_plan = transport_plan
-                ranking_plan = transport_plan
+                mix_plan = transport_plan_for_mix
 
             mixed_subset = mix_plan @ patch_values[batch_idx, key_indices]
             mixed_subset = mixed_subset.to(dtype=mixed_default.dtype)
@@ -296,9 +295,9 @@ class PatchmatchHelpersMixin:
                         "key_indices": key_indices,
                         "token_hw": token_hw,
                         "raw_logits": raw_logits,
-                        "ranking_scores": ranking_plan.clamp_min(1e-8).log().float(),
+                        "ranking_scores": transport_scores.float(),
                         "pred_probs": transport_plan.float(),
-                        "pred_log_probs": transport_plan.clamp_min(1e-8).log().float(),
+                        "pred_log_probs": transport_log_probs.float(),
                     }
                 )
 

@@ -15,10 +15,11 @@ model:
     attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
     use_transport: true
-    transport_epsilon: 0.05
-    transport_iters: 12
+    transport_epsilon: 1.0
+    transport_iters: 24
     transport_capacity_scale: 1.25
-    transport_train_hard: false
+    transport_mass_penalty: 1.0
+    transport_train_hard: true
     transport_eval_hard: true
     matching_descriptor_dim: 128
     matching_hidden_dim: 192
