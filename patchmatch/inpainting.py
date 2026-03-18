@@ -323,9 +323,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             padding=self.value_patch_padding,
         )
         key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
-        # The transport field should match against stable context signals, not coarse RGB
-        # hallucinations inside the hole.
-        use_coarse_rgb_matching = self.match_coarse_rgb and (not self.use_transport)
+        use_coarse_rgb_matching = self.match_coarse_rgb
         coarse_match_map = None
         if use_coarse_rgb_matching:
             coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
