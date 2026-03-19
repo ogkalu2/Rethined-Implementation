@@ -315,6 +315,14 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             stride=self.kernel_size,
             padding=self.value_patch_padding,
         )
+        visible_source_patch_map = None
+        if self.use_transport:
+            visible_source_patch_map, _ = self.extract_patches(
+                image,
+                self.value_patch_size,
+                stride=self.kernel_size,
+                padding=self.value_patch_padding,
+            )
         query_mask_flat = self.flatten_query_mask(mask)
         key_mask_patch_map, _ = self.extract_patches(
             mask,
@@ -431,7 +439,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             transport_result = self.transport_patch_mix_masked_queries(
                 query_tokens,
                 key_tokens,
-                source_patch_map,
+                visible_source_patch_map,
                 query_mask_flat,
                 key_valid_flat,
                 token_hw=token_hw,
@@ -505,7 +513,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                         _, transport_self_aux = self._build_transport_aux(
                             query_tokens,
                             key_tokens,
-                            source_patch_map,
+                            visible_source_patch_map,
                             transport_self_mask,
                             transport_self_keys,
                             token_hw,
