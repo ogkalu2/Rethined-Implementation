@@ -349,6 +349,31 @@ def save_vis(writer, batch, coarse, refined, step, log_dir=None):
 
 
 @torch.no_grad()
+def render_visualization_batch(model, batch_views, device, use_amp):
+    was_training = model.training
+    amp_device_type = get_autocast_device_type(device)
+    amp_enabled = is_amp_enabled(device, use_amp)
+    try:
+        model.eval()
+        with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
+            refined_raw, _, coarse_raw = model(
+                batch_views["masked_image"],
+                batch_views["mask"],
+                value_image=batch_views["refine_target"],
+                return_aux=False,
+            )
+        refined = refined_raw.clamp(0, 1).detach()
+        coarse = composite_with_known(
+            coarse_raw.clamp(0, 1),
+            batch_views["refine_target"],
+            batch_views["mask"],
+        ).detach()
+        return coarse, refined
+    finally:
+        model.train(was_training)
+
+
+@torch.no_grad()
 def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ctx, criterion=None, max_batches=8):
     model.eval()
     raw_model = unwrap_model(model)
@@ -770,8 +795,6 @@ def train(cfg, args, dist_ctx):
     data_iter = iter(train_loader)
     running_g = 0.0
     last_batch_views = None
-    last_coarse = None
-    last_refined = None
     metrics = {}
 
     progress_bar = tqdm(
@@ -825,8 +848,6 @@ def train(cfg, args, dist_ctx):
                         value_image=refine_target,
                         return_aux=True,
                     )
-                    refined_vis = refined_raw.clamp(0, 1)
-                    coarse_vis = composite_with_known(coarse_raw.clamp(0, 1), refine_target, mask)
                     g_loss, g_metrics = criterion.inpainter_loss(
                         coarse_raw,
                         refined_raw,
@@ -860,8 +881,6 @@ def train(cfg, args, dist_ctx):
                 metric_sums[key] += metric_to_float(value)
 
             last_batch_views = batch_views
-            last_coarse = coarse_vis.detach()
-            last_refined = refined_vis.detach()
 
         if step_has_nonfinite:
             optimizer_g.zero_grad(set_to_none=True)
@@ -1071,7 +1090,13 @@ def train(cfg, args, dist_ctx):
             barrier(dist_ctx)
 
         if dist_ctx.is_main_process and step % log_cfg["vis_interval"] == 0 and last_batch_views is not None:
-            save_vis(writer, last_batch_views, last_coarse, last_refined, step, log_dir=log_cfg["log_dir"])
+            vis_coarse, vis_refined = render_visualization_batch(
+                model,
+                last_batch_views,
+                device,
+                cfg["training"]["mixed_precision"],
+            )
+            save_vis(writer, last_batch_views, vis_coarse, vis_refined, step, log_dir=log_cfg["log_dir"])
 
         checkpoint_steps = log_cfg.get("checkpoint_steps")
         should_save = False

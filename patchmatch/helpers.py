@@ -200,6 +200,8 @@ class PatchmatchHelpersMixin:
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         token_hw: tuple[int, int],
+        *,
+        snap_mask_flat: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_patches, _ = coords_flat.shape
         source_patch_values = self._flatten_patch_map(source_patch_map)
@@ -218,6 +220,9 @@ class PatchmatchHelpersMixin:
 
         for batch_idx in range(batch_size):
             query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
+            if snap_mask_flat is not None:
+                allowed_queries = snap_mask_flat[batch_idx, query_indices] > 0.5
+                query_indices = query_indices[allowed_queries]
             valid_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
             if query_indices.numel() == 0 or valid_indices.numel() == 0:
                 continue
@@ -303,9 +308,10 @@ class PatchmatchHelpersMixin:
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
 
         selected_indices = None
-        # Snapping only makes sense when a fallback target exists; otherwise it creates
-        # a train/eval mismatch for the default transport path.
-        if (not self.training) and self.transport_snap_to_valid_eval and default_tokens is not None:
+        # During eval, hard-invalid transport rows can produce black patches because
+        # the source sampler uses zero padding and the visible source bank contains
+        # masked-out pixels. Snap only those rows back onto the nearest valid patch.
+        if (not self.training) and self.transport_snap_to_valid_eval:
             coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
             snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
@@ -313,7 +319,9 @@ class PatchmatchHelpersMixin:
                 query_mask_flat,
                 key_valid_flat,
                 token_hw,
+                snap_mask_flat=fallback_mask,
             )
+            valid_rows = selected_indices >= 0
             if default_tokens is not None:
                 valid_rows = selected_indices >= 0
                 snapped_values_flat = torch.where(
@@ -321,7 +329,11 @@ class PatchmatchHelpersMixin:
                     snapped_values_flat,
                     default_tokens,
                 )
-            sampled_values_flat = snapped_values_flat
+            sampled_values_flat = torch.where(
+                valid_rows.unsqueeze(-1),
+                snapped_values_flat,
+                sampled_values_flat,
+            )
 
         aux = {
             "copy_mode": "transport",
