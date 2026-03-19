@@ -303,7 +303,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         coarse_raw, features = self.encoder_decoder(image)
         known_image = image if value_image is None else value_image
         coarse_composite = coarse_raw * mask + known_image * (1 - mask)
-        # Restore the pre-25ed075 behavior: build matching tokens from the raw coarse
+        # build matching tokens from the raw coarse
         # prediction for both transport and attention paths.
         coarse_token_source = coarse_raw
 
