@@ -20,8 +20,6 @@ model:
     transport_offset_scale: 1.0
     transport_refine_scale: 0.25
     transport_self_supervision_ratio: 0.0
-    transport_fallback_validity_threshold: 0.1
-    transport_snap_to_valid_eval: true
     matching_descriptor_dim: 128
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
