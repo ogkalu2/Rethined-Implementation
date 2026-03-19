@@ -29,7 +29,6 @@ model:
     query_image_context_matching: true
     separate_query_key_matching: false
     shared_query_key_descriptor: false
-    query_context_residual_init: 0.1
     query_context_channels: 32
     key_context_channels: 32
     key_coarse_rgb_residual_init: 0.25
