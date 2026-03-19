@@ -84,29 +84,7 @@ class PatchmatchHelpersMixin:
         return self._apply_branch_dropout(branch, drop_prob)
 
     def _build_context_encoder(self, in_channels: int, out_channels: int) -> nn.Sequential:
-        hidden_channels = max(out_channels, 32)
-        return nn.Sequential(
-            nn.Conv2d(
-                in_channels,
-                hidden_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                padding_mode="reflect",
-                bias=False,
-            ),
-            nn.GELU(),
-            nn.Conv2d(
-                hidden_channels,
-                out_channels,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                padding_mode="reflect",
-                bias=False,
-            ),
-            nn.GELU(),
-        )
+        return LightweightContextEncoder(in_channels, out_channels)
 
     def _build_projection_head(self, input_dim: int, output_dim: int) -> nn.Sequential:
         hidden_dim = output_dim
@@ -134,6 +112,7 @@ class PatchmatchHelpersMixin:
                 bias=False,
             ),
             nn.GELU(),
+            LightweightContextBlock(hidden_dim, dilation=2),
             nn.Conv2d(hidden_dim, output_dim, kernel_size=1, stride=1, bias=False),
         )
 
