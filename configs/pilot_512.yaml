@@ -90,6 +90,7 @@ loss:
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
   transport_selection_weight: 1.5
+  transport_selection_temperature: 0.25
   transport_validity_weight: 0.1
   transport_offset_smoothness_weight: 0.01
   transport_offset_edge_scale: 5.0

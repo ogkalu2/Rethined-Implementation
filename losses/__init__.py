@@ -97,6 +97,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         retrieval_target_margin_pct: float = 0.03,
         transport_patch_weight: float = 1.0,
         transport_selection_weight: float = 0.0,
+        transport_selection_temperature: float = 1.0,
         transport_validity_weight: float = 0.1,
         transport_offset_smoothness_weight: float = 0.01,
         transport_offset_edge_scale: float = 5.0,
@@ -121,6 +122,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
         self.transport_patch_weight = float(transport_patch_weight)
         self.transport_selection_weight = float(transport_selection_weight)
+        self.transport_selection_temperature = float(transport_selection_temperature)
         self.transport_validity_weight = float(transport_validity_weight)
         self.transport_offset_smoothness_weight = float(transport_offset_smoothness_weight)
         self.transport_offset_edge_scale = float(transport_offset_edge_scale)
@@ -137,6 +139,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raise ValueError("transport_patch_weight must be non-negative.")
         if self.transport_selection_weight < 0:
             raise ValueError("transport_selection_weight must be non-negative.")
+        if self.transport_selection_temperature <= 0:
+            raise ValueError("transport_selection_temperature must be positive.")
         if self.transport_validity_weight < 0:
             raise ValueError("transport_validity_weight must be non-negative.")
         if self.transport_offset_smoothness_weight < 0:
@@ -657,7 +661,10 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 min_teacher_dist * (1.0 + self.retrieval_target_margin_pct) + 1e-4
             )
 
-            pred_probs = F.softmax(masked_raw_logits, dim=-1)
+            pred_probs = F.softmax(
+                masked_raw_logits / self.transport_selection_temperature,
+                dim=-1,
+            )
             valid_probs_sum = (pred_probs * valid_targets_mask.float()).sum(dim=-1).clamp_min(1e-8)
             losses.append(-valid_probs_sum.log().mean())
 
