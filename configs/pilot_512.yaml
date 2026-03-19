@@ -31,8 +31,8 @@ model:
     query_context_channels: 32
     query_context_residual_init: 0.1
     key_context_channels: 32
-    key_coarse_rgb_residual_init: 0.25
-    key_feature_residual_init: 0.25
+    key_coarse_rgb_residual_init: 0
+    key_feature_residual_init: 0
     nheads: 1
     stem_out_stride: 1
     stem_out_channels: 3
