@@ -96,6 +96,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         retrieval_teacher_temperature: float = 0.07,
         retrieval_target_margin_pct: float = 0.03,
         transport_patch_weight: float = 1.0,
+        transport_selection_weight: float = 0.0,
         transport_validity_weight: float = 0.1,
         transport_offset_smoothness_weight: float = 0.01,
         transport_offset_edge_scale: float = 5.0,
@@ -119,6 +120,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
         self.transport_patch_weight = float(transport_patch_weight)
+        self.transport_selection_weight = float(transport_selection_weight)
         self.transport_validity_weight = float(transport_validity_weight)
         self.transport_offset_smoothness_weight = float(transport_offset_smoothness_weight)
         self.transport_offset_edge_scale = float(transport_offset_edge_scale)
@@ -133,6 +135,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raise ValueError("retrieval_coherence_sigma must be positive.")
         if self.transport_patch_weight < 0:
             raise ValueError("transport_patch_weight must be non-negative.")
+        if self.transport_selection_weight < 0:
+            raise ValueError("transport_selection_weight must be non-negative.")
         if self.transport_validity_weight < 0:
             raise ValueError("transport_validity_weight must be non-negative.")
         if self.transport_offset_smoothness_weight < 0:
@@ -172,6 +176,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
     def transport_patch_supervision_enabled(self) -> bool:
         return self.transport_patch_weight > 0
+
+    def transport_selection_supervision_enabled(self) -> bool:
+        return self.transport_selection_weight > 0
 
     def transport_validity_supervision_enabled(self) -> bool:
         return self.transport_validity_weight > 0
@@ -596,6 +603,71 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         )
         return metrics
 
+    def _transport_selection_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {"transport_selection_loss": 0.0}
+        if attention_aux is None or attention_aux.get("copy_mode") != "transport":
+            return zero, metrics
+
+        kernel_size = int(attention_aux.get("kernel_size", 0))
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        supervision_entries = self._build_transport_supervision_entries(attention_aux)
+        if (
+            kernel_size <= 0
+            or query_mask_flat is None
+            or supervision_entries is None
+        ):
+            return zero, metrics
+
+        teacher_patch_size = kernel_size + 2 * self.retrieval_teacher_patch_padding
+        teacher_tokens = self._extract_patch_tokens(
+            refined_target,
+            patch_size=teacher_patch_size,
+            stride=kernel_size,
+            padding=self.retrieval_teacher_patch_padding,
+        )
+        teacher_tokens = self._normalize_patch_tokens(teacher_tokens)
+
+        losses = []
+        for batch_idx, entry in enumerate(supervision_entries):
+            query_indices = entry["query_indices"]
+            key_indices = entry["key_indices"]
+            raw_logits = entry["raw_logits"]
+            if raw_logits.numel() == 0 or query_indices.numel() == 0 or key_indices.numel() == 0:
+                continue
+
+            masked_queries = query_mask_flat[batch_idx, query_indices] > 0.5
+            if not masked_queries.any():
+                continue
+
+            masked_raw_logits = raw_logits[masked_queries].float()
+            query_teacher_tokens = teacher_tokens[batch_idx, query_indices[masked_queries]]
+            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
+            teacher_distances = torch.cdist(
+                query_teacher_tokens.unsqueeze(0),
+                key_teacher_tokens.unsqueeze(0),
+                p=1,
+            ).squeeze(0)
+            min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
+            valid_targets_mask = teacher_distances <= (
+                min_teacher_dist * (1.0 + self.retrieval_target_margin_pct) + 1e-4
+            )
+
+            pred_probs = F.softmax(masked_raw_logits, dim=-1)
+            valid_probs_sum = (pred_probs * valid_targets_mask.float()).sum(dim=-1).clamp_min(1e-8)
+            losses.append(-valid_probs_sum.log().mean())
+
+        if not losses:
+            return zero, metrics
+
+        loss = torch.stack(losses).mean()
+        metrics["transport_selection_loss"] = loss.item()
+        return loss, metrics
+
     def inpainter_loss(
         self,
         coarse_raw: torch.Tensor,
@@ -653,6 +725,13 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             transport_patch_loss, transport_patch_metrics = self._transport_patch_loss(refined_target, attention_aux)
             total = total + self.transport_patch_weight * transport_patch_loss
             loss_dict["transport_patch"] = transport_patch_metrics["transport_patch"]
+        if self.transport_selection_supervision_enabled():
+            transport_selection_loss, transport_selection_metrics = self._transport_selection_loss(
+                refined_target,
+                attention_aux,
+            )
+            total = total + self.transport_selection_weight * transport_selection_loss
+            loss_dict["transport_selection_loss"] = transport_selection_metrics["transport_selection_loss"]
         if self.transport_validity_supervision_enabled():
             transport_validity_loss, transport_validity_metrics = self._transport_validity_loss(refined_target, attention_aux)
             total = total + self.transport_validity_weight * transport_validity_loss

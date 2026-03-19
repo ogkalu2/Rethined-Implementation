@@ -299,6 +299,8 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
         summary += f", tr32_{retrieval_margin_label}={metrics['transport_selection_recall32']:.3f}"
     if "transport_patch" in metrics:
         summary += f", tp={metrics['transport_patch']:.4f}"
+    if "transport_selection_loss" in metrics:
+        summary += f", tsel={metrics['transport_selection_loss']:.4f}"
     if "transport_validity" in metrics:
         summary += f", tval={metrics['transport_validity']:.4f}"
     if "transport_valid_ratio" in metrics:
@@ -911,6 +913,8 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("loss/retrieval_top1_margin", metrics["retrieval_top1_margin_loss"], step)
             if "transport_patch" in metrics:
                 writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
+            if "transport_selection_loss" in metrics:
+                writer.add_scalar("loss/transport_selection", metrics["transport_selection_loss"], step)
             if "transport_validity" in metrics:
                 writer.add_scalar("loss/transport_validity", metrics["transport_validity"], step)
             if "transport_valid_ratio" in metrics:
@@ -989,6 +993,8 @@ def train(cfg, args, dist_ctx):
                     postfix[f"tr8_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall8']:.3f}"
                 if "transport_selection_recall32" in metrics:
                     postfix[f"tr32_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall32']:.3f}"
+                if "transport_selection_loss" in metrics:
+                    postfix["tsel"] = f"{metrics['transport_selection_loss']:.4f}"
                 progress_bar.set_postfix(postfix, refresh=False)
 
         eval_interval = log_cfg.get("eval_interval", 0)
