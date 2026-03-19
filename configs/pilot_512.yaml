@@ -21,7 +21,7 @@ model:
     transport_refine_scale: 0.25
     transport_fallback_validity_threshold: 0.1
     transport_snap_to_valid_eval: true
-    transport_train_selection: "straight_through_nearest_valid"
+    transport_train_selection: "bilinear"
     transport_eval_selection: "nearest_valid"
     matching_descriptor_dim: 256
     match_coarse_rgb: true
@@ -67,7 +67,7 @@ training:
   total_steps: 3000
   grad_accum_steps: 4
   lr: 0.001
-  scorer_lr: 0.001
+  scorer_lr: 0.0005
   warmup_steps: 200
   min_lr: 0.000001
   scorer_min_lr: 0.000001
@@ -91,7 +91,7 @@ loss:
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
   transport_selection_weight: 1.5
-  transport_selection_temperature: 0.25
+  transport_selection_temperature: 0.2
   transport_validity_weight: 0.1
   transport_offset_smoothness_weight: 0.01
   transport_offset_edge_scale: 5.0
