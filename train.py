@@ -300,11 +300,13 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
     if "transport_patch" in metrics:
         summary += (
             f", tp={metrics['transport_patch']:.4f}"
+            f", tval={metrics['transport_validity']:.4f}"
             f", tvr={metrics['transport_valid_ratio']:.3f}"
             f", tfr={metrics['transport_fallback_ratio']:.3f}"
             f", tsp={metrics['transport_self_patch']:.4f}"
             f", tsvr={metrics['transport_self_valid_ratio']:.3f}"
             f", tsm={metrics['transport_offset_smoothness']:.4f}"
+            f", tcr={metrics['transport_offset_curvature']:.4f}"
             f", tcy={metrics['transport_cycle_consistency']:.4f}"
             f", tcm={metrics['transport_confidence_mean']:.3f}"
         )
