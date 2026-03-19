@@ -246,14 +246,6 @@ def mean_metric(values):
     return float(sum(values) / len(values)) if values else None
 
 
-RETRIEVAL_RECALL_KEYS = (
-    "retrieval_recall1_exact",
-    "retrieval_recall1",
-    "retrieval_recall8",
-    "retrieval_recall32",
-)
-
-
 def is_better_metric(candidate, best, mode):
     if candidate is None:
         return False
@@ -298,18 +290,17 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
     if include_retrieval and "retrieval_recall32" in metrics:
         summary += f", r32_{retrieval_margin_label}={metrics['retrieval_recall32']:.3f}"
     if "transport_patch" in metrics:
-        summary += (
-            f", tp={metrics['transport_patch']:.4f}"
-            f", tval={metrics['transport_validity']:.4f}"
-            f", tvr={metrics['transport_valid_ratio']:.3f}"
-            f", tfr={metrics['transport_fallback_ratio']:.3f}"
-            f", tsp={metrics['transport_self_patch']:.4f}"
-            f", tsvr={metrics['transport_self_valid_ratio']:.3f}"
-            f", tsm={metrics['transport_offset_smoothness']:.4f}"
-            f", tcr={metrics['transport_offset_curvature']:.4f}"
-            f", tcy={metrics['transport_cycle_consistency']:.4f}"
-            f", tcm={metrics['transport_confidence_mean']:.3f}"
-        )
+        summary += f", tp={metrics['transport_patch']:.4f}"
+    if "transport_validity" in metrics:
+        summary += f", tval={metrics['transport_validity']:.4f}"
+    if "transport_valid_ratio" in metrics:
+        summary += f", tvr={metrics['transport_valid_ratio']:.3f}"
+    if "transport_fallback_ratio" in metrics:
+        summary += f", tfr={metrics['transport_fallback_ratio']:.3f}"
+    if "transport_offset_smoothness" in metrics:
+        summary += f", tsm={metrics['transport_offset_smoothness']:.4f}"
+    if "transport_offset_curvature" in metrics:
+        summary += f", tcr={metrics['transport_offset_curvature']:.4f}"
     return summary
 
 
@@ -426,8 +417,8 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
         metric_counts["hr_gain_abs"] += int(hr_gain.numel())
         if criterion is not None:
             retrieval_metrics = criterion.attention_supervision_metrics(refine_target, attention_aux)
-            for key in RETRIEVAL_RECALL_KEYS:
-                metric_sums[key] += float(retrieval_metrics[key])
+            for key, value in retrieval_metrics.items():
+                metric_sums[key] += float(value)
                 metric_counts[key] += 1
 
     model.train()
@@ -478,7 +469,7 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
             else None
         ),
     }
-    for key in RETRIEVAL_RECALL_KEYS:
+    for key in ("retrieval_recall1_exact", "retrieval_recall1", "retrieval_recall8", "retrieval_recall32"):
         value = mean_from(key)
         if value is not None:
             result[key] = value
@@ -872,18 +863,16 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("loss/retrieval_top1_margin", metrics["retrieval_top1_margin_loss"], step)
             if "transport_patch" in metrics:
                 writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
+            if "transport_validity" in metrics:
                 writer.add_scalar("loss/transport_validity", metrics["transport_validity"], step)
+            if "transport_valid_ratio" in metrics:
                 writer.add_scalar("transport/valid_ratio", metrics["transport_valid_ratio"], step)
+            if "transport_fallback_ratio" in metrics:
                 writer.add_scalar("transport/fallback_ratio", metrics["transport_fallback_ratio"], step)
-                writer.add_scalar("loss/transport_self_patch", metrics["transport_self_patch"], step)
-                writer.add_scalar("loss/transport_self_validity", metrics["transport_self_validity"], step)
-                writer.add_scalar("transport/self_valid_ratio", metrics["transport_self_valid_ratio"], step)
+            if "transport_offset_smoothness" in metrics:
                 writer.add_scalar("loss/transport_offset_smoothness", metrics["transport_offset_smoothness"], step)
+            if "transport_offset_curvature" in metrics:
                 writer.add_scalar("transport/offset_curvature", metrics["transport_offset_curvature"], step)
-                writer.add_scalar("loss/transport_cycle_consistency", metrics["transport_cycle_consistency"], step)
-                writer.add_scalar("transport/cycle_error", metrics["transport_cycle_error"], step)
-                writer.add_scalar("loss/transport_confidence", metrics["transport_confidence"], step)
-                writer.add_scalar("transport/confidence_mean", metrics["transport_confidence_mean"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/inpainter_total", metrics["inpainter_total"], step)
             writer.add_scalar("loss/running_inpainter", running_g, step)
@@ -909,34 +898,22 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("accelerator_mem_gb", peak_memory_gb, step)
             write_status(log_cfg["log_dir"], step, total_steps, metrics, lr_g)
             if log_cfg.get("print_train_metrics", False):
-                progress_bar.set_postfix(
-                    {
-                        "i": f"{metrics['inpainter_total']:.4f}",
-                        "l1": f"{metrics['refined_l1']:.4f}",
-                        "qp": (
-                            f"{metrics['refined_query_patch_l1']:.4f}"
-                            if "refined_query_patch_l1" in metrics else "n/a"
-                        ),
-                        "r1_exact": (
-                            f"{metrics['retrieval_recall1_exact']:.3f}"
-                            if "retrieval_recall1_exact" in metrics else "n/a"
-                        ),
-                        f"r1_{retrieval_margin_label}": (
-                            f"{metrics['retrieval_recall1']:.3f}"
-                            if "retrieval_recall1" in metrics else "n/a"
-                        ),
-                        f"r8_{retrieval_margin_label}": (
-                            f"{metrics['retrieval_recall8']:.3f}"
-                            if "retrieval_recall8" in metrics else "n/a"
-                        ),
-                        f"r32_{retrieval_margin_label}": (
-                            f"{metrics['retrieval_recall32']:.3f}"
-                            if "retrieval_recall32" in metrics else "n/a"
-                        ),
-                        "perc": f"{metrics['perceptual']:.4f}",
-                    },
-                    refresh=False,
-                )
+                postfix = {
+                    "i": f"{metrics['inpainter_total']:.4f}",
+                    "l1": f"{metrics['refined_l1']:.4f}",
+                    "perc": f"{metrics['perceptual']:.4f}",
+                }
+                if "refined_query_patch_l1" in metrics:
+                    postfix["qp"] = f"{metrics['refined_query_patch_l1']:.4f}"
+                if "retrieval_recall1_exact" in metrics:
+                    postfix["r1_exact"] = f"{metrics['retrieval_recall1_exact']:.3f}"
+                if "retrieval_recall1" in metrics:
+                    postfix[f"r1_{retrieval_margin_label}"] = f"{metrics['retrieval_recall1']:.3f}"
+                if "retrieval_recall8" in metrics:
+                    postfix[f"r8_{retrieval_margin_label}"] = f"{metrics['retrieval_recall8']:.3f}"
+                if "retrieval_recall32" in metrics:
+                    postfix[f"r32_{retrieval_margin_label}"] = f"{metrics['retrieval_recall32']:.3f}"
+                progress_bar.set_postfix(postfix, refresh=False)
 
         eval_interval = log_cfg.get("eval_interval", 0)
         if eval_loader is not None and eval_interval and step % eval_interval == 0:

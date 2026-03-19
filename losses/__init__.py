@@ -74,7 +74,7 @@ def masked_gradient_l1_loss(
 
 
 class InpaintingLoss(TransportLossMixin, nn.Module):
-    """Training losses for refinement, retrieval, and transport supervision."""
+    """Training losses for refinement, retrieval, and active transport supervision."""
 
     SCHEDULED_WEIGHT_NAMES = (
         "retrieval_loss_weight",
@@ -97,11 +97,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         retrieval_target_margin_pct: float = 0.03,
         transport_patch_weight: float = 1.0,
         transport_validity_weight: float = 0.1,
-        transport_self_patch_weight: float = 0.0,
-        transport_self_validity_weight: float = 0.0,
         transport_offset_smoothness_weight: float = 0.01,
-        transport_cycle_consistency_weight: float = 0.0,
-        transport_confidence_weight: float = 0.0,
         transport_offset_edge_scale: float = 5.0,
         loss_schedule_focus_steps: int = 0,
         loss_schedule_transition_steps: int = 0,
@@ -124,11 +120,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
         self.transport_patch_weight = float(transport_patch_weight)
         self.transport_validity_weight = float(transport_validity_weight)
-        self.transport_self_patch_weight = float(transport_self_patch_weight)
-        self.transport_self_validity_weight = float(transport_self_validity_weight)
         self.transport_offset_smoothness_weight = float(transport_offset_smoothness_weight)
-        self.transport_cycle_consistency_weight = float(transport_cycle_consistency_weight)
-        self.transport_confidence_weight = float(transport_confidence_weight)
         self.transport_offset_edge_scale = float(transport_offset_edge_scale)
         self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
         self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
@@ -143,16 +135,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raise ValueError("transport_patch_weight must be non-negative.")
         if self.transport_validity_weight < 0:
             raise ValueError("transport_validity_weight must be non-negative.")
-        if self.transport_self_patch_weight < 0:
-            raise ValueError("transport_self_patch_weight must be non-negative.")
-        if self.transport_self_validity_weight < 0:
-            raise ValueError("transport_self_validity_weight must be non-negative.")
         if self.transport_offset_smoothness_weight < 0:
             raise ValueError("transport_offset_smoothness_weight must be non-negative.")
-        if self.transport_cycle_consistency_weight < 0:
-            raise ValueError("transport_cycle_consistency_weight must be non-negative.")
-        if self.transport_confidence_weight < 0:
-            raise ValueError("transport_confidence_weight must be non-negative.")
         if self.transport_offset_edge_scale < 0:
             raise ValueError("transport_offset_edge_scale must be non-negative.")
 
@@ -177,6 +161,23 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
     def set_training_step(self, step: int):
         self.current_training_step = max(0, int(step))
+
+    def retrieval_supervision_enabled(self) -> bool:
+        return (
+            self._get_scheduled_weight("retrieval_loss_weight") > 0
+            or self.retrieval_hard_ce_weight > 0
+            or self.retrieval_top1_margin_weight > 0
+            or self.retrieval_coherence_weight > 0
+        )
+
+    def transport_patch_supervision_enabled(self) -> bool:
+        return self.transport_patch_weight > 0
+
+    def transport_validity_supervision_enabled(self) -> bool:
+        return self.transport_validity_weight > 0
+
+    def transport_smoothness_supervision_enabled(self) -> bool:
+        return self.transport_offset_smoothness_weight > 0
 
     def _get_scheduled_weight(self, name: str) -> float:
         base_weight = self._base_weight_values[name]
@@ -386,18 +387,11 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         attention_aux: dict[str, object] | None,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
         zero = refined_target.new_zeros(())
-        loss_terms = {
-            "retrieval": zero,
-            "retrieval_hard_ce": zero,
-            "retrieval_top1_margin": zero,
-            "retrieval_coherence": zero,
-        }
-        metrics = {
-            "retrieval_recall1_exact": 0.0,
-            "retrieval_recall1": 0.0,
-            "retrieval_recall8": 0.0,
-            "retrieval_recall32": 0.0,
-        }
+        if not self.retrieval_supervision_enabled() or attention_aux is None:
+            return {}, {}
+
+        loss_terms = {}
+        metrics = {}
         if attention_aux is None:
             return loss_terms, metrics
 
@@ -560,6 +554,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         refined_target: torch.Tensor,
         attention_aux: dict[str, object] | None,
     ) -> dict[str, float]:
+        if not self.retrieval_supervision_enabled():
+            return {}
         _, metrics = self._attention_supervision_losses(refined_target, attention_aux)
         return metrics
 
@@ -575,28 +571,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         coarse_l2 = masked_mse_loss(coarse_raw, coarse_target, mask)
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
-        attention_loss_terms, attention_metrics = self._attention_supervision_losses(refined_target, attention_aux)
-        transport_patch_loss, transport_patch_metrics = self._transport_patch_loss(refined_target, attention_aux)
-        transport_validity_loss, transport_validity_metrics = self._transport_validity_loss(refined_target, attention_aux)
-        transport_self_patch_loss, transport_self_patch_metrics = self._transport_self_patch_loss(
-            refined_target,
-            attention_aux,
-        )
-        transport_self_validity_loss, transport_self_validity_metrics = self._transport_self_validity_loss(
-            refined_target,
-            attention_aux,
-        )
-        transport_offset_smoothness_loss, transport_offset_smoothness_metrics = self._transport_offset_smoothness_loss(
-            refined_target,
-            attention_aux,
-        )
-        transport_cycle_consistency_loss, transport_cycle_consistency_metrics = (
-            self._transport_cycle_consistency_loss(refined_target, attention_aux)
-        )
-        transport_confidence_loss, transport_confidence_metrics = self._transport_confidence_loss(
-            refined_target,
-            attention_aux,
-        )
         perceptual = self.perceptual_loss(refined, refined_target)
 
         scheduled_weights = {
@@ -607,46 +581,53 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             self.coarse_l2_weight * coarse_l2
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
-            + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms["retrieval"]
-            + self.retrieval_hard_ce_weight * attention_loss_terms["retrieval_hard_ce"]
-            + self.retrieval_top1_margin_weight * attention_loss_terms["retrieval_top1_margin"]
-            + self.retrieval_coherence_weight * attention_loss_terms["retrieval_coherence"]
-            + self.transport_patch_weight * transport_patch_loss
-            + self.transport_validity_weight * transport_validity_loss
-            + self.transport_self_patch_weight * transport_self_patch_loss
-            + self.transport_self_validity_weight * transport_self_validity_loss
-            + self.transport_offset_smoothness_weight * transport_offset_smoothness_loss
-            + self.transport_cycle_consistency_weight * transport_cycle_consistency_loss
-            + self.transport_confidence_weight * transport_confidence_loss
             + scheduled_weights["perceptual_weight"] * perceptual
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
             "refined_l1": refined_l1.item(),
             "refined_query_patch_l1": refined_query_patch_l1.item(),
-            "retrieval_loss": attention_loss_terms["retrieval"].item(),
-            "retrieval_hard_ce_loss": attention_loss_terms["retrieval_hard_ce"].item(),
-            "retrieval_top1_margin_loss": attention_loss_terms["retrieval_top1_margin"].item(),
-            "retrieval_coherence_loss": attention_loss_terms["retrieval_coherence"].item(),
-            "transport_patch": transport_patch_metrics["transport_patch"],
-            "transport_validity": transport_validity_metrics["transport_validity"],
-            "transport_valid_ratio": transport_validity_metrics["transport_valid_ratio"],
-            "transport_fallback_ratio": transport_validity_metrics["transport_fallback_ratio"],
-            "transport_self_patch": transport_self_patch_metrics["transport_self_patch"],
-            "transport_self_validity": transport_self_validity_metrics["transport_self_validity"],
-            "transport_self_valid_ratio": transport_self_validity_metrics["transport_self_valid_ratio"],
-            "transport_offset_smoothness": transport_offset_smoothness_metrics["transport_offset_smoothness"],
-            "transport_offset_curvature": transport_offset_smoothness_metrics["transport_offset_curvature"],
-            "transport_cycle_consistency": transport_cycle_consistency_metrics["transport_cycle_consistency"],
-            "transport_cycle_error": transport_cycle_consistency_metrics["transport_cycle_error"],
-            "transport_confidence": transport_confidence_metrics["transport_confidence"],
-            "transport_confidence_mean": transport_confidence_metrics["transport_confidence_mean"],
             "perceptual": perceptual.item(),
-            "inpainter_total": total.item(),
         }
-        loss_dict.update({
-            f"weight/{name.removesuffix('_weight')}": value
-            for name, value in scheduled_weights.items()
-        })
-        loss_dict.update(attention_metrics)
+        if self.retrieval_supervision_enabled():
+            attention_loss_terms, attention_metrics = self._attention_supervision_losses(refined_target, attention_aux)
+            total = (
+                total
+                + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms.get("retrieval", zero)
+                + self.retrieval_hard_ce_weight * attention_loss_terms.get("retrieval_hard_ce", zero)
+                + self.retrieval_top1_margin_weight * attention_loss_terms.get("retrieval_top1_margin", zero)
+                + self.retrieval_coherence_weight * attention_loss_terms.get("retrieval_coherence", zero)
+            )
+            if "retrieval" in attention_loss_terms:
+                loss_dict["retrieval_loss"] = attention_loss_terms["retrieval"].item()
+            if "retrieval_hard_ce" in attention_loss_terms:
+                loss_dict["retrieval_hard_ce_loss"] = attention_loss_terms["retrieval_hard_ce"].item()
+            if "retrieval_top1_margin" in attention_loss_terms:
+                loss_dict["retrieval_top1_margin_loss"] = attention_loss_terms["retrieval_top1_margin"].item()
+            if "retrieval_coherence" in attention_loss_terms:
+                loss_dict["retrieval_coherence_loss"] = attention_loss_terms["retrieval_coherence"].item()
+            loss_dict["weight/retrieval_loss"] = scheduled_weights["retrieval_loss_weight"]
+            loss_dict.update(attention_metrics)
+
+        if self.transport_patch_supervision_enabled():
+            transport_patch_loss, transport_patch_metrics = self._transport_patch_loss(refined_target, attention_aux)
+            total = total + self.transport_patch_weight * transport_patch_loss
+            loss_dict["transport_patch"] = transport_patch_metrics["transport_patch"]
+        if self.transport_validity_supervision_enabled():
+            transport_validity_loss, transport_validity_metrics = self._transport_validity_loss(refined_target, attention_aux)
+            total = total + self.transport_validity_weight * transport_validity_loss
+            loss_dict["transport_validity"] = transport_validity_metrics["transport_validity"]
+            loss_dict["transport_valid_ratio"] = transport_validity_metrics["transport_valid_ratio"]
+            loss_dict["transport_fallback_ratio"] = transport_validity_metrics["transport_fallback_ratio"]
+        if self.transport_smoothness_supervision_enabled():
+            transport_offset_smoothness_loss, transport_offset_smoothness_metrics = self._transport_offset_smoothness_loss(
+                refined_target,
+                attention_aux,
+            )
+            total = total + self.transport_offset_smoothness_weight * transport_offset_smoothness_loss
+            loss_dict["transport_offset_smoothness"] = transport_offset_smoothness_metrics["transport_offset_smoothness"]
+            loss_dict["transport_offset_curvature"] = transport_offset_smoothness_metrics["transport_offset_curvature"]
+
+        loss_dict["weight/perceptual"] = scheduled_weights["perceptual_weight"]
+        loss_dict["inpainter_total"] = total.item()
         return total, loss_dict

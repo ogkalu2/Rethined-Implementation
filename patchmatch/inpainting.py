@@ -28,7 +28,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         transport_refine_steps: int = 2,
         transport_offset_scale: float = 1.0,
         transport_refine_scale: float = 0.25,
-        transport_self_supervision_ratio: float = 0.0,
         transport_fallback_validity_threshold: float = 0.1,
         transport_snap_to_valid_eval: bool = True,
         matching_descriptor_dim: int | None = None,
@@ -155,7 +154,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_refine_steps = max(0, int(transport_refine_steps))
         self.transport_offset_scale = float(transport_offset_scale)
         self.transport_refine_scale = float(transport_refine_scale)
-        self.transport_self_supervision_ratio = float(transport_self_supervision_ratio)
         self.transport_fallback_validity_threshold = float(transport_fallback_validity_threshold)
         self.transport_snap_to_valid_eval = bool(transport_snap_to_valid_eval)
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
@@ -167,8 +165,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             raise ValueError("transport_offset_scale must be non-negative.")
         if self.transport_refine_scale < 0:
             raise ValueError("transport_refine_scale must be non-negative.")
-        if not 0.0 <= self.transport_self_supervision_ratio <= 1.0:
-            raise ValueError("transport_self_supervision_ratio must be in [0, 1].")
         if not 0.0 <= self.transport_fallback_validity_threshold <= 1.0:
             raise ValueError("transport_fallback_validity_threshold must be in [0, 1].")
 
@@ -186,7 +182,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_descriptor_head = None
         self.transport_init_head = None
         self.transport_refine_head = None
-        self.transport_confidence_head = None
         if self.separate_query_key_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
@@ -222,7 +217,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             transport_refine_in = (self.patch_token_dim * 2) + 4
             self.transport_init_head = self._build_transport_head(transport_init_in, 2)
             self.transport_refine_head = self._build_transport_head(transport_refine_in, 2)
-            self.transport_confidence_head = self._build_transport_head(transport_refine_in, 1)
         if self.query_image_context_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.query_context_descriptor_head = self._build_projection_head(
@@ -494,30 +488,5 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             }
             if copy_aux is not None:
                 aux.update(copy_aux)
-            if self.use_transport and self.training:
-                transport_self_mask = self._sample_transport_self_mask(key_valid_flat)
-                if transport_self_mask is not None:
-                    transport_self_keys = key_valid_flat * (1.0 - transport_self_mask)
-                    if (transport_self_keys > 0.5).any():
-                        self_transport_state = self._predict_transport_field(
-                            query_tokens,
-                            key_tokens,
-                            transport_self_mask,
-                            transport_self_keys,
-                            token_hw,
-                            compute_confidence=False,
-                        )
-                        _, transport_self_aux = self._build_transport_aux(
-                            query_tokens,
-                            key_tokens,
-                            visible_source_patch_map,
-                            transport_self_mask,
-                            transport_self_keys,
-                            token_hw,
-                            self_transport_state,
-                            default_tokens=None,
-                            return_diagnostics=False,
-                        )
-                        aux["transport_self_aux"] = transport_self_aux
             return refined, masked_attention, coarse_raw, aux
         return refined, masked_attention, coarse_raw
