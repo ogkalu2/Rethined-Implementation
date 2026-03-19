@@ -366,13 +366,13 @@ class PatchmatchHelpersMixin:
             valid_copy = (~fallback_mask).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
 
+        raw_sampled_values_flat = sampled_values_flat
         selected_indices = None
-        # The original transport path snapped to the nearest valid patch during training too.
-        # Keep that behavior so transport supervision sees discrete valid copies instead of
-        # partially invalid bilinear samples, while still allowing eval-time opt-out.
+        # Use snapped valid patches in the forward pass, but keep gradients flowing through
+        # the differentiable transport samples during training.
         if self.training or self.transport_snap_to_valid_eval:
             coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
-            sampled_values_flat, selected_indices = self._snap_transport_to_valid_patches(
+            snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
                 coords_flat,
                 query_mask_flat,
@@ -381,11 +381,15 @@ class PatchmatchHelpersMixin:
             )
             if default_tokens is not None:
                 valid_rows = selected_indices >= 0
-                sampled_values_flat = torch.where(
+                snapped_values_flat = torch.where(
                     valid_rows.unsqueeze(-1),
-                    sampled_values_flat,
+                    snapped_values_flat,
                     default_tokens,
                 )
+            if self.training:
+                sampled_values_flat = raw_sampled_values_flat + (snapped_values_flat - raw_sampled_values_flat).detach()
+            else:
+                sampled_values_flat = snapped_values_flat
 
         aux = {
             "copy_mode": "transport",
