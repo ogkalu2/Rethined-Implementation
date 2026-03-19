@@ -367,7 +367,10 @@ class PatchmatchHelpersMixin:
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
 
         selected_indices = None
-        if self.transport_snap_to_valid_eval and not self.training:
+        # The original transport path snapped to the nearest valid patch during training too.
+        # Keep that behavior so transport supervision sees discrete valid copies instead of
+        # partially invalid bilinear samples, while still allowing eval-time opt-out.
+        if self.training or self.transport_snap_to_valid_eval:
             coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
             sampled_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
