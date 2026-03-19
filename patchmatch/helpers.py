@@ -307,9 +307,9 @@ class PatchmatchHelpersMixin:
             valid_copy = (~fallback_mask).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
 
+        coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
         selected_indices = None
         if self.training and self.transport_train_selection == "straight_through_nearest_valid":
-            coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
             snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
                 coords_flat,
@@ -332,7 +332,6 @@ class PatchmatchHelpersMixin:
                 sampled_values_flat,
             )
         elif not self.training and self.transport_eval_selection == "nearest_valid":
-            coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
             snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
                 coords_flat,
@@ -357,7 +356,6 @@ class PatchmatchHelpersMixin:
             # During eval, hard-invalid transport rows can produce black patches because
             # the source sampler uses zero padding and the visible source bank contains
             # masked-out pixels. Snap only those rows back onto the nearest valid patch.
-            coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
             snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
                 coords_flat,
@@ -379,17 +377,49 @@ class PatchmatchHelpersMixin:
                 sampled_values_flat,
             )
 
+        selection_coords_flat = coords_flat
+        effective_validity_flat = sampled_validity_flat
+        effective_fallback_mask = fallback_mask
+        if selected_indices is not None:
+            base_coords_flat = base_coords.flatten(start_dim=2).transpose(1, 2)
+            safe_selected = selected_indices.clamp_min(0).unsqueeze(-1).expand(-1, -1, base_coords_flat.shape[-1])
+            snapped_coords_flat = torch.gather(base_coords_flat, 1, safe_selected)
+            valid_rows = selected_indices >= 0
+            straight_through_coords = selection_coords_flat + (snapped_coords_flat - selection_coords_flat).detach()
+            selection_coords_flat = torch.where(
+                valid_rows.unsqueeze(-1),
+                straight_through_coords,
+                selection_coords_flat,
+            )
+            snapped_validity_flat = torch.ones_like(sampled_validity_flat)
+            straight_through_validity = (
+                effective_validity_flat + (snapped_validity_flat - effective_validity_flat).detach()
+            )
+            effective_validity_flat = torch.where(
+                valid_rows,
+                straight_through_validity,
+                effective_validity_flat,
+            )
+            effective_fallback_mask = torch.where(
+                valid_rows,
+                torch.zeros_like(fallback_mask),
+                fallback_mask,
+            )
+
         aux = {
             "copy_mode": "transport",
             "query_mask_flat": query_mask_flat,
             "key_valid_flat": key_valid_flat,
             "transport_coords": coords.flatten(start_dim=2).transpose(1, 2),
+            "transport_selection_coords": selection_coords_flat,
             "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
             "transport_copy_values": sampled_values.flatten(start_dim=2).transpose(1, 2),
             "transport_values": sampled_values_flat,
             "transport_validity": sampled_validity_flat,
+            "transport_effective_validity": effective_validity_flat,
             "transport_hard_validity": hard_validity_flat,
             "transport_fallback_mask": fallback_mask,
+            "transport_effective_fallback_mask": effective_fallback_mask,
         }
         if selected_indices is not None:
             aux["transport_selected_indices"] = selected_indices

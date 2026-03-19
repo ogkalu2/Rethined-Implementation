@@ -66,8 +66,12 @@ class TransportLossMixin:
             return zero, metrics
 
         query_mask_flat = attention_aux.get("query_mask_flat")
-        transport_validity = attention_aux.get("transport_validity")
-        fallback_mask = attention_aux.get("transport_fallback_mask")
+        transport_validity = attention_aux.get("transport_effective_validity")
+        if transport_validity is None:
+            transport_validity = attention_aux.get("transport_validity")
+        fallback_mask = attention_aux.get("transport_effective_fallback_mask")
+        if fallback_mask is None:
+            fallback_mask = attention_aux.get("transport_fallback_mask")
         if query_mask_flat is None or transport_validity is None:
             return zero, metrics
 

@@ -368,7 +368,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
         query_mask_flat = attention_aux.get("query_mask_flat")
         key_valid_flat = attention_aux.get("key_valid_flat")
-        transport_coords = attention_aux.get("transport_coords")
+        transport_coords = attention_aux.get("transport_selection_coords")
+        if transport_coords is None:
+            transport_coords = attention_aux.get("transport_coords")
         token_hw = attention_aux.get("token_hw")
         if (
             query_mask_flat is None
