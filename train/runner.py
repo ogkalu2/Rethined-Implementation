@@ -319,6 +319,33 @@ def train(cfg, args, dist_ctx):
         metrics = {key: value / grad_accum for key, value in metric_sums.items()}
         metrics = reduce_metrics(metrics, dist_ctx, average=True)
         running_g = 0.9 * running_g + 0.1 * metrics["inpainter_total"]
+        if dist_ctx.is_main_process:
+            postfix = {"epoch": f"{epoch:.2f}/{total_epochs:.2f}"}
+            if log_cfg.get("print_train_metrics", False):
+                postfix["i"] = f"{metrics['inpainter_total']:.4f}"
+                postfix["l1"] = f"{metrics['refined_l1']:.4f}"
+                postfix["perc"] = f"{metrics['perceptual']:.4f}"
+                if "refined_query_patch_l1" in metrics:
+                    postfix["qp"] = f"{metrics['refined_query_patch_l1']:.4f}"
+                if "retrieval_recall1_exact" in metrics:
+                    postfix["r1_exact"] = f"{metrics['retrieval_recall1_exact']:.3f}"
+                if "retrieval_recall1" in metrics:
+                    postfix[f"r1_{retrieval_margin_label}"] = f"{metrics['retrieval_recall1']:.3f}"
+                if "retrieval_recall8" in metrics:
+                    postfix[f"r8_{retrieval_margin_label}"] = f"{metrics['retrieval_recall8']:.3f}"
+                if "retrieval_recall32" in metrics:
+                    postfix[f"r32_{retrieval_margin_label}"] = f"{metrics['retrieval_recall32']:.3f}"
+                if "transport_selection_recall1_exact" in metrics:
+                    postfix["tr1_exact"] = f"{metrics['transport_selection_recall1_exact']:.3f}"
+                if "transport_selection_recall1" in metrics:
+                    postfix[f"tr1_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall1']:.3f}"
+                if "transport_selection_recall8" in metrics:
+                    postfix[f"tr8_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall8']:.3f}"
+                if "transport_selection_recall32" in metrics:
+                    postfix[f"tr32_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall32']:.3f}"
+                if "transport_selection_loss" in metrics:
+                    postfix["tsel"] = f"{metrics['transport_selection_loss']:.4f}"
+            progress_bar.set_postfix(postfix, refresh=False)
 
         if dist_ctx.is_main_process and (step == 1 or step % log_cfg["log_interval"] == 0):
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
@@ -389,33 +416,6 @@ def train(cfg, args, dist_ctx):
             if peak_memory_gb is not None:
                 writer.add_scalar("accelerator_mem_gb", peak_memory_gb, step)
             write_status(log_cfg["log_dir"], step, total_steps, epoch, total_epochs, metrics, lr_g)
-            if log_cfg.get("print_train_metrics", False):
-                postfix = {
-                    "i": f"{metrics['inpainter_total']:.4f}",
-                    "l1": f"{metrics['refined_l1']:.4f}",
-                    "perc": f"{metrics['perceptual']:.4f}",
-                }
-                if "refined_query_patch_l1" in metrics:
-                    postfix["qp"] = f"{metrics['refined_query_patch_l1']:.4f}"
-                if "retrieval_recall1_exact" in metrics:
-                    postfix["r1_exact"] = f"{metrics['retrieval_recall1_exact']:.3f}"
-                if "retrieval_recall1" in metrics:
-                    postfix[f"r1_{retrieval_margin_label}"] = f"{metrics['retrieval_recall1']:.3f}"
-                if "retrieval_recall8" in metrics:
-                    postfix[f"r8_{retrieval_margin_label}"] = f"{metrics['retrieval_recall8']:.3f}"
-                if "retrieval_recall32" in metrics:
-                    postfix[f"r32_{retrieval_margin_label}"] = f"{metrics['retrieval_recall32']:.3f}"
-                if "transport_selection_recall1_exact" in metrics:
-                    postfix["tr1_exact"] = f"{metrics['transport_selection_recall1_exact']:.3f}"
-                if "transport_selection_recall1" in metrics:
-                    postfix[f"tr1_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall1']:.3f}"
-                if "transport_selection_recall8" in metrics:
-                    postfix[f"tr8_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall8']:.3f}"
-                if "transport_selection_recall32" in metrics:
-                    postfix[f"tr32_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall32']:.3f}"
-                if "transport_selection_loss" in metrics:
-                    postfix["tsel"] = f"{metrics['transport_selection_loss']:.4f}"
-                progress_bar.set_postfix(postfix, refresh=False)
 
         should_eval = False
         if eval_loader is not None:
