@@ -26,7 +26,7 @@ model:
     matching_descriptor_dim: 256
     matching_hidden_dim: 192
     match_coarse_rgb: true
-    coarse_rgb_branch_dropout: 0
+    coarse_rgb_branch_dropout: 0.1
     query_image_context_matching: true
     separate_query_key_matching: false
     shared_query_key_descriptor: false
