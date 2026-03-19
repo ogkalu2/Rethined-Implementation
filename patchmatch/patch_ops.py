@@ -6,6 +6,14 @@ from torch.nn import functional as F
 
 class PatchOpsMixin:
     def _pool_to_token_grid(self, feature_map: torch.Tensor, token_hw: tuple[int, int]) -> torch.Tensor:
+        height, width = feature_map.shape[-2:]
+        out_h, out_w = int(token_hw[0]), int(token_hw[1])
+        if out_h <= 0 or out_w <= 0:
+            raise ValueError(f"Invalid token grid size: {token_hw}.")
+        if height % out_h == 0 and width % out_w == 0:
+            kernel_h = height // out_h
+            kernel_w = width // out_w
+            return F.avg_pool2d(feature_map, kernel_size=(kernel_h, kernel_w), stride=(kernel_h, kernel_w))
         return F.adaptive_avg_pool2d(feature_map, token_hw)
 
     def _compute_unfolding_weights(self, kernel_size: int, channels: int) -> torch.Tensor:
@@ -64,7 +72,6 @@ class PatchOpsMixin:
                     patch_size, channels, dtype=feature_map.dtype, device=feature_map.device
                 )
                 patches = F.conv2d(feature_map, weights, stride=patch_size, groups=channels)
-                patches = patches.view(batch_size, channels * patch_size * patch_size, n_h, n_w)
             else:
                 x = feature_map.view(batch_size, channels, n_h, patch_size, n_w, patch_size)
                 x = x.permute(0, 1, 3, 5, 2, 4).contiguous()
@@ -108,7 +115,7 @@ class PatchOpsMixin:
             )
 
         # Fast path for non-overlapping patch reconstruction.
-        if stride == kernel_size and padding == 0 and not use_window:
+        if stride == kernel_size and padding == 0 and not use_window and not torch.onnx.is_in_onnx_export():
             out_h, out_w = int(output_size[0]), int(output_size[1])
             if out_h % kernel_size != 0 or out_w % kernel_size != 0:
                 raise ValueError(

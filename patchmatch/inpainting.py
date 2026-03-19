@@ -310,8 +310,10 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         # build matching tokens from the raw coarse
         # prediction for both transport and attention paths.
         coarse_token_source = coarse_raw
+        token_hw = (self.token_grid_size, self.token_grid_size)
 
-        patch_map, output_size = self.unfold_native(coarse_token_source, self.kernel_size)
+        patch_map, _ = self.unfold_native(coarse_token_source, self.kernel_size)
+        output_size = (self.image_size, self.image_size)
         source_patch_map, _ = self.extract_patches(
             known_image,
             self.value_patch_size,
@@ -344,7 +346,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.concat_features:
             coarse_features = F.interpolate(
                 features[self.feature_i],
-                size=patch_map.shape[-2:],
+                size=token_hw,
                 mode="bilinear",
                 align_corners=False,
             )
@@ -359,11 +361,11 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
             query_context_map = self._pool_to_token_grid(
                 self.query_context_encoder(torch.cat([image, mask], dim=1)),
-                patch_map.shape[-2:],
+                token_hw,
             )
             key_context_map = self._pool_to_token_grid(
                 self.key_context_encoder(image),
-                patch_map.shape[-2:],
+                token_hw,
             )
 
             query_token_inputs = [query_context_map, visible_patch_map]
@@ -406,7 +408,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
                 query_context_map = self._pool_to_token_grid(
                     self.query_context_encoder(torch.cat([image, mask], dim=1)),
-                    patch_map.shape[-2:],
+                    token_hw,
                 )
                 query_context_map = torch.cat([query_context_map, visible_patch_map], dim=1)
                 query_context_map = self.query_context_descriptor_head(query_context_map)
@@ -423,7 +425,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         query_tokens = self.pre_attention_norm(query_tokens)
         key_tokens = self.pre_attention_norm(key_tokens)
 
-        token_hw = patch_map.shape[-2:]
         attention_supervision_entries = None
         copy_aux = None
         if return_aux and not self.use_transport:

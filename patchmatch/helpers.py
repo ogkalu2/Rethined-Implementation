@@ -205,34 +205,39 @@ class PatchmatchHelpersMixin:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, num_patches, _ = coords_flat.shape
         source_patch_values = self._flatten_patch_map(source_patch_map)
-        snapped_values = source_patch_values.clone()
-        selected_indices = torch.full(
-            (batch_size, num_patches),
-            -1,
-            dtype=torch.long,
-            device=coords_flat.device,
-        )
         base_coords_flat = self._get_normalized_token_coords(
             token_hw,
             dtype=coords_flat.dtype,
             device=coords_flat.device,
         ).flatten(start_dim=2).transpose(1, 2).expand(batch_size, -1, -1)
+        active_queries = query_mask_flat > 0.5
+        if snap_mask_flat is not None:
+            active_queries = active_queries & (snap_mask_flat > 0.5)
+        valid_keys = key_valid_flat > 0.5
+        has_valid_keys = valid_keys.any(dim=1, keepdim=True)
+        valid_query_rows = active_queries & has_valid_keys
 
-        for batch_idx in range(batch_size):
-            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            if snap_mask_flat is not None:
-                allowed_queries = snap_mask_flat[batch_idx, query_indices] > 0.5
-                query_indices = query_indices[allowed_queries]
-            valid_indices = (key_valid_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            if query_indices.numel() == 0 or valid_indices.numel() == 0:
-                continue
-
-            query_coords = coords_flat[batch_idx, query_indices].float()
-            valid_coords = base_coords_flat[batch_idx, valid_indices].float()
-            nearest_valid = valid_indices[torch.cdist(query_coords, valid_coords).argmin(dim=1)]
-            snapped_values[batch_idx].index_copy_(0, query_indices, source_patch_values[batch_idx, nearest_valid])
-            selected_indices[batch_idx].index_copy_(0, query_indices, nearest_valid)
-
+        deltas = coords_flat.float().unsqueeze(2) - base_coords_flat.float().unsqueeze(1)
+        pairwise_dist = deltas.square().sum(dim=-1)
+        large_distance = torch.finfo(pairwise_dist.dtype).max
+        masked_dist = torch.where(
+            valid_keys.unsqueeze(1),
+            pairwise_dist,
+            torch.full_like(pairwise_dist, large_distance),
+        )
+        nearest_valid = masked_dist.argmin(dim=-1)
+        selected_indices = torch.where(
+            valid_query_rows,
+            nearest_valid,
+            torch.full_like(nearest_valid, -1),
+        )
+        safe_selected = selected_indices.clamp_min(0).unsqueeze(-1).expand(-1, -1, source_patch_values.shape[-1])
+        gathered_values = torch.gather(source_patch_values, 1, safe_selected)
+        snapped_values = torch.where(
+            valid_query_rows.unsqueeze(-1),
+            gathered_values,
+            source_patch_values,
+        )
         return snapped_values, selected_indices
 
     def _predict_transport_field(
@@ -437,76 +442,67 @@ class PatchmatchHelpersMixin:
     ) -> torch.Tensor:
         batch_size, num_patches, _ = coords_flat.shape
         height, width = token_hw
-        dense_attn = torch.eye(num_patches, device=coords_flat.device, dtype=value_dtype)
-        dense_attn = dense_attn.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
+        identity = torch.eye(num_patches, device=coords_flat.device, dtype=value_dtype)
+        identity = identity.unsqueeze(0).expand(batch_size, -1, -1)
         if selected_indices is not None:
-            for batch_idx in range(batch_size):
-                query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
-                if query_indices.numel() == 0:
-                    continue
-
-                replacement_rows = dense_attn.new_zeros((query_indices.numel(), num_patches))
-                chosen = selected_indices[batch_idx, query_indices]
-                valid_rows = chosen >= 0
-                if valid_rows.any():
-                    replacement_rows[valid_rows, chosen[valid_rows]] = 1.0
-                dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
-            return dense_attn
+            valid_rows = masked_queries & (selected_indices >= 0)
+            safe_selected = selected_indices.clamp_min(0)
+            replacement_rows = F.one_hot(safe_selected, num_classes=num_patches).to(dtype=value_dtype)
+            replacement_rows = replacement_rows * valid_rows.unsqueeze(-1).to(dtype=value_dtype)
+            dense_attn = torch.where(masked_queries.unsqueeze(-1), replacement_rows, identity)
+            return dense_attn.unsqueeze(1)
 
         width_scale = max(width - 1, 1)
         height_scale = max(height - 1, 1)
-
-        for batch_idx in range(batch_size):
-            query_indices = masked_queries[batch_idx].nonzero(as_tuple=False).flatten()
-            if query_indices.numel() == 0:
-                continue
-
-            coords = coords_flat[batch_idx, query_indices]
-            replacement_rows = dense_attn.new_zeros((query_indices.numel(), num_patches))
-            if validity_flat is None:
-                strength = replacement_rows.new_ones((query_indices.numel(), 1))
-            else:
-                strength = validity_flat[batch_idx, query_indices].to(dtype=replacement_rows.dtype).unsqueeze(-1)
-
-            x_pos = (coords[..., 0] + 1.0) * 0.5 * width_scale
-            y_pos = (coords[..., 1] + 1.0) * 0.5 * height_scale
-            x0 = x_pos.floor().long().clamp_(0, width - 1)
-            y0 = y_pos.floor().long().clamp_(0, height - 1)
-            x1 = (x0 + 1).clamp_(0, width - 1)
-            y1 = (y0 + 1).clamp_(0, height - 1)
-            wx1 = (x_pos - x0.to(dtype=x_pos.dtype)).clamp_(0.0, 1.0)
-            wy1 = (y_pos - y0.to(dtype=y_pos.dtype)).clamp_(0.0, 1.0)
-            wx0 = 1.0 - wx1
-            wy0 = 1.0 - wy1
-
-            candidate_indices = torch.stack(
-                [
-                    (y0 * width) + x0,
-                    (y0 * width) + x1,
-                    (y1 * width) + x0,
-                    (y1 * width) + x1,
-                ],
-                dim=-1,
+        coords = coords_flat
+        if validity_flat is None:
+            strength = torch.ones(
+                (batch_size, num_patches, 1),
+                device=coords.device,
+                dtype=value_dtype,
             )
-            bilinear_weights = torch.stack(
-                [
-                    wy0 * wx0,
-                    wy0 * wx1,
-                    wy1 * wx0,
-                    wy1 * wx1,
-                ],
-                dim=-1,
-            )
-            weighted = (bilinear_weights * strength).reshape(query_indices.numel(), -1)
-            replacement_rows.scatter_add_(
-                1,
-                candidate_indices.reshape(query_indices.numel(), -1),
-                weighted,
-            )
-            dense_attn[batch_idx, 0].index_copy_(0, query_indices, replacement_rows)
+        else:
+            strength = validity_flat.to(dtype=value_dtype).unsqueeze(-1)
 
-        return dense_attn
+        x_pos = (coords[..., 0] + 1.0) * 0.5 * width_scale
+        y_pos = (coords[..., 1] + 1.0) * 0.5 * height_scale
+        x0 = x_pos.floor().long().clamp_(0, width - 1)
+        y0 = y_pos.floor().long().clamp_(0, height - 1)
+        x1 = (x0 + 1).clamp_(0, width - 1)
+        y1 = (y0 + 1).clamp_(0, height - 1)
+        wx1 = (x_pos - x0.to(dtype=x_pos.dtype)).clamp_(0.0, 1.0)
+        wy1 = (y_pos - y0.to(dtype=y_pos.dtype)).clamp_(0.0, 1.0)
+        wx0 = 1.0 - wx1
+        wy0 = 1.0 - wy1
+
+        candidate_indices = torch.stack(
+            [
+                (y0 * width) + x0,
+                (y0 * width) + x1,
+                (y1 * width) + x0,
+                (y1 * width) + x1,
+            ],
+            dim=-1,
+        )
+        bilinear_weights = torch.stack(
+            [
+                wy0 * wx0,
+                wy0 * wx1,
+                wy1 * wx0,
+                wy1 * wx1,
+            ],
+            dim=-1,
+        ).to(dtype=value_dtype)
+        replacement_rows = torch.zeros(
+            (batch_size, num_patches, num_patches),
+            device=coords.device,
+            dtype=value_dtype,
+        )
+        weighted = bilinear_weights * strength * masked_queries.unsqueeze(-1).to(dtype=value_dtype)
+        replacement_rows.scatter_add_(2, candidate_indices, weighted)
+        dense_attn = torch.where(masked_queries.unsqueeze(-1), replacement_rows, identity)
+        return dense_attn.unsqueeze(1)
 
     def direct_patch_mix_masked_queries(
         self,
@@ -589,11 +585,8 @@ class PatchmatchHelpersMixin:
 
         mixed = self._flatten_patch_map(source_patch_map)
         mixed = default_tokens.clone() if default_tokens is not None else mixed.clone()
-        for batch_idx in range(batch_size):
-            query_indices = (query_mask_flat[batch_idx] > 0.5).nonzero(as_tuple=False).flatten()
-            if query_indices.numel() == 0:
-                continue
-            mixed[batch_idx].index_copy_(0, query_indices, sampled_values_flat[batch_idx, query_indices])
+        query_rows = (query_mask_flat > 0.5).unsqueeze(-1)
+        mixed = torch.where(query_rows, sampled_values_flat, mixed)
 
         hard_dense_attn = None
         if self.training and self.transport_train_selection == "straight_through_nearest_valid":
