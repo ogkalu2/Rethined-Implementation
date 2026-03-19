@@ -289,6 +289,14 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
         summary += f", r8_{retrieval_margin_label}={metrics['retrieval_recall8']:.3f}"
     if include_retrieval and "retrieval_recall32" in metrics:
         summary += f", r32_{retrieval_margin_label}={metrics['retrieval_recall32']:.3f}"
+    if "transport_selection_recall1_exact" in metrics:
+        summary += f", tr1_exact={metrics['transport_selection_recall1_exact']:.3f}"
+    if "transport_selection_recall1" in metrics:
+        summary += f", tr1_{retrieval_margin_label}={metrics['transport_selection_recall1']:.3f}"
+    if "transport_selection_recall8" in metrics:
+        summary += f", tr8_{retrieval_margin_label}={metrics['transport_selection_recall8']:.3f}"
+    if "transport_selection_recall32" in metrics:
+        summary += f", tr32_{retrieval_margin_label}={metrics['transport_selection_recall32']:.3f}"
     if "transport_patch" in metrics:
         summary += f", tp={metrics['transport_patch']:.4f}"
     if "transport_validity" in metrics:
@@ -304,7 +312,7 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
     return summary
 
 
-def format_val_retrieval_snapshot(metrics, retrieval_margin_label="3pct"):
+def format_val_selection_snapshot(metrics, retrieval_margin_label="3pct"):
     parts = []
     if "retrieval_recall1_exact" in metrics:
         parts.append(f"r1_exact={metrics['retrieval_recall1_exact']:.3f}")
@@ -314,6 +322,14 @@ def format_val_retrieval_snapshot(metrics, retrieval_margin_label="3pct"):
         parts.append(f"r8_{retrieval_margin_label}={metrics['retrieval_recall8']:.3f}")
     if "retrieval_recall32" in metrics:
         parts.append(f"r32_{retrieval_margin_label}={metrics['retrieval_recall32']:.3f}")
+    if "transport_selection_recall1_exact" in metrics:
+        parts.append(f"tr1_exact={metrics['transport_selection_recall1_exact']:.3f}")
+    if "transport_selection_recall1" in metrics:
+        parts.append(f"tr1_{retrieval_margin_label}={metrics['transport_selection_recall1']:.3f}")
+    if "transport_selection_recall8" in metrics:
+        parts.append(f"tr8_{retrieval_margin_label}={metrics['transport_selection_recall8']:.3f}")
+    if "transport_selection_recall32" in metrics:
+        parts.append(f"tr32_{retrieval_margin_label}={metrics['transport_selection_recall32']:.3f}")
     return ", ".join(parts)
 
 
@@ -420,6 +436,10 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
             for key, value in retrieval_metrics.items():
                 metric_sums[key] += float(value)
                 metric_counts[key] += 1
+            transport_selection_metrics = criterion.transport_selection_metrics(refine_target, attention_aux)
+            for key, value in transport_selection_metrics.items():
+                metric_sums[key] += float(value)
+                metric_counts[key] += 1
 
     model.train()
     if dist_ctx.enabled:
@@ -469,7 +489,16 @@ def validate_model(model, dataloader, device, use_amp, model_image_size, dist_ct
             else None
         ),
     }
-    for key in ("retrieval_recall1_exact", "retrieval_recall1", "retrieval_recall8", "retrieval_recall32"):
+    for key in (
+        "retrieval_recall1_exact",
+        "retrieval_recall1",
+        "retrieval_recall8",
+        "retrieval_recall32",
+        "transport_selection_recall1_exact",
+        "transport_selection_recall1",
+        "transport_selection_recall8",
+        "transport_selection_recall32",
+    ):
         value = mean_from(key)
         if value is not None:
             result[key] = value
@@ -888,6 +917,26 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar(f"retrieval/recall8_{retrieval_margin_label}", metrics["retrieval_recall8"], step)
             if "retrieval_recall32" in metrics:
                 writer.add_scalar(f"retrieval/recall32_{retrieval_margin_label}", metrics["retrieval_recall32"], step)
+            if "transport_selection_recall1_exact" in metrics:
+                writer.add_scalar("transport_selection/recall1_exact", metrics["transport_selection_recall1_exact"], step)
+            if "transport_selection_recall1" in metrics:
+                writer.add_scalar(
+                    f"transport_selection/recall1_{retrieval_margin_label}",
+                    metrics["transport_selection_recall1"],
+                    step,
+                )
+            if "transport_selection_recall8" in metrics:
+                writer.add_scalar(
+                    f"transport_selection/recall8_{retrieval_margin_label}",
+                    metrics["transport_selection_recall8"],
+                    step,
+                )
+            if "transport_selection_recall32" in metrics:
+                writer.add_scalar(
+                    f"transport_selection/recall32_{retrieval_margin_label}",
+                    metrics["transport_selection_recall32"],
+                    step,
+                )
             if "weight/retrieval_loss" in metrics:
                 writer.add_scalar("loss_weight/retrieval", metrics["weight/retrieval_loss"], step)
             if "weight/perceptual" in metrics:
@@ -913,6 +962,14 @@ def train(cfg, args, dist_ctx):
                     postfix[f"r8_{retrieval_margin_label}"] = f"{metrics['retrieval_recall8']:.3f}"
                 if "retrieval_recall32" in metrics:
                     postfix[f"r32_{retrieval_margin_label}"] = f"{metrics['retrieval_recall32']:.3f}"
+                if "transport_selection_recall1_exact" in metrics:
+                    postfix["tr1_exact"] = f"{metrics['transport_selection_recall1_exact']:.3f}"
+                if "transport_selection_recall1" in metrics:
+                    postfix[f"tr1_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall1']:.3f}"
+                if "transport_selection_recall8" in metrics:
+                    postfix[f"tr8_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall8']:.3f}"
+                if "transport_selection_recall32" in metrics:
+                    postfix[f"tr32_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall32']:.3f}"
                 progress_bar.set_postfix(postfix, refresh=False)
 
         eval_interval = log_cfg.get("eval_interval", 0)
@@ -947,8 +1004,32 @@ def train(cfg, args, dist_ctx):
                     writer.add_scalar(f"val/retrieval_recall8_{retrieval_margin_label}", val_metrics["retrieval_recall8"], step)
                 if "retrieval_recall32" in val_metrics:
                     writer.add_scalar(f"val/retrieval_recall32_{retrieval_margin_label}", val_metrics["retrieval_recall32"], step)
+                if "transport_selection_recall1_exact" in val_metrics:
+                    writer.add_scalar(
+                        "val/transport_selection/recall1_exact",
+                        val_metrics["transport_selection_recall1_exact"],
+                        step,
+                    )
+                if "transport_selection_recall1" in val_metrics:
+                    writer.add_scalar(
+                        f"val/transport_selection/recall1_{retrieval_margin_label}",
+                        val_metrics["transport_selection_recall1"],
+                        step,
+                    )
+                if "transport_selection_recall8" in val_metrics:
+                    writer.add_scalar(
+                        f"val/transport_selection/recall8_{retrieval_margin_label}",
+                        val_metrics["transport_selection_recall8"],
+                        step,
+                    )
+                if "transport_selection_recall32" in val_metrics:
+                    writer.add_scalar(
+                        f"val/transport_selection/recall32_{retrieval_margin_label}",
+                        val_metrics["transport_selection_recall32"],
+                        step,
+                    )
                 write_validation_history(log_cfg["log_dir"], step, val_metrics)
-                retrieval_snapshot = format_val_retrieval_snapshot(
+                retrieval_snapshot = format_val_selection_snapshot(
                     val_metrics,
                     retrieval_margin_label=retrieval_margin_label,
                 )

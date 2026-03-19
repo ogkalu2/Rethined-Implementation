@@ -266,6 +266,26 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             ys = ys / float(height - 1)
         return torch.stack([xs, ys], dim=-1)
 
+    def _normalized_transport_token_coords(
+        self,
+        indices: torch.Tensor,
+        token_hw: tuple[int, int],
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        height, width = token_hw
+        ys = torch.div(indices, width, rounding_mode="floor").to(dtype=dtype)
+        xs = (indices % width).to(dtype=dtype)
+        if width > 1:
+            xs = (xs / float(width - 1)) * 2.0 - 1.0
+        else:
+            xs = torch.full_like(xs, -1.0)
+        if height > 1:
+            ys = (ys / float(height - 1)) * 2.0 - 1.0
+        else:
+            ys = torch.full_like(ys, -1.0)
+        return torch.stack([xs, ys], dim=-1)
+
     def _adjacent_query_pairs(
         self,
         query_indices: torch.Tensor,
@@ -366,7 +386,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 continue
 
             query_coords = transport_coords[batch_idx, query_indices].float()
-            key_coords = self._normalized_token_coords(
+            key_coords = self._normalized_transport_token_coords(
                 key_indices,
                 token_hw,
                 dtype=query_coords.dtype,
@@ -385,20 +405,22 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self,
         refined_target: torch.Tensor,
         attention_aux: dict[str, object] | None,
+        *,
+        metric_prefix: str = "retrieval",
+        allow_metric_only: bool = False,
     ) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
         zero = refined_target.new_zeros(())
-        if not self.retrieval_supervision_enabled() or attention_aux is None:
+        if attention_aux is None:
+            return {}, {}
+        if not self.retrieval_supervision_enabled() and not allow_metric_only:
             return {}, {}
 
         loss_terms = {}
         metrics = {}
-        if attention_aux is None:
-            return loss_terms, metrics
-
         kernel_size = int(attention_aux.get("kernel_size", 0))
         query_mask_flat = attention_aux.get("query_mask_flat")
         supervision_entries = attention_aux.get("attention_supervision_entries")
-        compute_retrieval_losses = True
+        compute_retrieval_losses = self.retrieval_supervision_enabled()
         if supervision_entries is None and attention_aux.get("copy_mode") == "transport":
             supervision_entries = self._build_transport_supervision_entries(attention_aux)
             compute_retrieval_losses = False
@@ -540,13 +562,13 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             loss_terms["retrieval_coherence"] = torch.stack(retrieval_coherence_losses).mean()
 
         if retrieval_recall1_exact:
-            metrics["retrieval_recall1_exact"] = torch.stack(retrieval_recall1_exact).mean().item()
+            metrics[f"{metric_prefix}_recall1_exact"] = torch.stack(retrieval_recall1_exact).mean().item()
         if retrieval_recall1:
-            metrics["retrieval_recall1"] = torch.stack(retrieval_recall1).mean().item()
+            metrics[f"{metric_prefix}_recall1"] = torch.stack(retrieval_recall1).mean().item()
         if retrieval_recall8:
-            metrics["retrieval_recall8"] = torch.stack(retrieval_recall8).mean().item()
+            metrics[f"{metric_prefix}_recall8"] = torch.stack(retrieval_recall8).mean().item()
         if retrieval_recall32:
-            metrics["retrieval_recall32"] = torch.stack(retrieval_recall32).mean().item()
+            metrics[f"{metric_prefix}_recall32"] = torch.stack(retrieval_recall32).mean().item()
         return loss_terms, metrics
 
     def attention_supervision_metrics(
@@ -557,6 +579,21 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         if not self.retrieval_supervision_enabled():
             return {}
         _, metrics = self._attention_supervision_losses(refined_target, attention_aux)
+        return metrics
+
+    def transport_selection_metrics(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> dict[str, float]:
+        if attention_aux is None or attention_aux.get("copy_mode") != "transport":
+            return {}
+        _, metrics = self._attention_supervision_losses(
+            refined_target,
+            attention_aux,
+            metric_prefix="transport_selection",
+            allow_metric_only=True,
+        )
         return metrics
 
     def inpainter_loss(
@@ -577,6 +614,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             name: self._get_scheduled_weight(name)
             for name in self.SCHEDULED_WEIGHT_NAMES
         }
+        zero = refined_target.new_zeros(())
         total = (
             self.coarse_l2_weight * coarse_l2
             + self.refined_l1_weight * refined_l1
@@ -608,6 +646,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 loss_dict["retrieval_coherence_loss"] = attention_loss_terms["retrieval_coherence"].item()
             loss_dict["weight/retrieval_loss"] = scheduled_weights["retrieval_loss_weight"]
             loss_dict.update(attention_metrics)
+
+        loss_dict.update(self.transport_selection_metrics(refined_target, attention_aux))
 
         if self.transport_patch_supervision_enabled():
             transport_patch_loss, transport_patch_metrics = self._transport_patch_loss(refined_target, attention_aux)
