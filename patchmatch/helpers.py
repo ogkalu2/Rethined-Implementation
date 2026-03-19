@@ -308,7 +308,30 @@ class PatchmatchHelpersMixin:
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
 
         selected_indices = None
-        if not self.training and self.transport_eval_selection == "nearest_valid":
+        if self.training and self.transport_train_selection == "straight_through_nearest_valid":
+            coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
+            snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
+                source_patch_map,
+                coords_flat,
+                query_mask_flat,
+                key_valid_flat,
+                token_hw,
+                snap_mask_flat=query_mask_flat,
+            )
+            valid_rows = selected_indices >= 0
+            if default_tokens is not None:
+                snapped_values_flat = torch.where(
+                    valid_rows.unsqueeze(-1),
+                    snapped_values_flat,
+                    default_tokens,
+                )
+            straight_through_values = sampled_values_flat + (snapped_values_flat - sampled_values_flat).detach()
+            sampled_values_flat = torch.where(
+                valid_rows.unsqueeze(-1),
+                straight_through_values,
+                sampled_values_flat,
+            )
+        elif not self.training and self.transport_eval_selection == "nearest_valid":
             coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
             snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
@@ -542,14 +565,34 @@ class PatchmatchHelpersMixin:
                 continue
             mixed[batch_idx].index_copy_(0, query_indices, sampled_values_flat[batch_idx, query_indices])
 
-        dense_attn = self._build_transport_attention(
-            coords_flat,
-            query_mask_flat,
-            token_hw,
-            value_dtype=source_patch_map.dtype,
-            selected_indices=selected_indices,
-            validity_flat=sampled_validity_flat,
-        )
+        hard_dense_attn = None
+        if self.training and self.transport_train_selection == "straight_through_nearest_valid":
+            hard_dense_attn = self._build_transport_attention(
+                coords_flat,
+                query_mask_flat,
+                token_hw,
+                value_dtype=source_patch_map.dtype,
+                selected_indices=selected_indices,
+                validity_flat=sampled_validity_flat,
+            )
+            soft_dense_attn = self._build_transport_attention(
+                coords_flat,
+                query_mask_flat,
+                token_hw,
+                value_dtype=source_patch_map.dtype,
+                selected_indices=None,
+                validity_flat=sampled_validity_flat,
+            )
+            dense_attn = soft_dense_attn + (hard_dense_attn - soft_dense_attn).detach()
+        else:
+            dense_attn = self._build_transport_attention(
+                coords_flat,
+                query_mask_flat,
+                token_hw,
+                value_dtype=source_patch_map.dtype,
+                selected_indices=selected_indices,
+                validity_flat=sampled_validity_flat,
+            )
         if return_aux_entries:
             return mixed, dense_attn, aux
         return mixed, dense_attn

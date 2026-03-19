@@ -30,6 +30,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         transport_refine_scale: float = 0.25,
         transport_fallback_validity_threshold: float = 0.1,
         transport_snap_to_valid_eval: bool = True,
+        transport_train_selection: str = "bilinear",
         transport_eval_selection: str = "bilinear",
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
@@ -157,6 +158,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_refine_scale = float(transport_refine_scale)
         self.transport_fallback_validity_threshold = float(transport_fallback_validity_threshold)
         self.transport_snap_to_valid_eval = bool(transport_snap_to_valid_eval)
+        self.transport_train_selection = str(transport_train_selection).lower()
         self.transport_eval_selection = str(transport_eval_selection).lower()
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
         if self.attention_top_k is not None and self.attention_top_k <= 0:
@@ -169,6 +171,10 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             raise ValueError("transport_refine_scale must be non-negative.")
         if not 0.0 <= self.transport_fallback_validity_threshold <= 1.0:
             raise ValueError("transport_fallback_validity_threshold must be in [0, 1].")
+        if self.transport_train_selection not in {"bilinear", "straight_through_nearest_valid"}:
+            raise ValueError(
+                "transport_train_selection must be one of {'bilinear', 'straight_through_nearest_valid'}."
+            )
         if self.transport_eval_selection not in {"bilinear", "nearest_valid"}:
             raise ValueError("transport_eval_selection must be one of {'bilinear', 'nearest_valid'}.")
 
