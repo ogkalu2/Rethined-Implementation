@@ -19,7 +19,8 @@ from data.dataset import get_dataloader
 from device_utils import empty_device_cache, get_device_name, is_amp_enabled, resolve_device, time_device_call
 from upscale import AttentionUpscaling
 from model import InpaintingModel
-from train import build_model_config, composite_with_known, load_model_checkpoint, prepare_multiscale_batch
+from train.checkpoints import load_model_checkpoint
+from train.common import build_model_config, composite_with_known, prepare_multiscale_batch
 
 
 def load_model(checkpoint_path, cfg, device, random_init=False):

@@ -72,11 +72,11 @@ data:
   force_random_masks_eval: true
 
 training:
-  total_steps: 30000
+  total_epochs: 50
   grad_accum_steps: 4
   lr: 0.001
   scorer_lr: 0.0005
-  warmup_steps: 2000
+  warmup_epochs: 5
   min_lr: 0.000001
   scorer_min_lr: 0.000001
   grad_clip: 1.0
@@ -110,10 +110,10 @@ loss:
 logging:
   log_dir: "logs/train_main"
   log_interval: 50
-  vis_interval: 1000
-  eval_interval: 1000
+  vis_interval_epochs: 5
+  eval_interval_epochs: 5
   eval_batches: 16
-  save_interval: 5000
+  save_interval_epochs: 10
   save_checkpoints: true
   save_best_checkpoint: true
   save_best_metric: "masked_l1_hr_refined"

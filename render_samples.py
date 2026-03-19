@@ -13,7 +13,8 @@ from torchvision.utils import save_image
 from data.dataset import InpaintingDataset
 from device_utils import resolve_device
 from model import InpaintingModel
-from train import build_model_config, composite_with_known, load_model_checkpoint
+from train.checkpoints import load_model_checkpoint
+from train.common import build_model_config, composite_with_known
 
 
 def load_model_and_cfg(checkpoint_path: Path, config_path: Path, device: torch.device):

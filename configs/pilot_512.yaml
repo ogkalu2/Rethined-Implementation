@@ -64,11 +64,11 @@ data:
   force_random_masks_eval: true
 
 training:
-  total_steps: 3000
+  total_epochs: 66
   grad_accum_steps: 4
   lr: 0.001
   scorer_lr: 0.0005
-  warmup_steps: 200
+  warmup_epochs: 5
   min_lr: 0.000001
   scorer_min_lr: 0.000001
   grad_clip: 1.0
@@ -102,15 +102,15 @@ loss:
 logging:
   log_dir: "logs/pilot_512"
   log_interval: 25
-  vis_interval: 250
-  eval_interval: 250
+  vis_interval_epochs: 5
+  eval_interval_epochs: 5
   eval_batches: 8
-  save_interval: 1000
+  save_interval_epochs: 22
   save_checkpoints: true
   save_best_checkpoint: true
   save_best_metric: "masked_l1_hr_refined"
   save_best_mode: "min"
   save_final_checkpoint: true
-  checkpoint_steps: [1000, 3000]
+  checkpoint_epochs: [21.978, 65.934]
   keep_last_checkpoints: 3
   print_train_metrics: true
