@@ -9,7 +9,7 @@ model:
   inpainter:
     kernel_size: 8
     value_patch_size: 8
-    attention_temperature: 0.5
+    attention_temperature: 0.25
     attention_top_k: 32
     attention_selection: "softmax"
     attention_eval_selection: "argmax"
