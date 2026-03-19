@@ -303,9 +303,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         coarse_raw, features = self.encoder_decoder(image)
         known_image = image if value_image is None else value_image
         coarse_composite = coarse_raw * mask + known_image * (1 - mask)
-        # Keep transport matching on raw coarse tokens to mirror the original transport
-        # path. The attention path can still use the composite token source.
-        coarse_token_source = coarse_raw if self.use_transport else coarse_composite
+        # Restore the pre-25ed075 behavior: build matching tokens from the raw coarse
+        # prediction for both transport and attention paths.
+        coarse_token_source = coarse_raw
 
         patch_map, output_size = self.unfold_native(coarse_token_source, self.kernel_size)
         source_patch_map, _ = self.extract_patches(
