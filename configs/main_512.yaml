@@ -8,7 +8,7 @@ model:
   inpainter:
     kernel_size: 8
     value_patch_size: 8
-    attention_temperature: 0.1
+    attention_temperature: 0.5
     attention_top_k: 32
     attention_selection: "softmax"
     attention_eval_selection: "argmax"
@@ -99,7 +99,7 @@ loss:
   retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
-  transport_selection_weight: 0.1
+  transport_selection_weight: 1.5
   transport_selection_temperature: 0.2
   transport_validity_weight: 0.1
   transport_offset_smoothness_weight: 0.01
@@ -121,4 +121,4 @@ logging:
   save_best_mode: "min"
   save_final_checkpoint: true
   keep_last_checkpoints: 3
-  print_train_metrics: false
+  print_train_metrics: true
