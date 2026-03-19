@@ -11,7 +11,7 @@ model:
     value_patch_size: 8
     attention_temperature: 0.5
     attention_top_k: 32
-    attention_selection: "softmax"
+    attention_selection: "gumbel"
     attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
     use_transport: true
