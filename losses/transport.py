@@ -18,7 +18,11 @@ class TransportLossMixin:
             return zero, metrics
 
         query_mask_flat = attention_aux.get("query_mask_flat")
-        transport_values = attention_aux.get("transport_values")
+        # Prefer the differentiable pre-snap transport samples when available.
+        transport_values = attention_aux.get("transport_copy_values")
+        if transport_values is None:
+            transport_values = attention_aux.get("transport_values")
+        transport_validity = attention_aux.get("transport_validity")
         kernel_size = int(attention_aux.get("kernel_size", 0))
         value_patch_size = int(attention_aux.get("value_patch_size", 0))
         value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
@@ -43,7 +47,11 @@ class TransportLossMixin:
                 per_query = (
                     transport_values[batch_idx, masked_queries] - target_patches[batch_idx, masked_queries]
                 ).abs().mean(dim=-1)
-                losses.append(per_query.mean())
+                if transport_validity is not None:
+                    weights = transport_validity[batch_idx, masked_queries].detach().float().clamp_min(1e-3)
+                    losses.append((per_query * weights).sum() / weights.sum().clamp_min(1e-6))
+                else:
+                    losses.append(per_query.mean())
         if not losses:
             return zero, metrics
 
@@ -73,7 +81,10 @@ class TransportLossMixin:
             return zero, metrics
 
         query_mask_flat = transport_self_aux.get("query_mask_flat")
-        transport_values = transport_self_aux.get("transport_values")
+        transport_values = transport_self_aux.get("transport_copy_values")
+        if transport_values is None:
+            transport_values = transport_self_aux.get("transport_values")
+        transport_validity = transport_self_aux.get("transport_validity")
         if query_mask_flat is None or transport_values is None:
             return zero, metrics
 
@@ -90,7 +101,11 @@ class TransportLossMixin:
                 per_query = (
                     transport_values[batch_idx, self_queries] - target_patches[batch_idx, self_queries]
                 ).abs().mean(dim=-1)
-                losses.append(per_query.mean())
+                if transport_validity is not None:
+                    weights = transport_validity[batch_idx, self_queries].detach().float().clamp_min(1e-3)
+                    losses.append((per_query * weights).sum() / weights.sum().clamp_min(1e-6))
+                else:
+                    losses.append(per_query.mean())
         if not losses:
             return zero, metrics
 
