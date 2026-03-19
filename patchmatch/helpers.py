@@ -227,14 +227,8 @@ class PatchmatchHelpersMixin:
         coords: torch.Tensor,
         sampled_validity: torch.Tensor,
     ) -> torch.Tensor:
-        bilinear_values = self._sample_transport_map(source_patch_map, coords, mode="bilinear")
-        nearest_values = self._sample_transport_map(source_patch_map, coords, mode="nearest")
-        normalized_bilinear = torch.where(
-            sampled_validity > 1e-3,
-            bilinear_values / sampled_validity.clamp_min(1e-3).to(dtype=bilinear_values.dtype),
-            torch.zeros_like(bilinear_values),
-        )
-        return normalized_bilinear + (nearest_values - normalized_bilinear).detach()
+        sampled_values = self._sample_transport_map(source_patch_map, coords, mode="bilinear")
+        return sampled_values * sampled_validity.to(dtype=sampled_values.dtype)
 
     def _sample_transport_self_mask(
         self,
@@ -378,8 +372,8 @@ class PatchmatchHelpersMixin:
             coords,
             mode="nearest",
         ).clamp(0.0, 1.0)
-        normalized_values = self._sample_transport_source_values(source_patch_map, coords, sampled_validity)
-        sampled_values_flat = normalized_values.flatten(start_dim=2).transpose(1, 2)
+        sampled_values = self._sample_transport_source_values(source_patch_map, coords, sampled_validity)
+        sampled_values_flat = sampled_values.flatten(start_dim=2).transpose(1, 2)
         sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
         hard_validity_flat = hard_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
         fallback_mask = hard_validity_flat < self.transport_fallback_validity_threshold
@@ -388,9 +382,9 @@ class PatchmatchHelpersMixin:
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
 
         selected_indices = None
-        # Preserve the differentiable transport path during training.
-        # Eval/inference can still snap to discrete valid patches.
-        if (not self.training) and self.transport_snap_to_valid_eval:
+        # Snapping only makes sense when a fallback target exists; otherwise it creates
+        # a train/eval mismatch for the default transport path.
+        if (not self.training) and self.transport_snap_to_valid_eval and default_tokens is not None:
             coords_flat = coords.flatten(start_dim=2).transpose(1, 2)
             snapped_values_flat, selected_indices = self._snap_transport_to_valid_patches(
                 source_patch_map,
@@ -414,7 +408,7 @@ class PatchmatchHelpersMixin:
             "key_valid_flat": key_valid_flat,
             "transport_coords": coords.flatten(start_dim=2).transpose(1, 2),
             "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
-            "transport_copy_values": normalized_values.flatten(start_dim=2).transpose(1, 2),
+            "transport_copy_values": sampled_values.flatten(start_dim=2).transpose(1, 2),
             "transport_values": sampled_values_flat,
             "transport_validity": sampled_validity_flat,
             "transport_hard_validity": hard_validity_flat,
