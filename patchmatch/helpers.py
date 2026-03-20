@@ -259,10 +259,32 @@ class PatchmatchHelpersMixin:
             dtype=query_token_map.dtype,
             device=query_token_map.device,
         ).expand(batch_size, -1, -1, -1)
+        coords_anchor = base_coords
+
+        valid_keys = key_valid_flat > 0.5
+        has_valid_keys = valid_keys.any(dim=1, keepdim=True)
+        safe_valid_keys = torch.where(has_valid_keys, valid_keys, torch.ones_like(valid_keys))
+        key_mask = safe_valid_keys.to(dtype=query_tokens_full.dtype).unsqueeze(1).unsqueeze(1)
+        _, scorer_logits = self.multihead_attention.compute_attention_logits(
+            query_tokens_full,
+            key_tokens_full,
+            post_softmax_mask=key_mask,
+            query_mask_flat=query_mask_flat,
+        )
+        scorer_probs = F.softmax(scorer_logits.float(), dim=-1).mean(dim=1)
+        key_coords_flat = base_coords.flatten(start_dim=2).transpose(1, 2).to(dtype=scorer_probs.dtype)
+        scorer_prior_flat = torch.matmul(scorer_probs, key_coords_flat)
+        active_queries = (query_mask_flat > 0.5) & has_valid_keys
+        anchor_flat = torch.where(
+            active_queries.unsqueeze(-1),
+            scorer_prior_flat,
+            key_coords_flat,
+        )
+        coords_anchor = anchor_flat.transpose(1, 2).contiguous().view(batch_size, 2, height, width).to(dtype=base_coords.dtype)
 
         init_input = torch.cat([query_token_map, query_mask_map], dim=1)
         init_offsets = torch.tanh(self.transport_init_head(init_input)) * self.transport_offset_scale
-        coords = torch.clamp(base_coords + init_offsets, -1.0, 1.0)
+        coords = torch.clamp(coords_anchor + init_offsets, -1.0, 1.0)
 
         sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
         sampled_validity = self._sample_transport_map(valid_key_map, coords)
