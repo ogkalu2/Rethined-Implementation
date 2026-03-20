@@ -129,6 +129,12 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
         summary += f", tp={metrics['transport_patch']:.4f}"
     if "transport_selection_loss" in metrics:
         summary += f", tsel={metrics['transport_selection_loss']:.4f}"
+    if "copy_usage" in metrics:
+        summary += f", cup={metrics['copy_usage']:.4f}"
+    if "copy_max_key_share" in metrics:
+        summary += f", cmax={metrics['copy_max_key_share']:.3f}"
+    if "copy_unique_key_ratio" in metrics:
+        summary += f", cur={metrics['copy_unique_key_ratio']:.3f}"
     if "transport_validity" in metrics:
         summary += f", tval={metrics['transport_validity']:.4f}"
     if "transport_valid_ratio" in metrics:

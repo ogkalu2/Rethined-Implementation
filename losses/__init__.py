@@ -90,8 +90,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         retrieval_hard_ce_weight: float = 0.0,
         retrieval_top1_margin_weight: float = 0.0,
         retrieval_top1_margin: float = 0.0,
-        retrieval_coherence_weight: float = 0.0,
-        retrieval_coherence_sigma: float = 0.1,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
         retrieval_target_margin_pct: float = 0.03,
@@ -101,6 +99,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         transport_validity_weight: float = 0.1,
         transport_offset_smoothness_weight: float = 0.01,
         transport_offset_edge_scale: float = 5.0,
+        copy_usage_weight: float = 0.0,
         loss_schedule_focus_steps: int = 0,
         loss_schedule_transition_steps: int = 0,
         retrieval_loss_weight_start: float | None = None,
@@ -115,8 +114,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
         self.retrieval_top1_margin_weight = float(retrieval_top1_margin_weight)
         self.retrieval_top1_margin = float(retrieval_top1_margin)
-        self.retrieval_coherence_weight = float(retrieval_coherence_weight)
-        self.retrieval_coherence_sigma = float(retrieval_coherence_sigma)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
@@ -126,6 +123,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.transport_validity_weight = float(transport_validity_weight)
         self.transport_offset_smoothness_weight = float(transport_offset_smoothness_weight)
         self.transport_offset_edge_scale = float(transport_offset_edge_scale)
+        self.copy_usage_weight = float(copy_usage_weight)
         self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
         self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
         self.perceptual_weight = float(perceptual_weight)
@@ -133,8 +131,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raise ValueError("retrieval_teacher_temperature must be positive.")
         if self.retrieval_top1_margin < 0:
             raise ValueError("retrieval_top1_margin must be non-negative.")
-        if self.retrieval_coherence_sigma <= 0:
-            raise ValueError("retrieval_coherence_sigma must be positive.")
         if self.transport_patch_weight < 0:
             raise ValueError("transport_patch_weight must be non-negative.")
         if self.transport_selection_weight < 0:
@@ -147,6 +143,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raise ValueError("transport_offset_smoothness_weight must be non-negative.")
         if self.transport_offset_edge_scale < 0:
             raise ValueError("transport_offset_edge_scale must be non-negative.")
+        if self.copy_usage_weight < 0:
+            raise ValueError("copy_usage_weight must be non-negative.")
 
         self.perceptual_loss = PerceptualLoss()
         self.current_training_step = 0
@@ -175,7 +173,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             self._get_scheduled_weight("retrieval_loss_weight") > 0
             or self.retrieval_hard_ce_weight > 0
             or self.retrieval_top1_margin_weight > 0
-            or self.retrieval_coherence_weight > 0
         )
 
     def transport_patch_supervision_enabled(self) -> bool:
@@ -189,6 +186,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
     def transport_smoothness_supervision_enabled(self) -> bool:
         return self.transport_offset_smoothness_weight > 0
+
+    def copy_usage_supervision_enabled(self) -> bool:
+        return self.copy_usage_weight > 0
 
     def _get_scheduled_weight(self, name: str) -> float:
         base_weight = self._base_weight_values[name]
@@ -261,21 +261,154 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
     def _normalize_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         return patch_tokens.float()
 
-    def _normalized_token_coords(
+    def _teacher_patch_banks(
         self,
-        indices: torch.Tensor,
-        token_hw: tuple[int, int],
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object],
         *,
-        dtype: torch.dtype,
-    ) -> torch.Tensor:
-        height, width = token_hw
-        ys = torch.div(indices, width, rounding_mode="floor").to(dtype=dtype)
-        xs = (indices % width).to(dtype=dtype)
-        if width > 1:
-            xs = xs / float(width - 1)
-        if height > 1:
-            ys = ys / float(height - 1)
-        return torch.stack([xs, ys], dim=-1)
+        kernel_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        candidate_patch_bank = attention_aux.get("candidate_patch_bank")
+        candidate_source_image = attention_aux.get("candidate_source_image")
+        value_patch_size = int(attention_aux.get("value_patch_size", 0))
+        value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
+        if candidate_patch_bank is not None and kernel_size > 0 and value_patch_size > 0:
+            if candidate_source_image is not None and self.retrieval_teacher_patch_padding > 0:
+                teacher_patch_size = value_patch_size + 2 * self.retrieval_teacher_patch_padding
+                query_teacher_bank = self._extract_patch_tokens(
+                    refined_target,
+                    patch_size=teacher_patch_size,
+                    stride=kernel_size,
+                    padding=self.retrieval_teacher_patch_padding,
+                )
+                key_teacher_bank = self._extract_patch_tokens(
+                    candidate_source_image,
+                    patch_size=teacher_patch_size,
+                    stride=kernel_size,
+                    padding=self.retrieval_teacher_patch_padding,
+                )
+                return (
+                    self._normalize_patch_tokens(query_teacher_bank),
+                    self._normalize_patch_tokens(key_teacher_bank),
+                )
+            query_teacher_bank = self._extract_patch_tokens(
+                refined_target,
+                patch_size=value_patch_size,
+                stride=kernel_size,
+                padding=value_patch_padding,
+            )
+            return (
+                self._normalize_patch_tokens(query_teacher_bank),
+                self._normalize_patch_tokens(candidate_patch_bank),
+            )
+
+        teacher_patch_size = kernel_size + 2 * self.retrieval_teacher_patch_padding
+        teacher_bank = self._extract_patch_tokens(
+            refined_target,
+            patch_size=teacher_patch_size,
+            stride=kernel_size,
+            padding=self.retrieval_teacher_patch_padding,
+        )
+        teacher_bank = self._normalize_patch_tokens(teacher_bank)
+        return teacher_bank, teacher_bank
+
+    def _copy_usage_loss(
+        self,
+        refined_target: torch.Tensor,
+        attention_aux: dict[str, object] | None,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        zero = refined_target.new_zeros(())
+        metrics = {
+            "copy_usage": 0.0,
+            "copy_max_key_share": 0.0,
+            "copy_unique_key_ratio": 0.0,
+        }
+        if attention_aux is None:
+            return zero, metrics
+
+        kernel_size = int(attention_aux.get("kernel_size", 0))
+        query_mask_flat = attention_aux.get("query_mask_flat")
+        key_valid_flat = attention_aux.get("key_valid_flat")
+        selection_attention = attention_aux.get("selection_attention")
+        if (
+            kernel_size <= 0
+            or query_mask_flat is None
+            or key_valid_flat is None
+            or selection_attention is None
+        ):
+            return zero, metrics
+
+        selection_attention = selection_attention.float()
+        if selection_attention.dim() == 4:
+            selection_attention = selection_attention.mean(dim=1)
+        if selection_attention.dim() != 3:
+            return zero, metrics
+
+        query_teacher_bank, key_teacher_bank = self._teacher_patch_banks(
+            refined_target,
+            attention_aux,
+            kernel_size=kernel_size,
+        )
+
+        losses = []
+        max_key_shares = []
+        unique_key_ratios = []
+        masked_query_mask = query_mask_flat > 0.5
+        valid_key_mask = key_valid_flat > 0.5
+
+        for batch_idx in range(selection_attention.shape[0]):
+            query_indices = masked_query_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            key_indices = valid_key_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                continue
+
+            batch_probs = selection_attention[batch_idx].index_select(0, query_indices)
+            batch_probs = batch_probs.index_select(1, key_indices).clamp_min(0.0)
+            row_sums = batch_probs.sum(dim=-1, keepdim=True)
+            valid_rows = row_sums.squeeze(-1) > 1e-8
+            if not valid_rows.any():
+                continue
+
+            batch_probs = batch_probs[valid_rows] / row_sums[valid_rows].clamp_min(1e-8)
+            query_teacher_tokens = query_teacher_bank[batch_idx, query_indices[valid_rows]]
+            key_teacher_tokens = key_teacher_bank[batch_idx, key_indices]
+
+            teacher_distances = torch.cdist(
+                query_teacher_tokens.unsqueeze(0),
+                key_teacher_tokens.unsqueeze(0),
+                p=1,
+            ).squeeze(0)
+            min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
+            valid_targets_mask = teacher_distances <= (
+                min_teacher_dist * (1.0 + self.retrieval_target_margin_pct) + 1e-4
+            )
+            teacher_usage_rows = valid_targets_mask.float()
+            teacher_usage_rows = teacher_usage_rows / teacher_usage_rows.sum(dim=-1, keepdim=True).clamp_min(1.0)
+
+            predicted_usage = batch_probs.mean(dim=0)
+            predicted_usage = predicted_usage / predicted_usage.sum().clamp_min(1e-8)
+            teacher_usage = teacher_usage_rows.mean(dim=0)
+            teacher_usage = teacher_usage / teacher_usage.sum().clamp_min(1e-8)
+
+            usage_loss = torch.sum(
+                teacher_usage * (teacher_usage.clamp_min(1e-8).log() - predicted_usage.clamp_min(1e-8).log())
+            ) / max(int(predicted_usage.numel()), 1)
+            losses.append(usage_loss)
+
+            top1_keys = batch_probs.argmax(dim=-1)
+            key_hist = torch.bincount(top1_keys, minlength=batch_probs.shape[-1]).float()
+            key_hist_sum = key_hist.sum().clamp_min(1.0)
+            max_key_shares.append((key_hist.max() / key_hist_sum).item())
+            unique_key_ratios.append((key_hist > 0).float().mean().item())
+
+        if not losses:
+            return zero, metrics
+
+        loss = torch.stack(losses).mean()
+        metrics["copy_usage"] = loss.item()
+        metrics["copy_max_key_share"] = sum(max_key_shares) / len(max_key_shares)
+        metrics["copy_unique_key_ratio"] = sum(unique_key_ratios) / len(unique_key_ratios)
+        return loss, metrics
 
     def _normalized_transport_token_coords(
         self,
@@ -296,68 +429,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         else:
             ys = torch.full_like(ys, -1.0)
         return torch.stack([xs, ys], dim=-1)
-
-    def _adjacent_query_pairs(
-        self,
-        query_indices: torch.Tensor,
-        token_hw: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if query_indices.numel() <= 1:
-            empty = query_indices.new_empty((0,), dtype=torch.long)
-            return empty, empty
-
-        height, width = token_hw
-        num_tokens = height * width
-        order = torch.full((num_tokens,), -1, device=query_indices.device, dtype=torch.long)
-        local_order = torch.arange(query_indices.numel(), device=query_indices.device)
-        order[query_indices] = local_order
-
-        right_mask = (query_indices % width) < (width - 1)
-        right_sources = local_order[right_mask]
-        right_targets = order[query_indices[right_mask] + 1]
-        right_valid = right_targets >= 0
-
-        down_mask = (query_indices + width) < num_tokens
-        down_sources = local_order[down_mask]
-        down_targets = order[query_indices[down_mask] + width]
-        down_valid = down_targets >= 0
-
-        src = torch.cat([right_sources[right_valid], down_sources[down_valid]], dim=0)
-        dst = torch.cat([right_targets[right_valid], down_targets[down_valid]], dim=0)
-        return src, dst
-
-    def _retrieval_coherence_loss(
-        self,
-        pred_probs: torch.Tensor,
-        query_indices: torch.Tensor,
-        key_indices: torch.Tensor,
-        query_teacher_tokens: torch.Tensor,
-        token_hw: tuple[int, int],
-    ) -> torch.Tensor:
-        if pred_probs.shape[0] <= 1 or pred_probs.shape[-1] <= 0:
-            return pred_probs.new_zeros(())
-
-        pair_src, pair_dst = self._adjacent_query_pairs(query_indices, token_hw)
-        if pair_src.numel() == 0:
-            return pred_probs.new_zeros(())
-
-        key_coords = self._normalized_token_coords(
-            key_indices,
-            token_hw,
-            dtype=pred_probs.dtype,
-        )
-        expected_source_coords = pred_probs @ key_coords
-
-        query_patch_dists = (
-            query_teacher_tokens[pair_src] - query_teacher_tokens[pair_dst]
-        ).abs().mean(dim=-1)
-        pair_weights = torch.exp(-query_patch_dists / self.retrieval_coherence_sigma)
-        coord_diffs = F.smooth_l1_loss(
-            expected_source_coords[pair_src],
-            expected_source_coords[pair_dst],
-            reduction="none",
-        ).mean(dim=-1)
-        return (coord_diffs * pair_weights).mean()
 
     def _build_transport_supervision_entries(
         self,
@@ -444,19 +515,15 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         ):
             return loss_terms, metrics
 
-        teacher_patch_size = kernel_size + 2 * self.retrieval_teacher_patch_padding
-        teacher_tokens = self._extract_patch_tokens(
+        query_teacher_bank, key_teacher_bank = self._teacher_patch_banks(
             refined_target,
-            patch_size=teacher_patch_size,
-            stride=kernel_size,
-            padding=self.retrieval_teacher_patch_padding,
+            attention_aux,
+            kernel_size=kernel_size,
         )
-        teacher_tokens = self._normalize_patch_tokens(teacher_tokens)
 
         retrieval_losses = []
         retrieval_hard_ce_losses = []
         retrieval_top1_margin_losses = []
-        retrieval_coherence_losses = []
         retrieval_recall1_exact = []
         retrieval_recall1 = []
         retrieval_recall8 = []
@@ -475,8 +542,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raw_logits = raw_logits.float()
             ranking_scores = raw_logits if ranking_scores is None else ranking_scores.float()
             batch_query_mask = query_mask_flat[batch_idx, query_indices] > 0.5
-            query_teacher_tokens = teacher_tokens[batch_idx, query_indices]
-            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
+            query_teacher_tokens = query_teacher_bank[batch_idx, query_indices]
+            key_teacher_tokens = key_teacher_bank[batch_idx, key_indices]
             teacher_distances = torch.cdist(
                 query_teacher_tokens.unsqueeze(0),
                 key_teacher_tokens.unsqueeze(0),
@@ -508,9 +575,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 masked_raw_logits = ranking_scores[batch_query_mask]
                 masked_exact_targets = exact_targets_mask[batch_query_mask]
                 masked_valid_targets = valid_targets_mask[batch_query_mask]
-                masked_query_indices = query_indices[batch_query_mask]
-                masked_query_teacher_tokens = query_teacher_tokens[batch_query_mask]
-
                 masked_pred_probs = pred_probs[batch_query_mask]
                 if compute_retrieval_losses:
                     retrieval_losses.append(
@@ -522,19 +586,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                     retrieval_hard_ce_losses.append(
                         -valid_probs_sum.log().mean()
                     )
-
-                    if self.retrieval_coherence_weight > 0.0:
-                        token_hw = entry.get("token_hw") or attention_aux.get("token_hw")
-                        if token_hw is not None:
-                            retrieval_coherence_losses.append(
-                                self._retrieval_coherence_loss(
-                                    masked_pred_probs,
-                                    masked_query_indices,
-                                    key_indices,
-                                    masked_query_teacher_tokens,
-                                    tuple(token_hw),
-                                )
-                            )
 
                     if self.retrieval_top1_margin_weight > 0.0 and masked_raw_logits.shape[-1] > 1:
                         # Align the margin with the tolerant valid-target set so near-equivalent
@@ -571,8 +622,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
         if retrieval_top1_margin_losses:
             loss_terms["retrieval_top1_margin"] = torch.stack(retrieval_top1_margin_losses).mean()
-        if retrieval_coherence_losses:
-            loss_terms["retrieval_coherence"] = torch.stack(retrieval_coherence_losses).mean()
 
         if retrieval_recall1_exact:
             metrics[f"{metric_prefix}_recall1_exact"] = torch.stack(retrieval_recall1_exact).mean().item()
@@ -601,9 +650,11 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
     ) -> dict[str, float]:
         if attention_aux is None or attention_aux.get("copy_mode") != "transport":
             return {}
+        metric_aux = dict(attention_aux)
+        metric_aux["attention_supervision_entries"] = None
         _, metrics = self._attention_supervision_losses(
             refined_target,
-            attention_aux,
+            metric_aux,
             metric_prefix="transport_selection",
             allow_metric_only=True,
         )
@@ -629,14 +680,11 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         ):
             return zero, metrics
 
-        teacher_patch_size = kernel_size + 2 * self.retrieval_teacher_patch_padding
-        teacher_tokens = self._extract_patch_tokens(
+        query_teacher_bank, key_teacher_bank = self._teacher_patch_banks(
             refined_target,
-            patch_size=teacher_patch_size,
-            stride=kernel_size,
-            padding=self.retrieval_teacher_patch_padding,
+            attention_aux,
+            kernel_size=kernel_size,
         )
-        teacher_tokens = self._normalize_patch_tokens(teacher_tokens)
 
         losses = []
         for batch_idx, entry in enumerate(supervision_entries):
@@ -651,8 +699,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 continue
 
             masked_raw_logits = raw_logits[masked_queries].float()
-            query_teacher_tokens = teacher_tokens[batch_idx, query_indices[masked_queries]]
-            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
+            query_teacher_tokens = query_teacher_bank[batch_idx, query_indices[masked_queries]]
+            key_teacher_tokens = key_teacher_bank[batch_idx, key_indices]
             teacher_distances = torch.cdist(
                 query_teacher_tokens.unsqueeze(0),
                 key_teacher_tokens.unsqueeze(0),
@@ -715,7 +763,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms.get("retrieval", zero)
                 + self.retrieval_hard_ce_weight * attention_loss_terms.get("retrieval_hard_ce", zero)
                 + self.retrieval_top1_margin_weight * attention_loss_terms.get("retrieval_top1_margin", zero)
-                + self.retrieval_coherence_weight * attention_loss_terms.get("retrieval_coherence", zero)
             )
             if "retrieval" in attention_loss_terms:
                 loss_dict["retrieval_loss"] = attention_loss_terms["retrieval"].item()
@@ -723,12 +770,17 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 loss_dict["retrieval_hard_ce_loss"] = attention_loss_terms["retrieval_hard_ce"].item()
             if "retrieval_top1_margin" in attention_loss_terms:
                 loss_dict["retrieval_top1_margin_loss"] = attention_loss_terms["retrieval_top1_margin"].item()
-            if "retrieval_coherence" in attention_loss_terms:
-                loss_dict["retrieval_coherence_loss"] = attention_loss_terms["retrieval_coherence"].item()
             loss_dict["weight/retrieval_loss"] = scheduled_weights["retrieval_loss_weight"]
             loss_dict.update(attention_metrics)
 
         loss_dict.update(self.transport_selection_metrics(refined_target, attention_aux))
+
+        copy_usage_loss, copy_usage_metrics = self._copy_usage_loss(refined_target, attention_aux)
+        loss_dict["copy_usage"] = copy_usage_metrics["copy_usage"]
+        loss_dict["copy_max_key_share"] = copy_usage_metrics["copy_max_key_share"]
+        loss_dict["copy_unique_key_ratio"] = copy_usage_metrics["copy_unique_key_ratio"]
+        if self.copy_usage_supervision_enabled():
+            total = total + self.copy_usage_weight * copy_usage_loss
 
         if self.transport_patch_supervision_enabled():
             transport_patch_loss, transport_patch_metrics = self._transport_patch_loss(refined_target, attention_aux)
