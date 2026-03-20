@@ -494,6 +494,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "token_hw": token_hw,
                 "copy_mode": "transport" if self.use_transport else "attention",
                 "attention_supervision_entries": attention_supervision_entries,
+                "candidate_patch_bank": patch_values,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
             }

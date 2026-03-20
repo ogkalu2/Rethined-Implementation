@@ -91,7 +91,7 @@ loss:
   retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
-  transport_selection_weight: 1.5
+  transport_selection_weight: 0.5
   transport_selection_temperature: 0.2
   transport_validity_weight: 0.1
   transport_offset_smoothness_weight: 0.01
