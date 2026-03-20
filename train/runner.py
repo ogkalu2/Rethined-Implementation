@@ -66,7 +66,7 @@ def train(cfg, args, dist_ctx):
         "query_descriptor_head", "key_descriptor_head",
         "matching_descriptor_head", "shared_query_key_descriptor_head",
         "query_context_encoder", "key_context_encoder",
-        "query_context_descriptor_head", "query_context_scale",
+        "query_context_descriptor_head", "key_context_descriptor_head", "query_context_scale",
         "key_coarse_rgb_scale", "key_feature_scale",
         "pre_attention_norm", "multihead_attention",
     }
