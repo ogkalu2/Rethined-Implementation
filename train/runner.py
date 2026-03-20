@@ -345,6 +345,8 @@ def train(cfg, args, dist_ctx):
                     postfix[f"tr32_{retrieval_margin_label}"] = f"{metrics['transport_selection_recall32']:.3f}"
                 if "transport_selection_loss" in metrics:
                     postfix["tsel"] = f"{metrics['transport_selection_loss']:.4f}"
+                if "copy_max_key_share" in metrics:
+                    postfix["cmax"] = f"{metrics['copy_max_key_share']:.3f}"
             progress_bar.set_postfix(postfix, refresh=False)
 
         if dist_ctx.is_main_process and (step == 1 or step % log_cfg["log_interval"] == 0):
@@ -372,6 +374,12 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("loss/transport_offset_smoothness", metrics["transport_offset_smoothness"], step)
             if "transport_offset_curvature" in metrics:
                 writer.add_scalar("transport/offset_curvature", metrics["transport_offset_curvature"], step)
+            if "copy_usage" in metrics:
+                writer.add_scalar("loss/copy_usage", metrics["copy_usage"], step)
+            if "copy_max_key_share" in metrics:
+                writer.add_scalar("selection/max_key_share", metrics["copy_max_key_share"], step)
+            if "copy_unique_key_ratio" in metrics:
+                writer.add_scalar("selection/unique_key_ratio", metrics["copy_unique_key_ratio"], step)
             writer.add_scalar("loss/perceptual", metrics["perceptual"], step)
             writer.add_scalar("loss/inpainter_total", metrics["inpainter_total"], step)
             writer.add_scalar("loss/running_inpainter", running_g, step)
