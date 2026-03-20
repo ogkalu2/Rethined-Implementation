@@ -187,10 +187,176 @@ class PatchmatchHelpersMixin:
                 query_tokens[batch_idx : batch_idx + 1, query_indices],
                 key_tokens[batch_idx : batch_idx + 1, key_indices],
             )
-            entry["raw_logits"] = raw_logits.mean(dim=1).squeeze(0)
+            ranking_scores = raw_logits.mean(dim=1).squeeze(0)
+            if (
+                ranking_scores.shape[0] == query_tokens.shape[1]
+                and ranking_scores.shape[1] == key_tokens.shape[1]
+            ):
+                ranking_scores = ranking_scores.index_select(0, query_indices).index_select(1, key_indices)
+            else:
+                ranking_scores = ranking_scores[: query_indices.numel(), : key_indices.numel()]
+            entry["raw_logits"] = ranking_scores
             supervision_entries.append(entry)
 
         return supervision_entries
+
+    def _reduce_attention_logits_to_subset(
+        self,
+        raw_logits: torch.Tensor,
+        query_tokens: torch.Tensor,
+        key_tokens: torch.Tensor,
+        query_indices: torch.Tensor,
+        key_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        ranking_scores = raw_logits.mean(dim=1).squeeze(0)
+        if (
+            ranking_scores.shape[0] == query_tokens.shape[1]
+            and ranking_scores.shape[1] == key_tokens.shape[1]
+        ):
+            return ranking_scores.index_select(0, query_indices).index_select(1, key_indices)
+        return ranking_scores[: query_indices.numel(), : key_indices.numel()]
+
+    def _selection_top_k(self, num_keys: int) -> int:
+        top_k = self.attention_top_k
+        if top_k is None or top_k >= num_keys:
+            return int(num_keys)
+        return max(1, int(top_k))
+
+    def _build_joint_candidate_selection(
+        self,
+        query_tokens_full: torch.Tensor,
+        key_tokens_full: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> list[dict[str, torch.Tensor | tuple[int, int]]]:
+        selection_entries: list[dict[str, torch.Tensor | tuple[int, int]]] = []
+        masked_query_mask = query_mask_flat > 0.5
+        valid_key_mask = key_valid_flat > 0.5
+        token_coord_bank = self._get_normalized_token_coords(
+            token_hw,
+            dtype=query_tokens_full.dtype,
+            device=query_tokens_full.device,
+        ).flatten(start_dim=2).transpose(1, 2)
+
+        for batch_idx in range(query_tokens_full.shape[0]):
+            query_indices = masked_query_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            key_indices = valid_key_mask[batch_idx].nonzero(as_tuple=False).flatten()
+            entry: dict[str, torch.Tensor | tuple[int, int]] = {
+                "query_indices": query_indices,
+                "key_indices": key_indices,
+                "token_hw": token_hw,
+            }
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                empty_logits = query_tokens_full.new_empty((0, 0), dtype=torch.float32)
+                entry["raw_logits"] = empty_logits
+                entry["candidate_logits"] = empty_logits
+                entry["candidate_key_indices"] = query_indices.new_empty((0, 0))
+                entry["candidate_coords"] = query_tokens_full.new_empty((0, 0, 2))
+                entry["candidate_probs"] = empty_logits
+                entry["candidate_log_probs"] = empty_logits
+                selection_entries.append(entry)
+                continue
+
+            raw_logits, _ = self.multihead_attention.compute_attention_logits(
+                query_tokens_full[batch_idx : batch_idx + 1, query_indices],
+                key_tokens_full[batch_idx : batch_idx + 1, key_indices],
+            )
+            full_logits = self._reduce_attention_logits_to_subset(
+                raw_logits,
+                query_tokens_full,
+                key_tokens_full,
+                query_indices,
+                key_indices,
+            )
+
+            top_k = self._selection_top_k(full_logits.shape[-1])
+            topk_logits, topk_local = full_logits.topk(k=top_k, dim=-1)
+            candidate_key_indices = key_indices[topk_local]
+            candidate_key_tokens = key_tokens_full[batch_idx, candidate_key_indices]
+            candidate_coords = token_coord_bank[0, candidate_key_indices]
+
+            if self.joint_candidate_refiner is not None:
+                refined_topk_logits = self.joint_candidate_refiner(
+                    query_tokens_full[batch_idx, query_indices],
+                    query_indices,
+                    candidate_key_tokens,
+                    candidate_coords,
+                    topk_logits,
+                    token_hw,
+                )
+            else:
+                refined_topk_logits = topk_logits
+
+            candidate_probs = torch.softmax(refined_topk_logits, dim=-1)
+            candidate_log_probs = candidate_probs.clamp_min(1e-8).log()
+            entry["raw_logits"] = refined_topk_logits.float()
+            entry["candidate_logits"] = refined_topk_logits.float()
+            entry["candidate_key_indices"] = candidate_key_indices
+            entry["candidate_coords"] = candidate_coords
+            entry["candidate_probs"] = candidate_probs
+            entry["candidate_log_probs"] = candidate_log_probs
+            selection_entries.append(entry)
+
+        return selection_entries
+
+    def build_selection_prior_coords(
+        self,
+        query_tokens: torch.Tensor,
+        key_tokens: torch.Tensor,
+        query_mask_flat: torch.Tensor,
+        key_valid_flat: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        selection_entries = self._build_joint_candidate_selection(
+            query_tokens,
+            key_tokens,
+            query_mask_flat,
+            key_valid_flat,
+            token_hw,
+        )
+        return self._selection_prior_coords_from_entries(
+            selection_entries,
+            batch_size=query_tokens.shape[0],
+            num_patches=query_tokens.shape[1],
+            token_hw=token_hw,
+            dtype=query_tokens.dtype,
+            device=query_tokens.device,
+        )
+
+    def _selection_prior_coords_from_entries(
+        self,
+        selection_entries: list[dict[str, torch.Tensor | tuple[int, int]]],
+        *,
+        batch_size: int,
+        num_patches: int,
+        token_hw: tuple[int, int],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        base_coords = self._get_normalized_token_coords(
+            token_hw,
+            dtype=dtype,
+            device=device,
+        ).flatten(start_dim=2).transpose(1, 2).expand(batch_size, num_patches, -1).clone()
+        for batch_idx, entry in enumerate(selection_entries):
+            query_indices = entry["query_indices"]
+            if query_indices.numel() == 0:
+                continue
+            candidate_coords = entry["candidate_coords"]
+            candidate_probs = entry["candidate_probs"]
+            if self.joint_candidate_refiner is None:
+                best_local = candidate_probs.argmax(dim=-1)
+                base_coords[batch_idx, query_indices] = candidate_coords[
+                    torch.arange(candidate_coords.shape[0], device=candidate_coords.device),
+                    best_local,
+                ]
+            else:
+                base_coords[batch_idx, query_indices] = (
+                    candidate_probs.unsqueeze(-1) * candidate_coords
+                ).sum(dim=1)
+
+        return base_coords
 
     def _sample_transport_map(
         self,
@@ -283,10 +449,27 @@ class PatchmatchHelpersMixin:
             dtype=query_token_map.dtype,
             device=query_token_map.device,
         ).expand(batch_size, -1, -1, -1)
+        selection_entries = self._build_joint_candidate_selection(
+            query_tokens_full,
+            key_tokens_full,
+            query_mask_flat,
+            key_valid_flat,
+            token_hw,
+        )
+        prior_coords_flat = self._selection_prior_coords_from_entries(
+            selection_entries,
+            batch_size=batch_size,
+            num_patches=query_tokens_full.shape[1],
+            token_hw=token_hw,
+            dtype=query_token_map.dtype,
+            device=query_token_map.device,
+        )
+        prior_coords = prior_coords_flat.transpose(1, 2).contiguous().view(batch_size, 2, height, width)
 
         init_input = torch.cat([query_token_map, query_mask_map], dim=1)
         init_offsets = torch.tanh(self.transport_init_head(init_input)) * self.transport_offset_scale
-        coords = torch.clamp(base_coords + init_offsets, -1.0, 1.0)
+        coords = torch.where(query_mask_map > 0.5, prior_coords + init_offsets, base_coords)
+        coords = torch.clamp(coords, -1.0, 1.0)
 
         sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
         sampled_validity = self._sample_transport_map(valid_key_map, coords)
@@ -302,6 +485,8 @@ class PatchmatchHelpersMixin:
 
         return {
             "base_coords": base_coords,
+            "prior_coords": prior_coords,
+            "selection_entries": selection_entries,
             "coords": coords,
             "sampled_key_tokens": sampled_key_tokens,
             "sampled_validity": sampled_validity,
@@ -319,6 +504,8 @@ class PatchmatchHelpersMixin:
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         coords = transport_state["coords"]
         base_coords = transport_state["base_coords"]
+        prior_coords = transport_state.get("prior_coords")
+        selection_entries = transport_state.get("selection_entries")
         sampled_validity = transport_state["sampled_validity"]
 
         sampled_validity = sampled_validity.clamp(0.0, 1.0)
@@ -450,6 +637,10 @@ class PatchmatchHelpersMixin:
             "transport_fallback_mask": fallback_mask,
             "transport_effective_fallback_mask": effective_fallback_mask,
         }
+        if selection_entries is not None:
+            aux["attention_supervision_entries"] = selection_entries
+        if prior_coords is not None:
+            aux["transport_prior_coords"] = prior_coords.flatten(start_dim=2).transpose(1, 2)
         if selected_indices is not None:
             aux["transport_selected_indices"] = selected_indices
         return sampled_values_flat, aux
@@ -536,17 +727,63 @@ class PatchmatchHelpersMixin:
         query_mask_flat: torch.Tensor,
         key_valid_flat: torch.Tensor,
         default_tokens: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        token_hw: tuple[int, int] | None = None,
+        return_aux_entries: bool = False,
+        build_dense_attention: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, object]]:
         batch_size, num_patches, _ = query_tokens_full.shape
         mixed_default = patch_values if default_tokens is None else default_tokens
         mixed_default = mixed_default.clone()
-        eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
-        dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
+        dense_attn = None
+        if build_dense_attention:
+            eye = torch.eye(num_patches, device=patch_values.device, dtype=patch_values.dtype)
+            dense_attn = eye.unsqueeze(0).unsqueeze(0).repeat(batch_size, 1, 1, 1)
         masked_queries = query_mask_flat > 0.5
         valid_keys = key_valid_flat > 0.5
         has_valid_keys = valid_keys.any(dim=1, keepdim=True)
         safe_valid_keys = torch.where(has_valid_keys, valid_keys, torch.ones_like(valid_keys))
         key_mask = safe_valid_keys.to(dtype=query_tokens_full.dtype).unsqueeze(1).unsqueeze(1)
+
+        if self.joint_candidate_refiner is not None:
+            if token_hw is None:
+                raise ValueError("token_hw is required when joint candidate refinement is enabled.")
+            selection_entries = self._build_joint_candidate_selection(
+                query_tokens_full,
+                key_tokens_full,
+                query_mask_flat,
+                key_valid_flat,
+                token_hw,
+            )
+            mixed = mixed_default.clone()
+            for batch_idx, entry in enumerate(selection_entries):
+                query_indices = entry["query_indices"]
+                if query_indices.numel() == 0:
+                    continue
+                candidate_key_indices = entry["candidate_key_indices"]
+                candidate_probs = entry["candidate_probs"].to(dtype=patch_values.dtype)
+                candidate_patch_values = patch_values[batch_idx, candidate_key_indices]
+                mixed_queries = (candidate_probs.unsqueeze(-1) * candidate_patch_values).sum(dim=1)
+                mixed[batch_idx, query_indices] = mixed_queries
+                if dense_attn is not None:
+                    dense_attn[batch_idx, 0, query_indices] = 0
+                    dense_attn[batch_idx, 0, query_indices.unsqueeze(-1), candidate_key_indices] = (
+                        candidate_probs.to(dtype=dense_attn.dtype)
+                    )
+            if dense_attn is not None:
+                empty_key_queries = masked_queries & (~has_valid_keys)
+                dense_attn = torch.where(
+                    empty_key_queries.unsqueeze(1).unsqueeze(-1),
+                    torch.zeros_like(dense_attn),
+                    dense_attn,
+                )
+            if return_aux_entries:
+                return mixed, dense_attn, {
+                    "copy_mode": "attention",
+                    "selection_attention": dense_attn,
+                    "attention_supervision_entries": selection_entries,
+                }
+            return mixed, dense_attn
 
         mixed_all, probs_all = self.multihead_attention(
             query_tokens_full,
@@ -557,18 +794,24 @@ class PatchmatchHelpersMixin:
             query_mask_flat=query_mask_flat,
         )
         mixed_all = mixed_all.to(dtype=mixed_default.dtype)
-        probs_all = probs_all.to(dtype=dense_attn.dtype)
+        probs_all = probs_all.to(dtype=patch_values.dtype)
 
         active_queries = masked_queries & has_valid_keys
         mixed = torch.where(active_queries.unsqueeze(-1), mixed_all, mixed_default)
 
-        dense_attn = torch.where(active_queries.unsqueeze(1).unsqueeze(-1), probs_all, dense_attn)
-        empty_key_queries = masked_queries & (~has_valid_keys)
-        dense_attn = torch.where(
-            empty_key_queries.unsqueeze(1).unsqueeze(-1),
-            torch.zeros_like(dense_attn),
-            dense_attn,
-        )
+        if dense_attn is not None:
+            dense_attn = torch.where(active_queries.unsqueeze(1).unsqueeze(-1), probs_all.to(dtype=dense_attn.dtype), dense_attn)
+            empty_key_queries = masked_queries & (~has_valid_keys)
+            dense_attn = torch.where(
+                empty_key_queries.unsqueeze(1).unsqueeze(-1),
+                torch.zeros_like(dense_attn),
+                dense_attn,
+            )
+        if return_aux_entries:
+            return mixed, dense_attn, {
+                "copy_mode": "attention",
+                "selection_attention": dense_attn,
+            }
         return mixed, dense_attn
 
     def transport_patch_mix_masked_queries(
@@ -582,6 +825,7 @@ class PatchmatchHelpersMixin:
         token_hw: tuple[int, int] | None = None,
         default_tokens: torch.Tensor | None = None,
         return_aux_entries: bool = False,
+        build_dense_attention: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         if token_hw is None:
             raise ValueError("token_hw is required for transport patch mixing.")
@@ -612,34 +856,36 @@ class PatchmatchHelpersMixin:
         query_rows = (query_mask_flat > 0.5).unsqueeze(-1)
         mixed = torch.where(query_rows, sampled_values_flat, mixed)
 
-        hard_dense_attn = None
-        if self.training and self.transport_train_selection == "straight_through_nearest_valid":
-            hard_dense_attn = self._build_transport_attention(
-                coords_flat,
-                query_mask_flat,
-                token_hw,
-                value_dtype=source_patch_map.dtype,
-                selected_indices=selected_indices,
-                validity_flat=sampled_validity_flat,
-            )
-            soft_dense_attn = self._build_transport_attention(
-                coords_flat,
-                query_mask_flat,
-                token_hw,
-                value_dtype=source_patch_map.dtype,
-                selected_indices=None,
-                validity_flat=sampled_validity_flat,
-            )
-            dense_attn = soft_dense_attn + (hard_dense_attn - soft_dense_attn).detach()
-        else:
-            dense_attn = self._build_transport_attention(
-                coords_flat,
-                query_mask_flat,
-                token_hw,
-                value_dtype=source_patch_map.dtype,
-                selected_indices=selected_indices,
-                validity_flat=sampled_validity_flat,
-            )
+        dense_attn = None
+        if build_dense_attention:
+            hard_dense_attn = None
+            if self.training and self.transport_train_selection == "straight_through_nearest_valid":
+                hard_dense_attn = self._build_transport_attention(
+                    coords_flat,
+                    query_mask_flat,
+                    token_hw,
+                    value_dtype=source_patch_map.dtype,
+                    selected_indices=selected_indices,
+                    validity_flat=sampled_validity_flat,
+                )
+                soft_dense_attn = self._build_transport_attention(
+                    coords_flat,
+                    query_mask_flat,
+                    token_hw,
+                    value_dtype=source_patch_map.dtype,
+                    selected_indices=None,
+                    validity_flat=sampled_validity_flat,
+                )
+                dense_attn = soft_dense_attn + (hard_dense_attn - soft_dense_attn).detach()
+            else:
+                dense_attn = self._build_transport_attention(
+                    coords_flat,
+                    query_mask_flat,
+                    token_hw,
+                    value_dtype=source_patch_map.dtype,
+                    selected_indices=selected_indices,
+                    validity_flat=sampled_validity_flat,
+                )
         if return_aux_entries:
             return mixed, dense_attn, aux
         return mixed, dense_attn
@@ -660,9 +906,46 @@ class PatchmatchHelpersMixin:
 
     def summarize_attention(
         self,
-        attn_map: torch.Tensor,
+        attn_map: torch.Tensor | None,
         query_mask_flat: torch.Tensor,
+        attention_aux: dict[str, object] | None = None,
     ) -> dict[str, float]:
+        if attn_map is None and attention_aux is not None:
+            supervision_entries = attention_aux.get("attention_supervision_entries")
+            if supervision_entries is not None:
+                masked_query_ratio = (query_mask_flat > 0.5).float().mean().item()
+                masked_probs = []
+                for entry in supervision_entries:
+                    query_indices = entry["query_indices"]
+                    if query_indices.numel() == 0:
+                        continue
+                    candidate_probs = entry.get("candidate_probs")
+                    if candidate_probs is None or candidate_probs.numel() == 0:
+                        continue
+                    masked_probs.append(candidate_probs.float())
+                if not masked_probs:
+                    return {
+                        "attention_top1": 1.0,
+                        "attention_top4": 1.0,
+                        "attention_entropy": 0.0,
+                        "attention_masked_ratio": masked_query_ratio,
+                    }
+                masked_probs = torch.cat(masked_probs, dim=0)
+                top1 = masked_probs.max(dim=-1).values.mean().item()
+                top4_k = min(4, masked_probs.shape[-1])
+                top4 = masked_probs.topk(k=top4_k, dim=-1).values.sum(dim=-1).mean().item()
+                entropy = (
+                    -(masked_probs.clamp_min(1e-8) * masked_probs.clamp_min(1e-8).log()).sum(dim=-1).mean().item()
+                )
+                return {
+                    "attention_top1": top1,
+                    "attention_top4": top4,
+                    "attention_entropy": entropy,
+                    "attention_masked_ratio": masked_query_ratio,
+                }
+
+        if attn_map is None:
+            raise ValueError("Expected attention map or sparse attention supervision entries.")
         probs = attn_map.detach()
         if probs.dim() == 4:
             probs = probs.mean(dim=1)

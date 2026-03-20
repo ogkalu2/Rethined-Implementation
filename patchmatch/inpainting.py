@@ -7,6 +7,7 @@ from torch.nn import functional as F
 from blocks import NativeGaussianBlur2d
 
 from .attention import MultiHeadAttention
+from .candidate_refiner import CandidateJointRefiner
 from .helpers import PatchmatchHelpersMixin
 from .patch_ops import PatchOpsMixin
 
@@ -41,6 +42,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         query_boundary_only_matching: bool = False,
         query_boundary_inner_dilation: int = 0,
         query_boundary_outer_dilation: int = 3,
+        use_joint_scorer: bool = False,
+        joint_scorer_steps: int = 2,
+        joint_scorer_ff_mult: float = 2.0,
         separate_query_key_matching: bool = False,
         shared_query_key_descriptor: bool = False,
         query_context_channels: int = 32,
@@ -87,6 +91,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_boundary_only_matching = bool(query_boundary_only_matching)
         self.query_boundary_inner_dilation = max(0, int(query_boundary_inner_dilation))
         self.query_boundary_outer_dilation = max(0, int(query_boundary_outer_dilation))
+        self.use_joint_scorer = bool(use_joint_scorer)
+        self.joint_scorer_steps = max(0, int(joint_scorer_steps))
+        self.joint_scorer_ff_mult = float(joint_scorer_ff_mult)
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
         self.query_context_channels = int(query_context_channels)
@@ -192,6 +199,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             raise ValueError("transport_offset_scale must be non-negative.")
         if self.transport_refine_scale < 0:
             raise ValueError("transport_refine_scale must be non-negative.")
+        if self.joint_scorer_ff_mult <= 0:
+            raise ValueError("joint_scorer_ff_mult must be positive.")
         if not 0.0 <= self.transport_fallback_validity_threshold <= 1.0:
             raise ValueError("transport_fallback_validity_threshold must be in [0, 1].")
         if self.transport_train_selection not in {"bilinear", "straight_through_nearest_valid"}:
@@ -215,6 +224,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_descriptor_head = None
         self.transport_init_head = None
         self.transport_refine_head = None
+        self.joint_candidate_refiner = None
         if self.separate_query_key_matching:
             query_context_in_channels = 5 if self.query_boundary_only_matching else 4
             self.query_context_encoder = self._build_context_encoder(query_context_in_channels, self.query_context_channels)
@@ -277,6 +287,15 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
         )
+        if self.use_joint_scorer:
+            joint_heads = self.nheads if (self.patch_token_dim % max(1, self.nheads)) == 0 else 1
+            self.joint_candidate_refiner = CandidateJointRefiner(
+                self.patch_token_dim,
+                steps=self.joint_scorer_steps,
+                num_heads=joint_heads,
+                dropout=float(dropout),
+                ff_mult=self.joint_scorer_ff_mult,
+            )
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
             nn.Parameter(
@@ -477,7 +496,11 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         attention_supervision_entries = None
         copy_aux = None
-        if return_aux and not self.use_transport:
+        build_dense_attention = (
+            (not self.training)
+            or (not self.use_transport and self.joint_candidate_refiner is None)
+        )
+        if return_aux and not self.use_transport and self.joint_candidate_refiner is None:
             attention_supervision_entries = self.build_attention_supervision_entries(
                 query_tokens,
                 key_tokens,
@@ -497,19 +520,36 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 token_hw=token_hw,
                 default_tokens=None,
                 return_aux_entries=return_aux,
+                build_dense_attention=build_dense_attention,
             )
             if return_aux:
                 mixed_patches_flat, masked_attention, copy_aux = transport_result
             else:
                 mixed_patches_flat, masked_attention = transport_result
         elif self.attention_masking:
-            mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
-                query_tokens,
-                key_tokens,
-                patch_values,
-                query_mask_flat,
-                key_valid_flat,
-            )
+            if return_aux and self.joint_candidate_refiner is not None:
+                mixed_patches_flat, masked_attention, copy_aux = self.direct_patch_mix_masked_queries(
+                    query_tokens,
+                    key_tokens,
+                    patch_values,
+                    query_mask_flat,
+                    key_valid_flat,
+                    token_hw=token_hw,
+                    return_aux_entries=True,
+                    build_dense_attention=build_dense_attention,
+                )
+                attention_supervision_entries = copy_aux.get("attention_supervision_entries")
+            else:
+                mixed_patches_flat, masked_attention = self.direct_patch_mix_masked_queries(
+                    query_tokens,
+                    key_tokens,
+                    patch_values,
+                    query_mask_flat,
+                    key_valid_flat,
+                    token_hw=token_hw,
+                    return_aux_entries=False,
+                    build_dense_attention=build_dense_attention,
+                )
         else:
             mixed_patches_flat, masked_attention = self.multihead_attention(
                 query_tokens,
