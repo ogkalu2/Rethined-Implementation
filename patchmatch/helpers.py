@@ -296,7 +296,6 @@ class PatchmatchHelpersMixin:
         coords = transport_state["coords"]
         base_coords = transport_state["base_coords"]
         sampled_validity = transport_state["sampled_validity"]
-        source_patch_values = self._flatten_patch_map(source_patch_map)
 
         sampled_validity = sampled_validity.clamp(0.0, 1.0)
         hard_validity = self._sample_transport_map(
@@ -421,7 +420,6 @@ class PatchmatchHelpersMixin:
             "transport_base_coords": base_coords.flatten(start_dim=2).transpose(1, 2),
             "transport_copy_values": sampled_values.flatten(start_dim=2).transpose(1, 2),
             "transport_values": sampled_values_flat,
-            "candidate_patch_bank": source_patch_values,
             "transport_validity": sampled_validity_flat,
             "transport_effective_validity": effective_validity_flat,
             "transport_hard_validity": hard_validity_flat,

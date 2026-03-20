@@ -261,38 +261,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
     def _normalize_patch_tokens(self, patch_tokens: torch.Tensor) -> torch.Tensor:
         return patch_tokens.float()
 
-    def _teacher_patch_banks(
-        self,
-        refined_target: torch.Tensor,
-        attention_aux: dict[str, object],
-        *,
-        kernel_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        candidate_patch_bank = attention_aux.get("candidate_patch_bank")
-        value_patch_size = int(attention_aux.get("value_patch_size", 0))
-        value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
-        if candidate_patch_bank is not None and kernel_size > 0 and value_patch_size > 0:
-            query_teacher_bank = self._extract_patch_tokens(
-                refined_target,
-                patch_size=value_patch_size,
-                stride=kernel_size,
-                padding=value_patch_padding,
-            )
-            return (
-                self._normalize_patch_tokens(query_teacher_bank),
-                self._normalize_patch_tokens(candidate_patch_bank),
-            )
-
-        teacher_patch_size = kernel_size + 2 * self.retrieval_teacher_patch_padding
-        teacher_bank = self._extract_patch_tokens(
-            refined_target,
-            patch_size=teacher_patch_size,
-            stride=kernel_size,
-            padding=self.retrieval_teacher_patch_padding,
-        )
-        teacher_bank = self._normalize_patch_tokens(teacher_bank)
-        return teacher_bank, teacher_bank
-
     def _normalized_token_coords(
         self,
         indices: torch.Tensor,
@@ -476,11 +444,14 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         ):
             return loss_terms, metrics
 
-        query_teacher_bank, key_teacher_bank = self._teacher_patch_banks(
+        teacher_patch_size = kernel_size + 2 * self.retrieval_teacher_patch_padding
+        teacher_tokens = self._extract_patch_tokens(
             refined_target,
-            attention_aux,
-            kernel_size=kernel_size,
+            patch_size=teacher_patch_size,
+            stride=kernel_size,
+            padding=self.retrieval_teacher_patch_padding,
         )
+        teacher_tokens = self._normalize_patch_tokens(teacher_tokens)
 
         retrieval_losses = []
         retrieval_hard_ce_losses = []
@@ -504,8 +475,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raw_logits = raw_logits.float()
             ranking_scores = raw_logits if ranking_scores is None else ranking_scores.float()
             batch_query_mask = query_mask_flat[batch_idx, query_indices] > 0.5
-            query_teacher_tokens = query_teacher_bank[batch_idx, query_indices]
-            key_teacher_tokens = key_teacher_bank[batch_idx, key_indices]
+            query_teacher_tokens = teacher_tokens[batch_idx, query_indices]
+            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
             teacher_distances = torch.cdist(
                 query_teacher_tokens.unsqueeze(0),
                 key_teacher_tokens.unsqueeze(0),
@@ -658,11 +629,14 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         ):
             return zero, metrics
 
-        query_teacher_bank, key_teacher_bank = self._teacher_patch_banks(
+        teacher_patch_size = kernel_size + 2 * self.retrieval_teacher_patch_padding
+        teacher_tokens = self._extract_patch_tokens(
             refined_target,
-            attention_aux,
-            kernel_size=kernel_size,
+            patch_size=teacher_patch_size,
+            stride=kernel_size,
+            padding=self.retrieval_teacher_patch_padding,
         )
+        teacher_tokens = self._normalize_patch_tokens(teacher_tokens)
 
         losses = []
         for batch_idx, entry in enumerate(supervision_entries):
@@ -677,8 +651,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 continue
 
             masked_raw_logits = raw_logits[masked_queries].float()
-            query_teacher_tokens = query_teacher_bank[batch_idx, query_indices[masked_queries]]
-            key_teacher_tokens = key_teacher_bank[batch_idx, key_indices]
+            query_teacher_tokens = teacher_tokens[batch_idx, query_indices[masked_queries]]
+            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
             teacher_distances = torch.cdist(
                 query_teacher_tokens.unsqueeze(0),
                 key_teacher_tokens.unsqueeze(0),
