@@ -11,13 +11,19 @@ from patchmatch import PatchInpainting
 class InpaintingModel(nn.Module):
     def __init__(self, config: dict[str, Any]) -> None:
         super().__init__()
-        coarse_class_name = config["coarse_model"].get("class", "CoarseModel")
-        coarse_class = COARSE_MODEL_REGISTRY.get(coarse_class_name)
-        if coarse_class is None:
-            raise ValueError(f"Unsupported coarse model class: {coarse_class_name}")
-
-        self.coarse_model = coarse_class(**config["coarse_model"]["parameters"])
+        coarse_cfg = config["coarse_model"]
+        coarse_enabled = coarse_cfg.get("enabled", True)
         inpainter_params = dict(config["inpainter"]["params"])
+
+        self.coarse_model = None
+        if coarse_enabled:
+            coarse_class_name = coarse_cfg.get("class", "CoarseModel")
+            coarse_class = COARSE_MODEL_REGISTRY.get(coarse_class_name)
+            if coarse_class is None:
+                raise ValueError(f"Unsupported coarse model class: {coarse_class_name}")
+            self.coarse_model = coarse_class(**coarse_cfg["parameters"])
+        elif inpainter_params.get("match_coarse_rgb", True) or inpainter_params.get("concat_features", True):
+            raise ValueError("Coarse model cannot be disabled while match_coarse_rgb or concat_features is enabled.")
 
         if inpainter_params.get("concat_features", True):
             feature_i = inpainter_params.get("feature_i", 3)
@@ -92,7 +98,7 @@ class InpaintingModel(nn.Module):
 
     def reparameterize(self) -> "InpaintingModel":
         """Apply any model-specific inference-time reparameterization."""
-        if hasattr(self.coarse_model, "reparameterize"):
+        if self.coarse_model is not None and hasattr(self.coarse_model, "reparameterize"):
             self.coarse_model.reparameterize()
         if hasattr(self.inpainter, "reparameterize"):
             self.inpainter.reparameterize()

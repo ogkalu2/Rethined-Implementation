@@ -222,6 +222,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             raise ValueError("transport_eval_selection must be one of {'bilinear', 'nearest_valid'}.")
 
         self.encoder_decoder = model
+        if self.encoder_decoder is None and (self.match_coarse_rgb or self.concat_features):
+            raise ValueError("model is required when match_coarse_rgb or concat_features is enabled.")
         self.final_gaussian_blur = NativeGaussianBlur2d((7, 7), sigma=(2.01, 2.01))
         self.query_context_encoder = None
         self.key_context_encoder = None
@@ -363,15 +365,13 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         value_image: torch.Tensor | None = None,
         return_aux: bool = False,
     ):
-        coarse_raw, features = self.encoder_decoder(image)
+        if self.encoder_decoder is None:
+            coarse_raw = image
+            features = None
+        else:
+            coarse_raw, features = self.encoder_decoder(image)
         known_image = image if value_image is None else value_image
-        coarse_composite = coarse_raw * mask + known_image * (1 - mask)
-        # build matching tokens from the raw coarse
-        # prediction for both transport and attention paths.
-        coarse_token_source = coarse_raw
         token_hw = (self.token_grid_size, self.token_grid_size)
-
-        patch_map, _ = self.unfold_native(coarse_token_source, self.kernel_size)
         output_size = (self.image_size, self.image_size)
         source_patch_map, _ = self.extract_patches(
             known_image,
@@ -392,10 +392,12 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             stride=self.kernel_size,
             padding=self.value_patch_padding,
         )
-        key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=patch_map.dtype).flatten(start_dim=1)
+        key_valid_flat = (key_mask_patch_map.amax(dim=1) == 0).to(dtype=image.dtype).flatten(start_dim=1)
         use_coarse_rgb_matching = self.match_coarse_rgb
         coarse_match_map = None
         if use_coarse_rgb_matching:
+            # build matching tokens from the raw coarse prediction when enabled.
+            patch_map, _ = self.unfold_native(coarse_raw, self.kernel_size)
             coarse_match_map = patch_map.detach() if self.detach_coarse_rgb else patch_map
             coarse_match_map = self._prepare_matching_branch(
                 coarse_match_map,

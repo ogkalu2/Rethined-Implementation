@@ -1,6 +1,7 @@
 # Main Training Run, 512x512 input
 model:
   coarse_model:
+    enabled: false
     class: "CoarseModel"
     channels: [64, 128, 256, 384, 512]
     head_channels: 32
@@ -90,7 +91,7 @@ training:
   betas: [0.9, 0.999]
 
 loss:
-  coarse_l2_weight: 1.0
+  coarse_l2_weight: 0.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 0.0

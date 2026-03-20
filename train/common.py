@@ -62,8 +62,9 @@ def build_model_config(cfg):
     }
     return {
         "coarse_model": {
+            "enabled": coarse_cfg.get("enabled", True),
             "class": coarse_cfg.get("class", "CoarseModel"),
-            "parameters": {key: value for key, value in coarse_cfg.items() if key != "class"},
+            "parameters": {key: value for key, value in coarse_cfg.items() if key not in {"class", "enabled"}},
         },
         "inpainter": {
             "inpainter_class": "PatchInpainting",
