@@ -47,7 +47,7 @@ model:
     dropout: 0.1
     feature_i: 3
     feature_dim: null
-    concat_features: true
+    concat_features: false
     detach_coarse_rgb: false
     final_conv: false
     attention_masking: true
