@@ -269,28 +269,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         kernel_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         candidate_patch_bank = attention_aux.get("candidate_patch_bank")
-        candidate_source_image = attention_aux.get("candidate_source_image")
         value_patch_size = int(attention_aux.get("value_patch_size", 0))
         value_patch_padding = int(attention_aux.get("value_patch_padding", 0))
         if candidate_patch_bank is not None and kernel_size > 0 and value_patch_size > 0:
-            if candidate_source_image is not None and self.retrieval_teacher_patch_padding > 0:
-                teacher_patch_size = value_patch_size + 2 * self.retrieval_teacher_patch_padding
-                query_teacher_bank = self._extract_patch_tokens(
-                    refined_target,
-                    patch_size=teacher_patch_size,
-                    stride=kernel_size,
-                    padding=self.retrieval_teacher_patch_padding,
-                )
-                key_teacher_bank = self._extract_patch_tokens(
-                    candidate_source_image,
-                    patch_size=teacher_patch_size,
-                    stride=kernel_size,
-                    padding=self.retrieval_teacher_patch_padding,
-                )
-                return (
-                    self._normalize_patch_tokens(query_teacher_bank),
-                    self._normalize_patch_tokens(key_teacher_bank),
-                )
             query_teacher_bank = self._extract_patch_tokens(
                 refined_target,
                 patch_size=value_patch_size,

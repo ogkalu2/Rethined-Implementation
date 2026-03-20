@@ -427,7 +427,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         attention_supervision_entries = None
         copy_aux = None
-        if return_aux:
+        if return_aux and not self.use_transport:
             attention_supervision_entries = self.build_attention_supervision_entries(
                 query_tokens,
                 key_tokens,
@@ -496,7 +496,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "selection_attention": masked_attention,
                 "attention_supervision_entries": attention_supervision_entries,
                 "candidate_patch_bank": patch_values,
-                "candidate_source_image": known_image,
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
             }
