@@ -650,11 +650,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
     ) -> dict[str, float]:
         if attention_aux is None or attention_aux.get("copy_mode") != "transport":
             return {}
-        metric_aux = dict(attention_aux)
-        metric_aux["attention_supervision_entries"] = None
         _, metrics = self._attention_supervision_losses(
             refined_target,
-            metric_aux,
+            attention_aux,
             metric_prefix="transport_selection",
             allow_metric_only=True,
         )
