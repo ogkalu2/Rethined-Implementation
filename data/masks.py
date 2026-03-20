@@ -17,6 +17,7 @@ class FreeFormMaskGenerator:
     def __init__(
         self,
         image_size: int = 256,
+        working_size: int | None = None,
         min_coverage: float = 0.3,
         max_coverage: float = 0.5,
         max_strokes: int = 10,
@@ -34,7 +35,9 @@ class FreeFormMaskGenerator:
         connector_probability: float = 0.35,
         overlap_tolerance: float = 0.08,
     ):
-        self.image_size = int(image_size)
+        self.output_size = int(image_size)
+        self.image_size = min(self.output_size, int(working_size or self.output_size))
+        self.image_area = self.image_size * self.image_size
         self.min_coverage = float(min_coverage)
         self.max_coverage = float(max_coverage)
         self.max_strokes = int(max_strokes)
@@ -91,7 +94,7 @@ class FreeFormMaskGenerator:
 
     def _generate_freeform_mask(self, rng: np.random.RandomState) -> np.ndarray:
         for _ in range(self.max_retries):
-            mask = np.zeros((self.image_size, self.image_size), dtype=np.float32)
+            mask = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
 
             num_strokes = rng.randint(3, self.max_strokes + 1)
             for _ in range(num_strokes):
@@ -100,7 +103,7 @@ class FreeFormMaskGenerator:
                 else:
                     self._random_rectangle(mask, rng)
 
-            coverage = mask.mean()
+            coverage = float(np.count_nonzero(mask)) / self.image_area
             if self.min_coverage <= coverage <= self.max_coverage:
                 return mask
 
@@ -110,7 +113,7 @@ class FreeFormMaskGenerator:
                     self._random_stroke(mask, rng)
                     if rng.random() < 0.3:
                         self._random_rectangle(mask, rng)
-                coverage = mask.mean()
+                coverage = float(np.count_nonzero(mask)) / self.image_area
                 if coverage <= self.max_coverage:
                     return mask
 
@@ -150,17 +153,28 @@ class FreeFormMaskGenerator:
         axes = (max(1, int(major_axis)), max(1, int(minor_axis)))
         cv2.ellipse(mask, center, axes, float(angle_deg), 0.0, 360.0, color=1, thickness=-1)
 
-    def _sample_sparse_anchor(self, mask: np.ndarray, rng: np.random.RandomState, radius: int) -> tuple[int, int]:
+    def _sample_sparse_anchor(
+        self,
+        mask: np.ndarray,
+        rng: np.random.RandomState,
+        radius: int,
+        has_existing_pixels: bool,
+    ) -> tuple[int, int]:
         max_idx = self.image_size - 1
         radius = max(1, int(radius))
+        low = radius
+        high = max(max_idx - radius + 1, radius + 1)
+        if not has_existing_pixels:
+            return int(rng.randint(low, high)), int(rng.randint(low, high))
         for _ in range(24):
-            x = int(rng.randint(radius, max(max_idx - radius + 1, radius + 1)))
-            y = int(rng.randint(radius, max(max_idx - radius + 1, radius + 1)))
+            x = int(rng.randint(low, high))
+            y = int(rng.randint(low, high))
             y0 = max(0, y - radius)
             y1 = min(self.image_size, y + radius + 1)
             x0 = max(0, x - radius)
             x1 = min(self.image_size, x + radius + 1)
-            if mask[y0:y1, x0:x1].mean() <= self.overlap_tolerance:
+            window = mask[y0:y1, x0:x1]
+            if float(window.sum()) <= self.overlap_tolerance * window.size:
                 return x, y
         return int(rng.randint(0, self.image_size)), int(rng.randint(0, self.image_size))
 
@@ -175,11 +189,21 @@ class FreeFormMaskGenerator:
         )
         return length, min(width, max(3, length // 2))
 
-    def _draw_sparse_component(self, mask: np.ndarray, rng: np.random.RandomState):
-        component = np.zeros_like(mask)
+    def _draw_sparse_component(
+        self,
+        component: np.ndarray,
+        occupancy_mask: np.ndarray,
+        has_existing_pixels: bool,
+        rng: np.random.RandomState,
+    ):
         base_length, base_width = self._capsule_dims(rng)
         angle = rng.uniform(0.0, 2.0 * math.pi)
-        anchor = self._sample_sparse_anchor(component if mask.mean() == 0 else mask, rng, radius=base_length)
+        anchor = self._sample_sparse_anchor(
+            occupancy_mask,
+            rng,
+            radius=base_length,
+            has_existing_pixels=has_existing_pixels,
+        )
 
         if rng.random() < self.articulated_probability:
             segment_count = rng.randint(2, 5)
@@ -246,53 +270,60 @@ class FreeFormMaskGenerator:
                 )
                 cv2.line(component, end, connector_end, color=1, thickness=max(1, base_width // 4))
 
-        np.maximum(mask, component, out=mask)
-
     def _generate_sparse_object_mask(self, rng: np.random.RandomState) -> np.ndarray:
         target_coverage = rng.uniform(self.min_coverage, self.max_coverage)
         max_components = rng.randint(self.min_component_count, self.max_component_count + 1)
-        mask = np.zeros((self.image_size, self.image_size), dtype=np.float32)
+        mask = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
+        filled_pixels = 0
 
         for _ in range(max_components * 3):
-            current_coverage = float(mask.mean())
+            current_coverage = filled_pixels / self.image_area
             if current_coverage >= target_coverage:
                 break
 
-            candidate = mask.copy()
-            self._draw_sparse_component(candidate, rng)
-            candidate_coverage = float(candidate.mean())
+            component = np.zeros_like(mask)
+            self._draw_sparse_component(component, mask, filled_pixels > 0, rng)
+            new_pixels = int(np.count_nonzero(component & (1 - mask)))
+            if new_pixels <= 0:
+                continue
+            candidate_filled = filled_pixels + new_pixels
+            candidate_coverage = candidate_filled / self.image_area
             gain = candidate_coverage - current_coverage
             remaining = target_coverage - current_coverage
-            if gain <= 0:
-                continue
             if candidate_coverage > self.max_coverage and current_coverage >= self.min_coverage:
                 continue
             if gain > remaining * 1.8 and current_coverage >= self.min_coverage * 0.6:
                 continue
-            mask = candidate
+            mask |= component
+            filled_pixels = candidate_filled
 
-        coverage = float(mask.mean())
+        coverage = filled_pixels / self.image_area
         if coverage < self.min_coverage:
             for _ in range(max_components):
-                candidate = mask.copy()
-                self._draw_sparse_component(candidate, rng)
-                candidate_coverage = float(candidate.mean())
+                component = np.zeros_like(mask)
+                self._draw_sparse_component(component, mask, filled_pixels > 0, rng)
+                new_pixels = int(np.count_nonzero(component & (1 - mask)))
+                if new_pixels <= 0:
+                    continue
+                candidate_filled = filled_pixels + new_pixels
+                candidate_coverage = candidate_filled / self.image_area
                 if candidate_coverage > self.max_coverage:
                     continue
-                mask = candidate
+                mask |= component
+                filled_pixels = candidate_filled
                 coverage = candidate_coverage
                 if coverage >= self.min_coverage:
                     break
 
-        coverage = float(mask.mean())
+        coverage = filled_pixels / self.image_area
         if self.min_coverage <= coverage <= self.max_coverage:
             return mask
-        if coverage > 0:
+        if filled_pixels > 0:
             return mask
         return self._fallback_block_mask(rng)
 
     def _fallback_block_mask(self, rng: np.random.RandomState) -> np.ndarray:
-        mask = np.zeros((self.image_size, self.image_size), dtype=np.float32)
+        mask = np.zeros((self.image_size, self.image_size), dtype=np.uint8)
         target = rng.uniform(self.min_coverage, self.max_coverage)
         side = int(np.sqrt(target) * self.image_size)
         offset_x = (self.image_size - side) // 2
@@ -305,5 +336,9 @@ class FreeFormMaskGenerator:
         if rng is None:
             rng = np.random.RandomState()
         if self.style == "sparse_fashion":
-            return self._generate_sparse_object_mask(rng)
-        return self._generate_freeform_mask(rng)
+            mask = self._generate_sparse_object_mask(rng)
+        else:
+            mask = self._generate_freeform_mask(rng)
+        if self.image_size != self.output_size:
+            mask = cv2.resize(mask, (self.output_size, self.output_size), interpolation=cv2.INTER_NEAREST)
+        return mask.astype(np.float32, copy=False)
