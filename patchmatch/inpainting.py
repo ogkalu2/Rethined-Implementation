@@ -38,6 +38,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         detach_coarse_rgb: bool = False,
         coarse_rgb_branch_dropout: float = 0.0,
         query_image_context_matching: bool = False,
+        query_boundary_only_matching: bool = False,
+        query_boundary_inner_dilation: int = 0,
+        query_boundary_outer_dilation: int = 3,
         separate_query_key_matching: bool = False,
         shared_query_key_descriptor: bool = False,
         query_context_channels: int = 32,
@@ -81,6 +84,9 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.detach_coarse_rgb = bool(detach_coarse_rgb)
         self.coarse_rgb_branch_dropout = float(coarse_rgb_branch_dropout)
         self.query_image_context_matching = bool(query_image_context_matching)
+        self.query_boundary_only_matching = bool(query_boundary_only_matching)
+        self.query_boundary_inner_dilation = max(0, int(query_boundary_inner_dilation))
+        self.query_boundary_outer_dilation = max(0, int(query_boundary_outer_dilation))
         self.separate_query_key_matching = bool(separate_query_key_matching)
         self.shared_query_key_descriptor = bool(shared_query_key_descriptor)
         self.query_context_channels = int(query_context_channels)
@@ -90,22 +96,36 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.key_feature_residual_init = float(key_feature_residual_init)
         if not 0.0 <= self.coarse_rgb_branch_dropout < 1.0:
             raise ValueError("coarse_rgb_branch_dropout must be in [0, 1).")
+        if self.query_boundary_only_matching and self.query_boundary_outer_dilation <= self.query_boundary_inner_dilation:
+            raise ValueError(
+                "query_boundary_outer_dilation must be greater than query_boundary_inner_dilation "
+                "when query_boundary_only_matching=True."
+            )
         if self.query_image_context_matching and self.separate_query_key_matching:
             raise ValueError(
                 "query_image_context_matching and separate_query_key_matching cannot both be enabled."
+            )
+        if self.query_boundary_only_matching and self.query_image_context_matching:
+            raise ValueError(
+                "query_boundary_only_matching and query_image_context_matching cannot both be enabled."
             )
         if self.separate_query_key_matching:
             if self.query_context_channels <= 0:
                 raise ValueError("query_context_channels must be positive when separate_query_key_matching=True.")
             if self.key_context_channels <= 0:
                 raise ValueError("key_context_channels must be positive when separate_query_key_matching=True.")
+            if self.query_boundary_only_matching and self.shared_query_key_descriptor:
+                raise ValueError(
+                    "shared_query_key_descriptor is not supported with query_boundary_only_matching=True."
+                )
             if self.shared_query_key_descriptor and self.query_context_channels != self.key_context_channels:
                 raise ValueError(
                     "query_context_channels and key_context_channels must match when shared_query_key_descriptor=True."
                 )
-        elif self.query_image_context_matching and self.query_context_channels <= 0:
+        elif (self.query_image_context_matching or self.query_boundary_only_matching) and self.query_context_channels <= 0:
             raise ValueError(
-                "query_context_channels must be positive when query_image_context_matching=True."
+                "query_context_channels must be positive when query_image_context_matching=True "
+                "or query_boundary_only_matching=True."
             )
         self.concat_features = bool(concat_features)
         self.attention_masking = bool(attention_masking)
@@ -129,11 +149,14 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.query_matching_input_dim = self.matching_input_dim
         self.key_matching_input_dim = self.matching_input_dim
         if self.separate_query_key_matching:
-            self.query_matching_input_dim = self.query_patch_dim + self.query_context_channels
-            if self.match_coarse_rgb:
-                self.query_matching_input_dim += self.query_patch_dim
-            if self.concat_features:
-                self.query_matching_input_dim += self.feature_dim
+            if self.query_boundary_only_matching:
+                self.query_matching_input_dim = self.query_context_channels
+            else:
+                self.query_matching_input_dim = self.query_patch_dim + self.query_context_channels
+                if self.match_coarse_rgb:
+                    self.query_matching_input_dim += self.query_patch_dim
+                if self.concat_features:
+                    self.query_matching_input_dim += self.feature_dim
             self.key_matching_input_dim = self.query_patch_dim + self.key_context_channels
             if self.match_coarse_rgb:
                 self.key_matching_input_dim += self.query_patch_dim
@@ -193,7 +216,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_init_head = None
         self.transport_refine_head = None
         if self.separate_query_key_matching:
-            self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
+            query_context_in_channels = 5 if self.query_boundary_only_matching else 4
+            self.query_context_encoder = self._build_context_encoder(query_context_in_channels, self.query_context_channels)
             self.key_context_encoder = self._build_context_encoder(3, self.key_context_channels)
             if self.match_coarse_rgb:
                 self.key_coarse_rgb_scale = nn.Parameter(torch.tensor(self.key_coarse_rgb_residual_init))
@@ -227,7 +251,14 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             transport_refine_in = (self.patch_token_dim * 2) + 4
             self.transport_init_head = self._build_transport_head(transport_init_in, 2)
             self.transport_refine_head = self._build_transport_head(transport_refine_in, 2)
-        if self.query_image_context_matching:
+        if self.query_boundary_only_matching:
+            if self.query_context_encoder is None:
+                self.query_context_encoder = self._build_context_encoder(5, self.query_context_channels)
+            self.query_context_descriptor_head = self._build_projection_head(
+                self.query_context_channels,
+                self.patch_token_dim,
+            )
+        elif self.query_image_context_matching:
             self.query_context_encoder = self._build_context_encoder(4, self.query_context_channels)
             self.query_context_descriptor_head = self._build_projection_head(
                 self.query_context_channels + self.query_patch_dim,
@@ -357,22 +388,33 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         query_matching_tokens = None
         key_matching_tokens = None
+        query_boundary_ring = None
         if self.separate_query_key_matching:
             visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
-            query_context_map = self._pool_to_token_grid(
-                self.query_context_encoder(torch.cat([image, mask], dim=1)),
-                token_hw,
-            )
+            if self.query_boundary_only_matching:
+                query_context_inputs, query_boundary_ring = self.build_query_boundary_inputs(image, mask)
+                query_context_map = self._pool_to_token_grid(
+                    self.query_context_encoder(query_context_inputs),
+                    token_hw,
+                )
+            else:
+                query_context_map = self._pool_to_token_grid(
+                    self.query_context_encoder(torch.cat([image, mask], dim=1)),
+                    token_hw,
+                )
             key_context_map = self._pool_to_token_grid(
                 self.key_context_encoder(image),
                 token_hw,
             )
 
-            query_token_inputs = [query_context_map, visible_patch_map]
-            if use_coarse_rgb_matching:
-                query_token_inputs.append(coarse_match_map)
-            if self.concat_features:
-                query_token_inputs.append(coarse_features)
+            if self.query_boundary_only_matching:
+                query_token_inputs = [query_context_map]
+            else:
+                query_token_inputs = [query_context_map, visible_patch_map]
+                if use_coarse_rgb_matching:
+                    query_token_inputs.append(coarse_match_map)
+                if self.concat_features:
+                    query_token_inputs.append(coarse_features)
 
             key_token_inputs = [key_context_map, visible_patch_map]
             if use_coarse_rgb_matching:
@@ -404,7 +446,15 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
             query_matching_tokens = token_map.flatten(start_dim=2).transpose(1, 2)
             key_matching_tokens = query_matching_tokens
-            if self.query_image_context_matching:
+            if self.query_boundary_only_matching:
+                query_context_inputs, query_boundary_ring = self.build_query_boundary_inputs(image, mask)
+                query_context_map = self._pool_to_token_grid(
+                    self.query_context_encoder(query_context_inputs),
+                    token_hw,
+                )
+                query_context_map = self.query_context_descriptor_head(query_context_map)
+                query_matching_tokens = query_context_map.flatten(start_dim=2).transpose(1, 2)
+            elif self.query_image_context_matching:
                 visible_patch_map, _ = self.unfold_native(image, self.kernel_size)
                 query_context_map = self._pool_to_token_grid(
                     self.query_context_encoder(torch.cat([image, mask], dim=1)),
@@ -497,6 +547,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
                 "query_matching_tokens": query_matching_tokens,
                 "key_matching_tokens": key_matching_tokens,
             }
+            if query_boundary_ring is not None:
+                aux["query_boundary_ring"] = query_boundary_ring
             if copy_aux is not None:
                 aux.update(copy_aux)
             return refined, masked_attention, coarse_raw, aux

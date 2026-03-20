@@ -94,6 +94,30 @@ class PatchmatchHelpersMixin:
             nn.Conv2d(hidden_dim, output_dim, kernel_size=1, stride=1, bias=False),
         )
 
+    def _dilate_binary_mask(self, mask: torch.Tensor, radius: int) -> torch.Tensor:
+        radius = int(radius)
+        if radius <= 0:
+            return (mask > 0.5).to(dtype=mask.dtype)
+        kernel_size = 2 * radius + 1
+        return F.max_pool2d(mask, kernel_size=kernel_size, stride=1, padding=radius)
+
+    def build_query_boundary_ring(self, mask: torch.Tensor) -> torch.Tensor:
+        outer_ring = self._dilate_binary_mask(mask, self.query_boundary_outer_dilation)
+        if self.query_boundary_inner_dilation > 0:
+            inner_ring = self._dilate_binary_mask(mask, self.query_boundary_inner_dilation)
+        else:
+            inner_ring = (mask > 0.5).to(dtype=mask.dtype)
+        return (outer_ring - inner_ring).clamp_(0.0, 1.0)
+
+    def build_query_boundary_inputs(
+        self,
+        image: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        boundary_ring = self.build_query_boundary_ring(mask)
+        boundary_rgb = image * boundary_ring
+        return torch.cat([boundary_rgb, boundary_ring, mask], dim=1), boundary_ring
+
     def _build_matching_descriptor_head(
         self,
         input_dim: int,
