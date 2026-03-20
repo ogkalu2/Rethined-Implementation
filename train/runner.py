@@ -69,7 +69,6 @@ def train(cfg, args, dist_ctx):
         "query_context_descriptor_head", "query_context_scale",
         "key_coarse_rgb_scale", "key_feature_scale",
         "pre_attention_norm", "multihead_attention",
-        "joint_candidate_refiner",
     }
     scorer_params = []
     base_params = []
@@ -294,9 +293,8 @@ def train(cfg, args, dist_ctx):
                 break
 
             attn_metrics = raw_model.inpainter.summarize_attention(
-                None if attn_map is None else attn_map.detach(),
+                attn_map.detach(),
                 raw_model.inpainter.flatten_query_mask(mask).detach(),
-                attention_aux,
             )
 
             for key, value in g_metrics.items():

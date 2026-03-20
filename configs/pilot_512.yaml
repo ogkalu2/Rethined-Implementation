@@ -14,7 +14,7 @@ model:
     attention_selection: "softmax"
     attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
-    use_transport: false
+    use_transport: true
     transport_hidden_channels: 64
     transport_refine_steps: 2
     transport_offset_scale: 1.0
@@ -31,9 +31,6 @@ model:
     query_boundary_only_matching: true
     query_boundary_inner_dilation: 0
     query_boundary_outer_dilation: 3
-    use_joint_scorer: true
-    joint_scorer_steps: 2
-    joint_scorer_ff_mult: 2.0
     separate_query_key_matching: false
     shared_query_key_descriptor: false
     query_context_channels: 32
@@ -97,10 +94,10 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
-  retrieval_loss_weight: 0
-  retrieval_hard_ce_weight: 0
-  retrieval_top1_margin_weight: 0
-  retrieval_top1_margin: 0
+  retrieval_loss_weight: 0.0
+  retrieval_hard_ce_weight: 0.0
+  retrieval_top1_margin_weight: 0.0
+  retrieval_top1_margin: 0.5
   retrieval_coherence_weight: 0.0
   retrieval_coherence_sigma: 0.10
   retrieval_teacher_patch_padding: 8

@@ -330,11 +330,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self,
         pred_probs: torch.Tensor,
         query_indices: torch.Tensor,
+        key_indices: torch.Tensor,
         query_teacher_tokens: torch.Tensor,
         token_hw: tuple[int, int],
-        *,
-        key_indices: torch.Tensor | None = None,
-        candidate_coords: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if pred_probs.shape[0] <= 1 or pred_probs.shape[-1] <= 0:
             return pred_probs.new_zeros(())
@@ -343,19 +341,12 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         if pair_src.numel() == 0:
             return pred_probs.new_zeros(())
 
-        if candidate_coords is not None:
-            expected_source_coords = (
-                pred_probs.unsqueeze(-1) * candidate_coords.to(dtype=pred_probs.dtype)
-            ).sum(dim=1)
-        else:
-            if key_indices is None:
-                return pred_probs.new_zeros(())
-            key_coords = self._normalized_token_coords(
-                key_indices,
-                token_hw,
-                dtype=pred_probs.dtype,
-            )
-            expected_source_coords = pred_probs @ key_coords
+        key_coords = self._normalized_token_coords(
+            key_indices,
+            token_hw,
+            dtype=pred_probs.dtype,
+        )
+        expected_source_coords = pred_probs @ key_coords
 
         query_patch_dists = (
             query_teacher_tokens[pair_src] - query_teacher_tokens[pair_dst]
@@ -475,11 +466,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             query_indices = entry["query_indices"]
             key_indices = entry["key_indices"]
             raw_logits = entry["raw_logits"]
-            candidate_key_indices = entry.get("candidate_key_indices")
-            candidate_coords = entry.get("candidate_coords")
-            ranking_scores = entry.get("candidate_logits", entry.get("ranking_scores"))
-            pred_probs = entry.get("candidate_probs", entry.get("pred_probs"))
-            pred_log_probs = entry.get("candidate_log_probs", entry.get("pred_log_probs"))
+            ranking_scores = entry.get("ranking_scores")
+            pred_probs = entry.get("pred_probs")
+            pred_log_probs = entry.get("pred_log_probs")
             if raw_logits.numel() == 0 or query_indices.numel() == 0 or key_indices.numel() == 0:
                 continue
 
@@ -487,19 +476,12 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             ranking_scores = raw_logits if ranking_scores is None else ranking_scores.float()
             batch_query_mask = query_mask_flat[batch_idx, query_indices] > 0.5
             query_teacher_tokens = teacher_tokens[batch_idx, query_indices]
-            if candidate_key_indices is not None:
-                candidate_key_indices = candidate_key_indices.long()
-                candidate_teacher_tokens = teacher_tokens[batch_idx, candidate_key_indices]
-                teacher_distances = (
-                    query_teacher_tokens.unsqueeze(1) - candidate_teacher_tokens
-                ).abs().sum(dim=-1)
-            else:
-                key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
-                teacher_distances = torch.cdist(
-                    query_teacher_tokens.unsqueeze(0),
-                    key_teacher_tokens.unsqueeze(0),
-                    p=1,
-                ).squeeze(0)
+            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
+            teacher_distances = torch.cdist(
+                query_teacher_tokens.unsqueeze(0),
+                key_teacher_tokens.unsqueeze(0),
+                p=1,
+            ).squeeze(0)
             
             # Keep a strict best-match metric, but allow a small tolerance for near-tied targets.
             min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
@@ -528,9 +510,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 masked_valid_targets = valid_targets_mask[batch_query_mask]
                 masked_query_indices = query_indices[batch_query_mask]
                 masked_query_teacher_tokens = query_teacher_tokens[batch_query_mask]
-                masked_candidate_coords = None
-                if candidate_coords is not None:
-                    masked_candidate_coords = candidate_coords[batch_query_mask]
 
                 masked_pred_probs = pred_probs[batch_query_mask]
                 if compute_retrieval_losses:
@@ -551,10 +530,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                                 self._retrieval_coherence_loss(
                                     masked_pred_probs,
                                     masked_query_indices,
+                                    key_indices,
                                     masked_query_teacher_tokens,
                                     tuple(token_hw),
-                                    key_indices=key_indices,
-                                    candidate_coords=masked_candidate_coords,
                                 )
                             )
 
@@ -643,9 +621,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
         kernel_size = int(attention_aux.get("kernel_size", 0))
         query_mask_flat = attention_aux.get("query_mask_flat")
-        supervision_entries = attention_aux.get("attention_supervision_entries")
-        if supervision_entries is None:
-            supervision_entries = self._build_transport_supervision_entries(attention_aux)
+        supervision_entries = self._build_transport_supervision_entries(attention_aux)
         if (
             kernel_size <= 0
             or query_mask_flat is None
@@ -667,7 +643,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             query_indices = entry["query_indices"]
             key_indices = entry["key_indices"]
             raw_logits = entry["raw_logits"]
-            candidate_key_indices = entry.get("candidate_key_indices")
             if raw_logits.numel() == 0 or query_indices.numel() == 0 or key_indices.numel() == 0:
                 continue
 
@@ -677,19 +652,12 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
             masked_raw_logits = raw_logits[masked_queries].float()
             query_teacher_tokens = teacher_tokens[batch_idx, query_indices[masked_queries]]
-            if candidate_key_indices is not None:
-                candidate_key_indices = candidate_key_indices.long()
-                candidate_teacher_tokens = teacher_tokens[batch_idx, candidate_key_indices[masked_queries]]
-                teacher_distances = (
-                    query_teacher_tokens.unsqueeze(1) - candidate_teacher_tokens
-                ).abs().sum(dim=-1)
-            else:
-                key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
-                teacher_distances = torch.cdist(
-                    query_teacher_tokens.unsqueeze(0),
-                    key_teacher_tokens.unsqueeze(0),
-                    p=1,
-                ).squeeze(0)
+            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
+            teacher_distances = torch.cdist(
+                query_teacher_tokens.unsqueeze(0),
+                key_teacher_tokens.unsqueeze(0),
+                p=1,
+            ).squeeze(0)
             min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
             valid_targets_mask = teacher_distances <= (
                 min_teacher_dist * (1.0 + self.retrieval_target_margin_pct) + 1e-4

@@ -30,9 +30,6 @@ model:
     query_boundary_only_matching: true
     query_boundary_inner_dilation: 0
     query_boundary_outer_dilation: 3
-    use_joint_scorer: true
-    joint_scorer_steps: 2
-    joint_scorer_ff_mult: 2.0
     separate_query_key_matching: false
     shared_query_key_descriptor: false
     query_context_channels: 32
