@@ -61,15 +61,6 @@ data:
   mask_max_coverage: 0.40
   mask_generator:
     style: "freeform"
-    # min_capsule_length_ratio: 0.035
-    # max_capsule_length_ratio: 0.16
-    # min_capsule_width_ratio: 0.008
-    # max_capsule_width_ratio: 0.035
-    # min_component_count: 10
-    # max_component_count: 28
-    # articulated_probability: 0.25
-    # connector_probability: 0.15
-    # overlap_tolerance: 0.08
   force_random_masks_train: true
   force_random_masks_eval: true
 
@@ -90,20 +81,21 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
-  retrieval_loss_weight: 0.2
-  retrieval_hard_ce_weight: 1.0
-  retrieval_top1_margin_weight: 0.05
+  retrieval_loss_weight: 0.0
+  retrieval_hard_ce_weight: 0.0
+  retrieval_top1_margin_weight: 0.0
   retrieval_top1_margin: 0.5
+  retrieval_coherence_weight: 0.0
+  retrieval_coherence_sigma: 0.10
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
-  transport_selection_weight: 0.5
+  transport_selection_weight: 1.5
   transport_selection_temperature: 0.2
   transport_validity_weight: 0.1
   transport_offset_smoothness_weight: 0.01
   transport_offset_edge_scale: 5.0
-  copy_usage_weight: 0.05
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
   perceptual_weight: 0.15

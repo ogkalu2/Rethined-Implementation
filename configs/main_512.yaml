@@ -20,7 +20,7 @@ model:
     transport_refine_scale: 0.25
     transport_fallback_validity_threshold: 0.1
     transport_snap_to_valid_eval: true
-    transport_train_selection: "straight_through_nearest_valid"
+    transport_train_selection: "bilinear"
     transport_eval_selection: "nearest_valid"
     matching_descriptor_dim: 256
     matching_hidden_dim: 192
@@ -89,20 +89,21 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
-  retrieval_loss_weight: 0.2
-  retrieval_hard_ce_weight: 0.1
-  retrieval_top1_margin_weight: 0.05
+  retrieval_loss_weight: 0.0
+  retrieval_hard_ce_weight: 0.0
+  retrieval_top1_margin_weight: 0.0
   retrieval_top1_margin: 0.5
+  retrieval_coherence_weight: 0.0
+  retrieval_coherence_sigma: 0.10
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.05
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
-  transport_selection_weight: 0.5
+  transport_selection_weight: 1.5
   transport_selection_temperature: 0.2
   transport_validity_weight: 0.1
   transport_offset_smoothness_weight: 0.01
   transport_offset_edge_scale: 5.0
-  copy_usage_weight: 0.05
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
   perceptual_weight: 0.15
