@@ -1,7 +1,8 @@
 # Main Training Run, 512x512 input
+
 model:
   coarse_model:
-    enabled: false
+    enabled: true
     class: "CoarseModel"
     channels: [64, 128, 256, 384, 512]
     head_channels: 32
@@ -25,7 +26,7 @@ model:
     transport_eval_selection: "nearest_valid"
     matching_descriptor_dim: 256
     matching_hidden_dim: 192
-    match_coarse_rgb: false
+    match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
     query_image_context_matching: false
     key_image_context_matching: true
@@ -48,7 +49,7 @@ model:
     dropout: 0.1
     feature_i: 3
     feature_dim: null
-    concat_features: false
+    concat_features: true
     detach_coarse_rgb: false
     final_conv: false
     attention_masking: true
@@ -64,16 +65,16 @@ data:
   mask_min_coverage: 0.10
   mask_max_coverage: 0.35
   mask_generator:
-    style: "freeform"
-    # min_capsule_length_ratio: 0.035
-    # max_capsule_length_ratio: 0.16
-    # min_capsule_width_ratio: 0.008
-    # max_capsule_width_ratio: 0.035
-    # min_component_count: 10
-    # max_component_count: 28
-    # articulated_probability: 0.25
-    # connector_probability: 0.15
-    # overlap_tolerance: 0.08
+    style: "sparse_fashion"
+    min_capsule_length_ratio: 0.035
+    max_capsule_length_ratio: 0.16
+    min_capsule_width_ratio: 0.008
+    max_capsule_width_ratio: 0.035
+    min_component_count: 10
+    max_component_count: 28
+    articulated_probability: 0.25
+    connector_probability: 0.15
+    overlap_tolerance: 0.08
   force_random_masks_train: true
   force_random_masks_eval: true
 
