@@ -15,7 +15,7 @@ model:
     attention_selection: "softmax"
     attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
-    use_transport: true
+    use_transport: false
     transport_hidden_channels: 64
     transport_refine_steps: 2
     transport_offset_scale: 1.0
