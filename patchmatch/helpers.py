@@ -217,6 +217,157 @@ class PatchmatchHelpersMixin:
         sampled_values = self._sample_transport_map(source_patch_map, coords, mode="bilinear")
         return sampled_values * sampled_validity.to(dtype=sampled_values.dtype)
 
+    def _flatten_token_map(self, token_map: torch.Tensor) -> torch.Tensor:
+        return token_map.flatten(start_dim=2).transpose(1, 2).contiguous()
+
+    def _pool_transport_map(
+        self,
+        feature_map: torch.Tensor,
+        token_hw: tuple[int, int],
+        *,
+        mode: str,
+    ) -> torch.Tensor:
+        if mode == "avg":
+            return self._pool_to_token_grid(feature_map, token_hw)
+        if mode == "max":
+            return F.adaptive_max_pool2d(feature_map, token_hw)
+        raise ValueError(f"Unsupported transport pooling mode: {mode}")
+
+    def _compute_transport_score_init(
+        self,
+        query_token_map: torch.Tensor,
+        key_token_map: torch.Tensor,
+        query_mask_map: torch.Tensor,
+        valid_key_map: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = query_token_map.shape[0]
+        base_coords = self._get_normalized_token_coords(
+            token_hw,
+            dtype=query_token_map.dtype,
+            device=query_token_map.device,
+        ).expand(batch_size, -1, -1, -1)
+        base_coords_flat = base_coords.flatten(start_dim=2).transpose(1, 2)
+        score_coords_flat = base_coords_flat.clone()
+        score_strength_flat = torch.zeros(
+            (batch_size, base_coords_flat.shape[1]),
+            device=query_token_map.device,
+            dtype=query_token_map.dtype,
+        )
+        query_tokens = self._flatten_token_map(query_token_map)
+        key_tokens = self._flatten_token_map(key_token_map)
+        query_mask_flat = query_mask_map.flatten(start_dim=1) > 0.5
+        key_valid_flat = valid_key_map.flatten(start_dim=1) > 0.5
+
+        for batch_idx in range(batch_size):
+            query_indices = query_mask_flat[batch_idx].nonzero(as_tuple=False).flatten()
+            key_indices = key_valid_flat[batch_idx].nonzero(as_tuple=False).flatten()
+            if query_indices.numel() == 0 or key_indices.numel() == 0:
+                continue
+
+            raw_logits, _ = self.multihead_attention.compute_attention_logits(
+                query_tokens[batch_idx : batch_idx + 1, query_indices],
+                key_tokens[batch_idx : batch_idx + 1, key_indices],
+            )
+            logits = raw_logits.mean(dim=1).squeeze(0).float()
+            key_coords = base_coords_flat[batch_idx, key_indices].float()
+
+            if self.transport_score_top_k is not None and logits.shape[-1] > self.transport_score_top_k:
+                top_k = min(self.transport_score_top_k, logits.shape[-1])
+                top_logits, top_indices = torch.topk(logits, k=top_k, dim=-1)
+                probs = F.softmax(top_logits / self.transport_score_temperature, dim=-1)
+                matched_coords = (key_coords[top_indices] * probs.unsqueeze(-1)).sum(dim=1)
+                score_strength = probs.max(dim=-1).values
+            else:
+                probs = F.softmax(logits / self.transport_score_temperature, dim=-1)
+                matched_coords = probs @ key_coords
+                score_strength = probs.max(dim=-1).values
+
+            current_coords = base_coords_flat[batch_idx, query_indices].float()
+            blended_coords = current_coords + self.transport_score_init_scale * (matched_coords - current_coords)
+            score_coords_flat[batch_idx, query_indices] = blended_coords.to(dtype=score_coords_flat.dtype)
+            score_strength_flat[batch_idx, query_indices] = score_strength.to(dtype=score_strength_flat.dtype)
+
+        score_coords = score_coords_flat.transpose(1, 2).contiguous().view(batch_size, 2, token_hw[0], token_hw[1])
+        score_strength = score_strength_flat.view(batch_size, 1, token_hw[0], token_hw[1])
+        return score_coords, score_strength
+
+    def _compute_transport_confidence(
+        self,
+        query_token_map: torch.Tensor,
+        sampled_key_tokens: torch.Tensor,
+        query_mask_map: torch.Tensor,
+        sampled_validity: torch.Tensor,
+        coords: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if not self.transport_use_confidence or self.transport_confidence_head is None:
+            return None
+        confidence_input = torch.cat(
+            [query_token_map, sampled_key_tokens, query_mask_map, sampled_validity, coords],
+            dim=1,
+        )
+        confidence = torch.sigmoid(self.transport_confidence_head(confidence_input))
+        return (confidence * query_mask_map) + (1.0 - query_mask_map)
+
+    def _run_transport_local_refinement(
+        self,
+        query_token_map: torch.Tensor,
+        key_token_map: torch.Tensor,
+        valid_key_map: torch.Tensor,
+        query_mask_map: torch.Tensor,
+        coords: torch.Tensor,
+        token_hw: tuple[int, int],
+    ) -> torch.Tensor:
+        if not self.transport_use_local_refinement:
+            return coords
+
+        height, width = token_hw
+        radius = self.transport_local_window_size // 2
+        step_x = 0.0 if width <= 1 else 2.0 / float(width - 1)
+        step_y = 0.0 if height <= 1 else 2.0 / float(height - 1)
+        offsets = []
+        local_scores = []
+        for offset_y in range(-radius, radius + 1):
+            for offset_x in range(-radius, radius + 1):
+                delta = coords.new_tensor([offset_x * step_x, offset_y * step_y]).view(1, 2, 1, 1)
+                shifted_coords = torch.clamp(coords + delta, -1.0, 1.0)
+                sampled_key_tokens = self._sample_transport_map(key_token_map, shifted_coords)
+                sampled_validity = self._sample_transport_map(valid_key_map, shifted_coords).clamp_min(1e-6)
+                similarity = (query_token_map * sampled_key_tokens).sum(dim=1, keepdim=True).float()
+                similarity = similarity + sampled_validity.float().log()
+                offsets.append(delta)
+                local_scores.append(similarity)
+
+        local_logits = torch.cat(local_scores, dim=1) / self.transport_local_temperature
+        local_probs = F.softmax(local_logits, dim=1).to(dtype=coords.dtype)
+        offset_tensor = torch.stack(offsets, dim=1).to(dtype=coords.dtype)
+        offset_tensor = offset_tensor.expand(coords.shape[0], -1, -1, coords.shape[-2], coords.shape[-1])
+        delta = (local_probs.unsqueeze(2) * offset_tensor).sum(dim=1)
+        refined_coords = torch.clamp(coords + delta, -1.0, 1.0)
+        active_queries = (query_mask_map > 0.5).expand_as(refined_coords)
+        return torch.where(active_queries, refined_coords, coords)
+
+    def _run_transport_propagation(
+        self,
+        coords: torch.Tensor,
+        base_coords: torch.Tensor,
+        query_mask_map: torch.Tensor,
+        sampled_validity: torch.Tensor,
+        confidence: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not self.transport_use_propagation or self.transport_propagation_head is None:
+            return coords
+
+        displacement = coords - base_coords
+        propagation_inputs = [displacement, query_mask_map, sampled_validity]
+        if confidence is not None:
+            propagation_inputs.append(confidence)
+        propagation_delta = torch.tanh(self.transport_propagation_head(torch.cat(propagation_inputs, dim=1)))
+        propagation_delta = propagation_delta * self.transport_refine_scale
+        propagated_coords = torch.clamp(coords + propagation_delta, -1.0, 1.0)
+        active_queries = (query_mask_map > 0.5).expand_as(propagated_coords)
+        return torch.where(active_queries, propagated_coords, coords)
+
     def _snap_transport_to_valid_patches(
         self,
         source_patch_map: torch.Tensor,
@@ -284,9 +435,72 @@ class PatchmatchHelpersMixin:
             device=query_token_map.device,
         ).expand(batch_size, -1, -1, -1)
 
+        coarse_coords = None
+        init_coords = base_coords
+        if self.transport_use_coarse_to_fine and self.transport_coarse_ratio > 1 and min(height, width) > 1:
+            coarse_hw = (
+                max(1, height // self.transport_coarse_ratio),
+                max(1, width // self.transport_coarse_ratio),
+            )
+            if coarse_hw != token_hw:
+                coarse_query_map = self._pool_transport_map(query_token_map, coarse_hw, mode="avg")
+                coarse_key_map = self._pool_transport_map(key_token_map, coarse_hw, mode="avg")
+                coarse_query_mask = self._pool_transport_map(query_mask_map, coarse_hw, mode="max")
+                coarse_valid_key = self._pool_transport_map(valid_key_map, coarse_hw, mode="max")
+                coarse_base_coords = self._get_normalized_token_coords(
+                    coarse_hw,
+                    dtype=query_token_map.dtype,
+                    device=query_token_map.device,
+                ).expand(batch_size, -1, -1, -1)
+                coarse_init_coords = coarse_base_coords
+                if self.transport_use_score_init:
+                    coarse_score_coords, _ = self._compute_transport_score_init(
+                        coarse_query_map,
+                        coarse_key_map,
+                        coarse_query_mask,
+                        coarse_valid_key,
+                        coarse_hw,
+                    )
+                    coarse_active = (coarse_query_mask > 0.5).expand_as(coarse_init_coords)
+                    coarse_init_coords = torch.where(coarse_active, coarse_score_coords, coarse_init_coords)
+                coarse_init_input = torch.cat([coarse_query_map, coarse_query_mask], dim=1)
+                coarse_offsets = torch.tanh(self.transport_init_head(coarse_init_input)) * self.transport_offset_scale
+                coarse_coords = torch.clamp(coarse_init_coords + coarse_offsets, -1.0, 1.0)
+                coarse_sampled_key_tokens = self._sample_transport_map(coarse_key_map, coarse_coords)
+                coarse_sampled_validity = self._sample_transport_map(coarse_valid_key, coarse_coords)
+                for _ in range(self.transport_refine_steps):
+                    coarse_refine_input = torch.cat(
+                        [
+                            coarse_query_map,
+                            coarse_sampled_key_tokens,
+                            coarse_query_mask,
+                            coarse_sampled_validity,
+                            coarse_coords,
+                        ],
+                        dim=1,
+                    )
+                    coarse_delta = torch.tanh(self.transport_refine_head(coarse_refine_input)) * self.transport_refine_scale
+                    coarse_coords = torch.clamp(coarse_coords + coarse_delta, -1.0, 1.0)
+                    coarse_sampled_key_tokens = self._sample_transport_map(coarse_key_map, coarse_coords)
+                    coarse_sampled_validity = self._sample_transport_map(coarse_valid_key, coarse_coords)
+                init_coords = F.interpolate(coarse_coords, size=token_hw, mode="bilinear", align_corners=True)
+
+        score_init_coords = None
+        score_init_strength = None
+        if self.transport_use_score_init:
+            score_init_coords, score_init_strength = self._compute_transport_score_init(
+                query_token_map,
+                key_token_map,
+                query_mask_map,
+                valid_key_map,
+                token_hw,
+            )
+            active_queries = (query_mask_map > 0.5).expand_as(init_coords)
+            init_coords = torch.where(active_queries, score_init_coords, init_coords)
+
         init_input = torch.cat([query_token_map, query_mask_map], dim=1)
         init_offsets = torch.tanh(self.transport_init_head(init_input)) * self.transport_offset_scale
-        coords = torch.clamp(base_coords + init_offsets, -1.0, 1.0)
+        coords = torch.clamp(init_coords + init_offsets, -1.0, 1.0)
 
         sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
         sampled_validity = self._sample_transport_map(valid_key_map, coords)
@@ -300,11 +514,51 @@ class PatchmatchHelpersMixin:
             sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
             sampled_validity = self._sample_transport_map(valid_key_map, coords)
 
+        coords = self._run_transport_local_refinement(
+            query_token_map,
+            key_token_map,
+            valid_key_map,
+            query_mask_map,
+            coords,
+            token_hw,
+        )
+        sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
+        sampled_validity = self._sample_transport_map(valid_key_map, coords)
+
+        confidence = self._compute_transport_confidence(
+            query_token_map,
+            sampled_key_tokens,
+            query_mask_map,
+            sampled_validity,
+            coords,
+        )
+        for _ in range(self.transport_propagation_steps):
+            coords = self._run_transport_propagation(
+                coords,
+                base_coords,
+                query_mask_map,
+                sampled_validity,
+                confidence,
+            )
+            sampled_key_tokens = self._sample_transport_map(key_token_map, coords)
+            sampled_validity = self._sample_transport_map(valid_key_map, coords)
+            confidence = self._compute_transport_confidence(
+                query_token_map,
+                sampled_key_tokens,
+                query_mask_map,
+                sampled_validity,
+                coords,
+            )
+
         return {
             "base_coords": base_coords,
             "coords": coords,
             "sampled_key_tokens": sampled_key_tokens,
             "sampled_validity": sampled_validity,
+            "coarse_coords": coarse_coords,
+            "score_init_coords": score_init_coords,
+            "score_init_strength": score_init_strength,
+            "confidence": confidence,
         }
 
     def _build_transport_aux(
@@ -320,6 +574,10 @@ class PatchmatchHelpersMixin:
         coords = transport_state["coords"]
         base_coords = transport_state["base_coords"]
         sampled_validity = transport_state["sampled_validity"]
+        confidence = transport_state.get("confidence")
+        coarse_coords = transport_state.get("coarse_coords")
+        score_init_coords = transport_state.get("score_init_coords")
+        score_init_strength = transport_state.get("score_init_strength")
 
         sampled_validity = sampled_validity.clamp(0.0, 1.0)
         hard_validity = self._sample_transport_map(
@@ -331,7 +589,13 @@ class PatchmatchHelpersMixin:
         sampled_values_flat = sampled_values.flatten(start_dim=2).transpose(1, 2)
         sampled_validity_flat = sampled_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
         hard_validity_flat = hard_validity.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
-        fallback_mask = hard_validity_flat < self.transport_fallback_validity_threshold
+        confidence_flat = None
+        if confidence is not None:
+            confidence_flat = confidence.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
+        effective_validity_flat = sampled_validity_flat
+        if confidence_flat is not None:
+            effective_validity_flat = effective_validity_flat * confidence_flat
+        fallback_mask = effective_validity_flat < self.transport_fallback_validity_threshold
         if default_tokens is not None:
             valid_copy = (~fallback_mask).to(dtype=sampled_values_flat.dtype).unsqueeze(-1)
             sampled_values_flat = (valid_copy * sampled_values_flat) + ((1.0 - valid_copy) * default_tokens)
@@ -407,7 +671,6 @@ class PatchmatchHelpersMixin:
             )
 
         selection_coords_flat = coords_flat
-        effective_validity_flat = sampled_validity_flat
         effective_fallback_mask = fallback_mask
         if selected_indices is not None:
             base_coords_flat = base_coords.flatten(start_dim=2).transpose(1, 2)
@@ -450,6 +713,14 @@ class PatchmatchHelpersMixin:
             "transport_fallback_mask": fallback_mask,
             "transport_effective_fallback_mask": effective_fallback_mask,
         }
+        if confidence_flat is not None:
+            aux["transport_confidence"] = confidence_flat
+        if coarse_coords is not None:
+            aux["transport_coarse_coords"] = coarse_coords.flatten(start_dim=2).transpose(1, 2)
+        if score_init_coords is not None:
+            aux["transport_score_init_coords"] = score_init_coords.flatten(start_dim=2).transpose(1, 2)
+        if score_init_strength is not None:
+            aux["transport_score_init_strength"] = score_init_strength.flatten(start_dim=2).transpose(1, 2).squeeze(-1)
         if selected_indices is not None:
             aux["transport_selected_indices"] = selected_indices
         return sampled_values_flat, aux
@@ -603,7 +874,7 @@ class PatchmatchHelpersMixin:
             default_tokens=default_tokens,
         )
         sampled_values_flat = aux["transport_values"]
-        sampled_validity_flat = aux["transport_validity"]
+        sampled_validity_flat = aux["transport_effective_validity"]
         coords_flat = aux["transport_coords"]
         selected_indices = aux.get("transport_selected_indices")
 

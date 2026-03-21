@@ -28,6 +28,18 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         transport_refine_steps: int = 2,
         transport_offset_scale: float = 1.0,
         transport_refine_scale: float = 0.25,
+        transport_use_score_init: bool = False,
+        transport_score_temperature: float = 1.0,
+        transport_score_top_k: int | None = None,
+        transport_score_init_scale: float = 1.0,
+        transport_use_coarse_to_fine: bool = False,
+        transport_coarse_ratio: int = 2,
+        transport_use_confidence: bool = False,
+        transport_use_local_refinement: bool = False,
+        transport_local_window_size: int = 3,
+        transport_local_temperature: float = 1.0,
+        transport_use_propagation: bool = False,
+        transport_propagation_steps: int = 1,
         transport_fallback_validity_threshold: float = 0.1,
         transport_snap_to_valid_eval: bool = True,
         transport_train_selection: str = "bilinear",
@@ -199,6 +211,18 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_refine_steps = max(0, int(transport_refine_steps))
         self.transport_offset_scale = float(transport_offset_scale)
         self.transport_refine_scale = float(transport_refine_scale)
+        self.transport_use_score_init = bool(transport_use_score_init)
+        self.transport_score_temperature = float(transport_score_temperature)
+        self.transport_score_top_k = None if transport_score_top_k is None else int(transport_score_top_k)
+        self.transport_score_init_scale = float(transport_score_init_scale)
+        self.transport_use_coarse_to_fine = bool(transport_use_coarse_to_fine)
+        self.transport_coarse_ratio = int(transport_coarse_ratio)
+        self.transport_use_confidence = bool(transport_use_confidence)
+        self.transport_use_local_refinement = bool(transport_use_local_refinement)
+        self.transport_local_window_size = int(transport_local_window_size)
+        self.transport_local_temperature = float(transport_local_temperature)
+        self.transport_use_propagation = bool(transport_use_propagation)
+        self.transport_propagation_steps = max(0, int(transport_propagation_steps))
         self.transport_fallback_validity_threshold = float(transport_fallback_validity_threshold)
         self.transport_snap_to_valid_eval = bool(transport_snap_to_valid_eval)
         self.transport_train_selection = str(transport_train_selection).lower()
@@ -212,6 +236,18 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             raise ValueError("transport_offset_scale must be non-negative.")
         if self.transport_refine_scale < 0:
             raise ValueError("transport_refine_scale must be non-negative.")
+        if self.transport_score_temperature <= 0:
+            raise ValueError("transport_score_temperature must be positive.")
+        if self.transport_score_top_k is not None and self.transport_score_top_k <= 0:
+            self.transport_score_top_k = None
+        if self.transport_score_init_scale < 0:
+            raise ValueError("transport_score_init_scale must be non-negative.")
+        if self.transport_use_coarse_to_fine and self.transport_coarse_ratio <= 1:
+            raise ValueError("transport_coarse_ratio must be greater than 1 when transport_use_coarse_to_fine=True.")
+        if self.transport_local_window_size <= 0 or self.transport_local_window_size % 2 == 0:
+            raise ValueError("transport_local_window_size must be a positive odd integer.")
+        if self.transport_local_temperature <= 0:
+            raise ValueError("transport_local_temperature must be positive.")
         if not 0.0 <= self.transport_fallback_validity_threshold <= 1.0:
             raise ValueError("transport_fallback_validity_threshold must be in [0, 1].")
         if self.transport_train_selection not in {"bilinear", "straight_through_nearest_valid"}:
@@ -238,6 +274,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_descriptor_head = None
         self.transport_init_head = None
         self.transport_refine_head = None
+        self.transport_confidence_head = None
+        self.transport_propagation_head = None
         if self.separate_query_key_matching:
             query_context_in_channels = 5 if self.query_boundary_only_matching else 4
             self.query_context_encoder = self._build_context_encoder(query_context_in_channels, self.query_context_channels)
@@ -274,6 +312,11 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             transport_refine_in = (self.patch_token_dim * 2) + 4
             self.transport_init_head = self._build_transport_head(transport_init_in, 2)
             self.transport_refine_head = self._build_transport_head(transport_refine_in, 2)
+            if self.transport_use_confidence:
+                self.transport_confidence_head = self._build_transport_head(transport_refine_in, 1)
+            if self.transport_use_propagation:
+                transport_propagation_in = 4 + (1 if self.transport_use_confidence else 0)
+                self.transport_propagation_head = self._build_transport_head(transport_propagation_in, 2)
         if self.query_boundary_only_matching:
             if self.query_context_encoder is None:
                 self.query_context_encoder = self._build_context_encoder(5, self.query_context_channels)

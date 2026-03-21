@@ -20,6 +20,18 @@ model:
     transport_refine_steps: 2
     transport_offset_scale: 1.0
     transport_refine_scale: 0.25
+    transport_use_score_init: true
+    transport_score_temperature: 0.5
+    transport_score_top_k: 32
+    transport_score_init_scale: 1.0
+    transport_use_coarse_to_fine: true
+    transport_coarse_ratio: 2
+    transport_use_confidence: true
+    transport_use_local_refinement: true
+    transport_local_window_size: 3
+    transport_local_temperature: 0.5
+    transport_use_propagation: true
+    transport_propagation_steps: 1
     transport_fallback_validity_threshold: 0.1
     transport_snap_to_valid_eval: true
     transport_train_selection: "bilinear"
@@ -28,8 +40,8 @@ model:
     matching_hidden_dim: 192
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
-    query_image_context_matching: false
-    key_image_context_matching: true
+    query_image_context_matching: true
+    key_image_context_matching: false
     query_boundary_only_matching: true
     query_boundary_inner_dilation: 0
     query_boundary_outer_dilation: 3
