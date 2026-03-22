@@ -91,7 +91,7 @@ data:
   force_random_masks_eval: true
 
 training:
-  total_epochs: 100
+  total_epochs: 80
   grad_accum_steps: 4
   lr: 0.001
   scorer_lr: 0.0005
