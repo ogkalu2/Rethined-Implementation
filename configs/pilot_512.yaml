@@ -78,7 +78,6 @@ data:
   mask_max_coverage: 0.40
   mask_generator:
     style: "sparse_fashion"
-    working_size: 512
     min_capsule_length_ratio: 0.035
     max_capsule_length_ratio: 0.16
     min_capsule_width_ratio: 0.008
