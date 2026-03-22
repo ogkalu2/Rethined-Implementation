@@ -26,7 +26,7 @@ model:
     transport_score_init_scale: 1.0
     transport_use_coarse_to_fine: false
     transport_coarse_ratio: 2
-    transport_use_confidence: true
+    transport_use_confidence: false
     transport_use_local_refinement: false
     transport_local_window_size: 3
     transport_local_temperature: 0.5
@@ -44,7 +44,7 @@ model:
     key_image_context_matching: false
     query_boundary_only_matching: true
     query_boundary_inner_dilation: 0
-    query_boundary_outer_dilation: 3
+    query_boundary_outer_dilation: 16
     separate_query_key_matching: false
     shared_query_key_descriptor: false
     query_context_channels: 32
