@@ -25,6 +25,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_gumbel_hard: bool = True,
         use_transport: bool = False,
         transport_hidden_channels: int = 64,
+        transport_candidate_count: int = 4,
         transport_refine_steps: int = 2,
         transport_offset_scale: float = 1.0,
         transport_refine_scale: float = 0.25,
@@ -208,6 +209,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         )
         self.use_transport = bool(use_transport)
         self.transport_hidden_channels = int(transport_hidden_channels)
+        self.transport_candidate_count = max(1, int(transport_candidate_count))
         self.transport_refine_steps = max(0, int(transport_refine_steps))
         self.transport_offset_scale = float(transport_offset_scale)
         self.transport_refine_scale = float(transport_refine_scale)
@@ -274,6 +276,8 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.matching_descriptor_head = None
         self.transport_init_head = None
         self.transport_refine_head = None
+        self.transport_candidate_refine_head = None
+        self.transport_candidate_score_head = None
         self.transport_confidence_head = None
         self.transport_propagation_head = None
         if self.separate_query_key_matching:
@@ -310,13 +314,25 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         if self.use_transport:
             transport_init_in = self.patch_token_dim + 1
             transport_refine_in = (self.patch_token_dim * 2) + 4
+            transport_candidate_score_in = transport_refine_in + 2
             self.transport_init_head = self._build_transport_head(transport_init_in, 2)
             self.transport_refine_head = self._build_transport_head(transport_refine_in, 2)
+            self.transport_candidate_refine_head = self._build_transport_head(
+                transport_refine_in,
+                self.transport_candidate_count * 2,
+            )
+            self.transport_candidate_score_head = self._build_transport_head(
+                transport_candidate_score_in,
+                1,
+            )
             if self.transport_use_confidence:
                 self.transport_confidence_head = self._build_transport_head(transport_refine_in, 1)
             if self.transport_use_propagation:
                 transport_propagation_in = 4 + (1 if self.transport_use_confidence else 0)
-                self.transport_propagation_head = self._build_transport_head(transport_propagation_in, 2)
+                self.transport_propagation_head = self._build_transport_head(
+                    transport_propagation_in,
+                    self.transport_candidate_count * 2,
+                )
         if self.query_boundary_only_matching:
             if self.query_context_encoder is None:
                 self.query_context_encoder = self._build_context_encoder(5, self.query_context_channels)

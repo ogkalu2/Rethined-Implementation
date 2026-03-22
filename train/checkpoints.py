@@ -2,12 +2,33 @@ from __future__ import annotations
 
 import json
 import time
+import warnings
 from pathlib import Path
 
 import torch
 from torchvision.utils import make_grid, save_image
 
 from distributed_utils import unwrap_model
+
+
+_LEGACY_OPTIONAL_MISSING_KEYS = {
+    "inpainter.transport_candidate_refine_head.0.weight",
+    "inpainter.transport_candidate_refine_head.2.weight",
+    "inpainter.transport_candidate_refine_head.4.weight",
+    "inpainter.transport_candidate_refine_head.4.bias",
+    "inpainter.transport_candidate_score_head.0.weight",
+    "inpainter.transport_candidate_score_head.2.weight",
+    "inpainter.transport_candidate_score_head.4.weight",
+    "inpainter.transport_candidate_score_head.4.bias",
+    "hr_upscaler.patch_inpainting.transport_candidate_refine_head.0.weight",
+    "hr_upscaler.patch_inpainting.transport_candidate_refine_head.2.weight",
+    "hr_upscaler.patch_inpainting.transport_candidate_refine_head.4.weight",
+    "hr_upscaler.patch_inpainting.transport_candidate_refine_head.4.bias",
+    "hr_upscaler.patch_inpainting.transport_candidate_score_head.0.weight",
+    "hr_upscaler.patch_inpainting.transport_candidate_score_head.2.weight",
+    "hr_upscaler.patch_inpainting.transport_candidate_score_head.4.weight",
+    "hr_upscaler.patch_inpainting.transport_candidate_score_head.4.bias",
+}
 
 
 def save_checkpoint(
@@ -69,6 +90,14 @@ def load_model_checkpoint(model, state_dict):
     if state_dict and all(key.startswith("module.") for key in state_dict):
         state_dict = {key[len("module."):]: value for key, value in state_dict.items()}
     missing_keys, unexpected_keys = raw_model.load_state_dict(state_dict, strict=False)
+    ignored_missing_keys = sorted(key for key in missing_keys if key in _LEGACY_OPTIONAL_MISSING_KEYS)
+    missing_keys = [key for key in missing_keys if key not in _LEGACY_OPTIONAL_MISSING_KEYS]
+    if ignored_missing_keys:
+        warnings.warn(
+            "Loading checkpoint with randomly initialized legacy transport candidate heads: "
+            f"{ignored_missing_keys}",
+            RuntimeWarning,
+        )
     if missing_keys or unexpected_keys:
         raise RuntimeError(
             "Checkpoint is incompatible with the current model. "
