@@ -35,6 +35,35 @@ def save_checkpoint(
     )
 
 
+def prune_checkpoints(checkpoint_dir, keep_last_checkpoints, prefix="step_", preserve_paths=()):
+    if keep_last_checkpoints is None:
+        return []
+    keep_last_checkpoints = int(keep_last_checkpoints)
+    if keep_last_checkpoints <= 0:
+        return []
+
+    checkpoint_dir = Path(checkpoint_dir)
+    preserve_paths = {Path(path).resolve() for path in preserve_paths}
+    numbered_checkpoints = []
+    for path in checkpoint_dir.glob(f"{prefix}*.pth"):
+        try:
+            step = int(path.stem[len(prefix):])
+        except (IndexError, ValueError):
+            continue
+        numbered_checkpoints.append((step, path))
+
+    numbered_checkpoints.sort(key=lambda item: (item[0], item[1].name))
+    kept_paths = {path.resolve() for _, path in numbered_checkpoints[-keep_last_checkpoints:]}
+    removed_paths = []
+    for _, path in numbered_checkpoints:
+        resolved_path = path.resolve()
+        if resolved_path in kept_paths or resolved_path in preserve_paths:
+            continue
+        path.unlink(missing_ok=True)
+        removed_paths.append(path)
+    return removed_paths
+
+
 def load_model_checkpoint(model, state_dict):
     raw_model = unwrap_model(model)
     if state_dict and all(key.startswith("module.") for key in state_dict):

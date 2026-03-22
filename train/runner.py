@@ -24,6 +24,7 @@ from .checkpoints import (
     format_train_metric_snapshot,
     format_val_selection_snapshot,
     load_training_checkpoint,
+    prune_checkpoints,
     save_checkpoint,
     save_vis,
     write_status,
@@ -521,6 +522,36 @@ def train(cfg, args, dist_ctx):
                         f"Saved best checkpoint: {best_path} "
                         f"({best_metric_name}={best_metric_value:.6f} at step {best_metric_step}, epoch {epoch:.2f})"
                     )
+                keep_last_eval_checkpoints = log_cfg.get("keep_last_checkpoints")
+                if keep_last_eval_checkpoints:
+                    eval_ckpt_path = ckpt_dir / f"eval_step_{step}.pth"
+                    checkpoint_metrics = build_checkpoint_metrics(
+                        metrics,
+                        best_metric_name,
+                        best_metric_mode,
+                        best_metric_value,
+                        best_metric_step,
+                    )
+                    save_checkpoint(
+                        model,
+                        optimizer_g,
+                        scaler,
+                        step,
+                        epoch,
+                        checkpoint_metrics,
+                        cfg,
+                        eval_ckpt_path,
+                    )
+                    progress_bar.write(f"Saved eval checkpoint: {eval_ckpt_path} (epoch {epoch:.2f})")
+                    removed_paths = prune_checkpoints(
+                        ckpt_dir,
+                        keep_last_eval_checkpoints,
+                        prefix="eval_step_",
+                        preserve_paths=(eval_ckpt_path,),
+                    )
+                    if removed_paths:
+                        removed_names = ", ".join(path.name for path in removed_paths)
+                        progress_bar.write(f"Pruned old eval checkpoints: {removed_names}")
             empty_device_cache(device)
             barrier(dist_ctx)
 
