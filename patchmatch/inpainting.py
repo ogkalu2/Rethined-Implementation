@@ -32,6 +32,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         transport_score_temperature: float = 1.0,
         transport_score_top_k: int | None = None,
         transport_score_init_scale: float = 1.0,
+        transport_direct_scorer_supervision: bool = False,
         transport_use_coarse_to_fine: bool = False,
         transport_coarse_ratio: int = 2,
         transport_use_confidence: bool = False,
@@ -215,6 +216,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_score_temperature = float(transport_score_temperature)
         self.transport_score_top_k = None if transport_score_top_k is None else int(transport_score_top_k)
         self.transport_score_init_scale = float(transport_score_init_scale)
+        self.transport_direct_scorer_supervision = bool(transport_direct_scorer_supervision)
         self.transport_use_coarse_to_fine = bool(transport_use_coarse_to_fine)
         self.transport_coarse_ratio = int(transport_coarse_ratio)
         self.transport_use_confidence = bool(transport_use_confidence)
@@ -563,7 +565,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
 
         attention_supervision_entries = None
         copy_aux = None
-        if return_aux and not self.use_transport:
+        if return_aux and ((not self.use_transport) or self.transport_direct_scorer_supervision):
             attention_supervision_entries = self.build_attention_supervision_entries(
                 query_tokens,
                 key_tokens,
