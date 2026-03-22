@@ -20,7 +20,7 @@ model:
     transport_refine_steps: 2
     transport_offset_scale: 1.0
     transport_refine_scale: 0.25
-    transport_use_score_init: false
+    transport_use_score_init: true
     transport_score_temperature: 0.5
     transport_score_top_k: 32
     transport_score_init_scale: 1.0
