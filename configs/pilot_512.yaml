@@ -24,6 +24,8 @@ model:
     transport_score_temperature: 0.5
     transport_score_top_k: 32
     transport_score_init_scale: 1.0
+    transport_score_assignment: "capacity_greedy"
+    transport_score_assignment_capacity: 1
     transport_use_coarse_to_fine: false
     transport_coarse_ratio: 2
     transport_use_confidence: false
@@ -36,6 +38,7 @@ model:
     transport_snap_to_valid_eval: true
     transport_train_selection: "bilinear"
     transport_eval_selection: "nearest_valid"
+    transport_direct_scorer_supervision: true
     matching_descriptor_dim: 256
     matching_hidden_dim: 192
     match_coarse_rgb: false
@@ -115,13 +118,15 @@ loss:
   retrieval_coherence_sigma: 0.10
   retrieval_teacher_patch_padding: 8
   retrieval_teacher_temperature: 0.05
+  retrieval_teacher_mode: "hard"
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
-  transport_selection_weight: 1.5
+  transport_selection_weight: 0.25
   transport_selection_temperature: 0.2
   transport_validity_weight: 0.1
   transport_offset_smoothness_weight: 0.01
   transport_offset_edge_scale: 5.0
+  transport_descriptor_pretrain_steps: 455
   loss_schedule_focus_steps: 0
   loss_schedule_transition_steps: 0
   perceptual_weight: 0.15

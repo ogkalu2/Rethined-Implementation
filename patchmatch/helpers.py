@@ -327,6 +327,55 @@ class PatchmatchHelpersMixin:
         )
         return selected_coords, selection_strength
 
+    def _capacity_constrained_topk_assignment(
+        self,
+        top_logits: torch.Tensor,
+        top_indices: torch.Tensor,
+        top_valid_mask: torch.Tensor,
+        *,
+        per_key_capacity: int,
+    ) -> torch.Tensor:
+        if top_logits.numel() == 0:
+            return torch.empty((0,), device=top_logits.device, dtype=torch.long)
+        if per_key_capacity <= 0:
+            per_key_capacity = 1
+
+        assignment = torch.full((top_logits.shape[0],), -1, device=top_logits.device, dtype=torch.long)
+        valid_pair_mask = top_valid_mask.bool()
+        if not valid_pair_mask.any():
+            return assignment
+
+        cpu_logits = top_logits.detach().cpu()
+        cpu_indices = top_indices.detach().cpu()
+        cpu_valid = valid_pair_mask.detach().cpu()
+        num_candidates = top_logits.shape[1]
+        flat_scores = cpu_logits.masked_fill(~cpu_valid, float("-inf")).view(-1)
+        flat_order = flat_scores.argsort(descending=True)
+        key_usage: dict[int, int] = {}
+
+        for flat_idx in flat_order.tolist():
+            query_idx = flat_idx // num_candidates
+            slot_idx = flat_idx % num_candidates
+            if not bool(cpu_valid[query_idx, slot_idx]):
+                break
+            if int(assignment[query_idx].item()) >= 0:
+                continue
+            key_idx = int(cpu_indices[query_idx, slot_idx].item())
+            if key_idx < 0:
+                continue
+            used = key_usage.get(key_idx, 0)
+            if used >= per_key_capacity:
+                continue
+            assignment[query_idx] = slot_idx
+            key_usage[key_idx] = used + 1
+
+        for query_idx in (assignment < 0).nonzero(as_tuple=False).flatten().detach().cpu().tolist():
+            valid_slots = cpu_valid[query_idx].nonzero(as_tuple=False).flatten()
+            if valid_slots.numel() == 0:
+                continue
+            assignment[query_idx] = int(valid_slots[0].item())
+        return assignment
+
     def _compute_transport_score_init(
         self,
         query_token_map: torch.Tensor,
@@ -334,7 +383,7 @@ class PatchmatchHelpersMixin:
         query_mask_map: torch.Tensor,
         valid_key_map: torch.Tensor,
         token_hw: tuple[int, int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> dict[str, torch.Tensor]:
         batch_size = query_token_map.shape[0]
         base_coords = self._get_normalized_token_coords(
             token_hw,
@@ -352,6 +401,22 @@ class PatchmatchHelpersMixin:
         key_tokens = self._flatten_token_map(key_token_map)
         query_mask_flat = query_mask_map.flatten(start_dim=1) > 0.5
         key_valid_flat = valid_key_map.flatten(start_dim=1) > 0.5
+        top_k = self.transport_score_top_k
+        if top_k is None:
+            top_k = min(32, base_coords_flat.shape[1])
+        top_k = max(1, min(int(top_k), base_coords_flat.shape[1]))
+        invalid_logit = -1e4
+        candidate_logits = score_coords_flat.new_full(
+            (batch_size, base_coords_flat.shape[1], top_k),
+            invalid_logit,
+        )
+        candidate_key_indices = torch.full(
+            (batch_size, base_coords_flat.shape[1], top_k),
+            -1,
+            device=query_tokens.device,
+            dtype=torch.long,
+        )
+        candidate_coords = base_coords_flat.new_zeros((batch_size, base_coords_flat.shape[1], top_k, 2))
 
         for batch_idx in range(batch_size):
             query_indices = query_mask_flat[batch_idx].nonzero(as_tuple=False).flatten()
@@ -366,27 +431,58 @@ class PatchmatchHelpersMixin:
             logits = raw_logits.mean(dim=1).squeeze(0).float()
             key_coords = base_coords_flat[batch_idx, key_indices].float()
 
-            if self.transport_score_top_k is not None and logits.shape[-1] > self.transport_score_top_k:
-                top_k = min(self.transport_score_top_k, logits.shape[-1])
-                top_logits, top_indices = torch.topk(logits, k=top_k, dim=-1)
+            if logits.shape[-1] > top_k:
+                top_logits, top_positions = torch.topk(logits, k=top_k, dim=-1)
+                top_indices = key_indices[top_positions]
+                top_valid_mask = torch.ones_like(top_indices, dtype=torch.bool)
             else:
-                top_logits = logits
-                top_indices = torch.arange(
-                    logits.shape[-1],
-                    device=logits.device,
-                    dtype=torch.long,
-                ).unsqueeze(0).expand(logits.shape[0], -1)
+                pad_width = top_k - logits.shape[-1]
+                top_logits = F.pad(logits, (0, pad_width), value=invalid_logit)
+                top_indices = F.pad(key_indices.unsqueeze(0).expand(logits.shape[0], -1), (0, pad_width), value=-1)
+                top_valid_mask = top_indices >= 0
 
-            probs = F.softmax(top_logits / self.transport_score_temperature, dim=-1)
-            if self.training:
-                hard_idx = probs.argmax(dim=-1, keepdim=True)
-                hard = torch.zeros_like(probs).scatter_(1, hard_idx, 1.0)
-                weights = probs + (hard - probs).detach()
+            batch_candidate_coords = base_coords_flat[batch_idx, top_indices.clamp_min(0)]
+            batch_candidate_coords = torch.where(
+                top_valid_mask.unsqueeze(-1),
+                batch_candidate_coords,
+                torch.zeros_like(batch_candidate_coords),
+            )
+            candidate_logits[batch_idx, query_indices] = top_logits
+            candidate_key_indices[batch_idx, query_indices] = top_indices
+            candidate_coords[batch_idx, query_indices] = batch_candidate_coords
+
+            masked_top_logits = torch.where(
+                top_valid_mask,
+                top_logits,
+                torch.full_like(top_logits, invalid_logit),
+            )
+            probs = F.softmax(masked_top_logits / self.transport_score_temperature, dim=-1)
+            if self.transport_score_assignment == "capacity_greedy":
+                assigned_slots = self._capacity_constrained_topk_assignment(
+                    masked_top_logits,
+                    top_indices,
+                    top_valid_mask,
+                    per_key_capacity=self.transport_score_assignment_capacity,
+                )
+                safe_slots = assigned_slots.clamp_min(0)
+                row_indices = torch.arange(batch_candidate_coords.shape[0], device=batch_candidate_coords.device)
+                matched_coords = batch_candidate_coords[row_indices, safe_slots]
+                score_strength = probs[row_indices, safe_slots]
+                score_strength = torch.where(
+                    assigned_slots >= 0,
+                    score_strength,
+                    torch.zeros_like(score_strength),
+                )
             else:
-                hard_idx = probs.argmax(dim=-1, keepdim=True)
-                weights = torch.zeros_like(probs).scatter_(1, hard_idx, 1.0)
-            matched_coords = (key_coords[top_indices] * weights.unsqueeze(-1)).sum(dim=1)
-            score_strength = probs.max(dim=-1).values
+                if self.training:
+                    hard_idx = probs.argmax(dim=-1, keepdim=True)
+                    hard = torch.zeros_like(probs).scatter_(1, hard_idx, 1.0)
+                    weights = probs + (hard - probs).detach()
+                else:
+                    hard_idx = probs.argmax(dim=-1, keepdim=True)
+                    weights = torch.zeros_like(probs).scatter_(1, hard_idx, 1.0)
+                matched_coords = (batch_candidate_coords * weights.unsqueeze(-1)).sum(dim=1)
+                score_strength = probs.max(dim=-1).values
 
             current_coords = base_coords_flat[batch_idx, query_indices].float()
             blended_coords = current_coords + self.transport_score_init_scale * (matched_coords - current_coords)
@@ -396,7 +492,27 @@ class PatchmatchHelpersMixin:
 
         score_coords = score_coords_flat.transpose(1, 2).contiguous().view(batch_size, 2, token_hw[0], token_hw[1])
         score_strength = score_strength_flat.view(batch_size, 1, token_hw[0], token_hw[1])
-        return score_coords, score_strength
+        candidate_valid_mask = candidate_key_indices >= 0
+        masked_logits = torch.where(
+            candidate_valid_mask,
+            candidate_logits,
+            torch.full_like(candidate_logits, invalid_logit),
+        )
+        has_valid = candidate_valid_mask.any(dim=-1, keepdim=True)
+        safe_candidate_logits = torch.where(has_valid, masked_logits, torch.zeros_like(candidate_logits))
+        scaled_logits = safe_candidate_logits / max(float(self.transport_score_temperature), 1e-6)
+        candidate_probs = F.softmax(scaled_logits, dim=-1)
+        candidate_log_probs = F.log_softmax(scaled_logits, dim=-1)
+        return {
+            "coords": score_coords,
+            "strength": score_strength,
+            "candidate_logits": safe_candidate_logits.float(),
+            "candidate_probs": candidate_probs.float(),
+            "candidate_log_probs": candidate_log_probs.float(),
+            "candidate_key_indices": candidate_key_indices,
+            "candidate_valid_mask": candidate_valid_mask,
+            "candidate_coords": candidate_coords.float(),
+        }
 
     def _compute_transport_confidence(
         self,
@@ -576,13 +692,14 @@ class PatchmatchHelpersMixin:
                 ).expand(batch_size, -1, -1, -1)
                 coarse_init_coords = coarse_base_coords
                 if self.transport_use_score_init:
-                    coarse_score_coords, _ = self._compute_transport_score_init(
+                    coarse_score_state = self._compute_transport_score_init(
                         coarse_query_map,
                         coarse_key_map,
                         coarse_query_mask,
                         coarse_valid_key,
                         coarse_hw,
                     )
+                    coarse_score_coords = coarse_score_state["coords"]
                     coarse_active = (coarse_query_mask > 0.5).expand_as(coarse_init_coords)
                     coarse_init_coords = torch.where(coarse_active, coarse_score_coords, coarse_init_coords)
                 coarse_init_input = torch.cat([coarse_query_map, coarse_query_mask], dim=1)
@@ -637,14 +754,17 @@ class PatchmatchHelpersMixin:
 
         score_init_coords = None
         score_init_strength = None
+        score_init_scorer_state = None
         if self.transport_use_score_init:
-            score_init_coords, score_init_strength = self._compute_transport_score_init(
+            score_init_scorer_state = self._compute_transport_score_init(
                 query_token_map,
                 key_token_map,
                 query_mask_map,
                 valid_key_map,
                 token_hw,
             )
+            score_init_coords = score_init_scorer_state["coords"]
+            score_init_strength = score_init_scorer_state["strength"]
 
         init_candidates = [base_coords]
         if coarse_seed_coords is not None:
@@ -726,6 +846,7 @@ class PatchmatchHelpersMixin:
             "coarse_coords": coarse_coords,
             "score_init_coords": score_init_coords,
             "score_init_strength": score_init_strength,
+            "score_init_scorer_state": score_init_scorer_state,
             "confidence": confidence,
         }
 
@@ -1033,6 +1154,15 @@ class PatchmatchHelpersMixin:
             key_valid_flat,
             token_hw,
         )
+        attention_supervision_entries = None
+        if return_aux_entries and self.transport_direct_scorer_supervision:
+            attention_supervision_entries = self.build_attention_supervision_entries(
+                query_tokens_full,
+                key_tokens_full,
+                query_mask_flat,
+                key_valid_flat,
+                token_hw,
+            )
         _, aux = self._build_transport_aux(
             source_patch_map,
             query_mask_flat,
@@ -1041,6 +1171,9 @@ class PatchmatchHelpersMixin:
             transport_state,
             default_tokens=default_tokens,
         )
+        if attention_supervision_entries is not None:
+            aux["attention_supervision_entries"] = attention_supervision_entries
+            aux["transport_descriptor_supervision"] = True
         sampled_values_flat = aux["transport_values"]
         sampled_validity_flat = aux["transport_effective_validity"]
         coords_flat = aux["transport_coords"]
