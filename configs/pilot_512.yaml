@@ -41,12 +41,12 @@ model:
     matching_hidden_dim: 192
     match_coarse_rgb: true
     coarse_rgb_branch_dropout: 0
-    query_image_context_matching: true
+    query_image_context_matching: false
     key_image_context_matching: false
     query_boundary_only_matching: false
     query_boundary_inner_dilation: 0
     query_boundary_outer_dilation: 16
-    separate_query_key_matching: false
+    separate_query_key_matching: true
     shared_query_key_descriptor: false
     query_context_channels: 32
     query_context_residual_init: 0.1
@@ -57,8 +57,8 @@ model:
     stem_out_stride: 1
     stem_out_channels: 3
     image_size: 512
-    embed_dim: 2048
-    use_positional_encoding: true
+    embed_dim: 256
+    use_positional_encoding: false
     dropout: 0.1
     feature_i: 3
     feature_dim: null
@@ -108,12 +108,12 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 1.0
   refined_query_patch_l1_weight: 0.25
-  retrieval_loss_weight: 0.5
-  retrieval_hard_ce_weight: 1.0
+  retrieval_loss_weight: 1.0
+  retrieval_hard_ce_weight: 0.0
   retrieval_coherence_weight: 0.0
   retrieval_coherence_sigma: 0.10
-  retrieval_teacher_patch_padding: 8
-  retrieval_teacher_temperature: 0.05
+  retrieval_teacher_patch_padding: 4
+  retrieval_teacher_temperature: 1.0
   retrieval_target_margin_pct: 0.03
   transport_patch_weight: 1.0
   transport_selection_weight: 1.5
