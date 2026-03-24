@@ -48,41 +48,6 @@ from .data import build_eval_loader, build_train_loader
 from .eval import render_visualization_batch, validate_model
 
 
-SCORER_PARAM_NAMES = {
-    "query_descriptor_head",
-    "key_descriptor_head",
-    "matching_descriptor_head",
-    "shared_query_key_descriptor_head",
-    "query_context_encoder",
-    "key_context_encoder",
-    "query_context_descriptor_head",
-    "key_context_descriptor_head",
-    "query_context_scale",
-    "key_coarse_rgb_scale",
-    "key_feature_scale",
-    "pre_attention_norm",
-    "multihead_attention",
-    "transport_init_head",
-    "transport_refine_head",
-    "transport_candidate_refine_head",
-    "transport_candidate_score_head",
-    "transport_confidence_head",
-    "transport_propagation_head",
-}
-
-
-def split_parameter_groups(raw_model):
-    scorer_params = []
-    base_params = []
-    for name, param in raw_model.named_parameters():
-        parts = name.split(".")
-        if any(part in SCORER_PARAM_NAMES for part in parts):
-            scorer_params.append(param)
-        else:
-            base_params.append(param)
-    return base_params, scorer_params
-
-
 def train(cfg, args, dist_ctx):
     device = dist_ctx.device
     if dist_ctx.is_main_process:
@@ -98,7 +63,22 @@ def train(cfg, args, dist_ctx):
     loss_cfg = dict(cfg["loss"])
     criterion = InpaintingLoss(**loss_cfg).to(device)
 
-    base_params, scorer_params = split_parameter_groups(raw_model)
+    scorer_param_names = {
+        "query_descriptor_head", "key_descriptor_head",
+        "matching_descriptor_head", "shared_query_key_descriptor_head",
+        "query_context_encoder", "key_context_encoder",
+        "query_context_descriptor_head", "key_context_descriptor_head", "query_context_scale",
+        "key_coarse_rgb_scale", "key_feature_scale",
+        "pre_attention_norm", "multihead_attention",
+    }
+    scorer_params = []
+    base_params = []
+    for name, param in raw_model.named_parameters():
+        parts = name.split(".")
+        if any(part in scorer_param_names for part in parts):
+            scorer_params.append(param)
+        else:
+            base_params.append(param)
 
     scorer_lr = cfg["training"].get("scorer_lr", cfg["training"]["lr"])
     scorer_min_lr = cfg["training"].get("scorer_min_lr", cfg["training"]["min_lr"])
@@ -317,6 +297,7 @@ def train(cfg, args, dist_ctx):
                 attn_map.detach(),
                 raw_model.inpainter.flatten_query_mask(mask).detach(),
             )
+
             for key, value in g_metrics.items():
                 metric_sums[key] += metric_to_float(value)
             for key, value in attn_metrics.items():

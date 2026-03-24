@@ -94,7 +94,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         retrieval_coherence_sigma: float = 0.1,
         retrieval_teacher_patch_padding: int = 8,
         retrieval_teacher_temperature: float = 0.07,
-        retrieval_teacher_mode: str = "soft",
         retrieval_target_margin_pct: float = 0.03,
         transport_patch_weight: float = 1.0,
         transport_selection_weight: float = 0.0,
@@ -102,7 +101,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         transport_validity_weight: float = 0.1,
         transport_offset_smoothness_weight: float = 0.01,
         transport_offset_edge_scale: float = 5.0,
-        transport_descriptor_pretrain_steps: int = 0,
         loss_schedule_focus_steps: int = 0,
         loss_schedule_transition_steps: int = 0,
         retrieval_loss_weight_start: float | None = None,
@@ -121,7 +119,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.retrieval_coherence_sigma = float(retrieval_coherence_sigma)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
         self.retrieval_teacher_temperature = float(retrieval_teacher_temperature)
-        self.retrieval_teacher_mode = str(retrieval_teacher_mode).lower()
         self.retrieval_target_margin_pct = max(0.0, float(retrieval_target_margin_pct))
         self.transport_patch_weight = float(transport_patch_weight)
         self.transport_selection_weight = float(transport_selection_weight)
@@ -129,14 +126,11 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.transport_validity_weight = float(transport_validity_weight)
         self.transport_offset_smoothness_weight = float(transport_offset_smoothness_weight)
         self.transport_offset_edge_scale = float(transport_offset_edge_scale)
-        self.transport_descriptor_pretrain_steps = max(0, int(transport_descriptor_pretrain_steps))
         self.loss_schedule_focus_steps = max(0, int(loss_schedule_focus_steps))
         self.loss_schedule_transition_steps = max(0, int(loss_schedule_transition_steps))
         self.perceptual_weight = float(perceptual_weight)
         if self.retrieval_teacher_temperature <= 0:
             raise ValueError("retrieval_teacher_temperature must be positive.")
-        if self.retrieval_teacher_mode not in {"soft", "hard"}:
-            raise ValueError("retrieval_teacher_mode must be one of {'soft', 'hard'}.")
         if self.retrieval_top1_margin < 0:
             raise ValueError("retrieval_top1_margin must be non-negative.")
         if self.retrieval_coherence_sigma <= 0:
@@ -195,15 +189,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
     def transport_smoothness_supervision_enabled(self) -> bool:
         return self.transport_offset_smoothness_weight > 0
-
-    def transport_descriptor_pretrain_active(self, attention_aux: dict[str, object] | None) -> bool:
-        if self.transport_descriptor_pretrain_steps <= 0:
-            return False
-        if self.current_training_step > self.transport_descriptor_pretrain_steps:
-            return False
-        if attention_aux is None:
-            return False
-        return bool(attention_aux.get("transport_descriptor_supervision"))
 
     def _get_scheduled_weight(self, name: str) -> float:
         base_weight = self._base_weight_values[name]
@@ -381,18 +366,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         if attention_aux.get("copy_mode") != "transport":
             return None
 
-        sparse_entries = attention_aux.get("attention_supervision_entries")
-        if sparse_entries is not None:
-            if attention_aux.get("transport_descriptor_supervision"):
-                return sparse_entries
-            filtered_sparse_entries = [
-                entry
-                for entry in sparse_entries
-                if isinstance(entry, dict) and entry.get("candidate_key_indices") is not None
-            ]
-            if filtered_sparse_entries:
-                return filtered_sparse_entries
-
         query_mask_flat = attention_aux.get("query_mask_flat")
         key_valid_flat = attention_aux.get("key_valid_flat")
         transport_coords = attention_aux.get("transport_selection_coords")
@@ -440,23 +413,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             supervision_entries.append(entry)
 
         return supervision_entries
-
-    def _transport_selection_attention_aux(
-        self,
-        attention_aux: dict[str, object] | None,
-    ) -> dict[str, object] | None:
-        if attention_aux is None or attention_aux.get("copy_mode") != "transport":
-            return attention_aux
-        if attention_aux.get("transport_descriptor_supervision"):
-            return attention_aux
-        supervision_entries = attention_aux.get("attention_supervision_entries")
-        if supervision_entries is None:
-            return attention_aux
-        if any(isinstance(entry, dict) and entry.get("candidate_key_indices") is not None for entry in supervision_entries):
-            return attention_aux
-        attention_aux = dict(attention_aux)
-        attention_aux.pop("attention_supervision_entries", None)
-        return attention_aux
 
     def _attention_supervision_losses(
         self,
@@ -508,67 +464,35 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
         for batch_idx, entry in enumerate(supervision_entries):
             query_indices = entry["query_indices"]
-            key_indices = entry.get("key_indices")
+            key_indices = entry["key_indices"]
             raw_logits = entry["raw_logits"]
             ranking_scores = entry.get("ranking_scores")
             pred_probs = entry.get("pred_probs")
-            if pred_probs is None:
-                pred_probs = entry.get("candidate_probs")
             pred_log_probs = entry.get("pred_log_probs")
-            if pred_log_probs is None:
-                pred_log_probs = entry.get("candidate_log_probs")
-            candidate_key_indices = entry.get("candidate_key_indices")
-            candidate_valid_mask = entry.get("candidate_valid_mask")
-            if raw_logits.numel() == 0 or query_indices.numel() == 0:
+            if raw_logits.numel() == 0 or query_indices.numel() == 0 or key_indices.numel() == 0:
                 continue
 
             raw_logits = raw_logits.float()
             ranking_scores = raw_logits if ranking_scores is None else ranking_scores.float()
             batch_query_mask = query_mask_flat[batch_idx, query_indices] > 0.5
-            if not batch_query_mask.any():
-                continue
-
             query_teacher_tokens = teacher_tokens[batch_idx, query_indices]
-            if candidate_key_indices is not None:
-                candidate_key_indices = candidate_key_indices.long()
-                candidate_teacher_tokens = teacher_tokens[batch_idx, candidate_key_indices]
-                teacher_distances = (query_teacher_tokens.unsqueeze(1) - candidate_teacher_tokens).abs().sum(dim=-1)
-                if candidate_valid_mask is not None:
-                    invalid_mask = ~candidate_valid_mask.bool()
-                    large_value = torch.finfo(teacher_distances.dtype).max
-                    teacher_distances = teacher_distances.masked_fill(invalid_mask, large_value)
-                valid_candidate_rows = torch.isfinite(teacher_distances).any(dim=-1)
-                if not valid_candidate_rows.any():
-                    continue
-                batch_query_mask = batch_query_mask & valid_candidate_rows
-                if not batch_query_mask.any():
-                    continue
-            else:
-                if key_indices is None or key_indices.numel() == 0:
-                    continue
-                key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
-                teacher_distances = torch.cdist(
-                    query_teacher_tokens.unsqueeze(0),
-                    key_teacher_tokens.unsqueeze(0),
-                    p=1,
-                ).squeeze(0)
-
+            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
+            teacher_distances = torch.cdist(
+                query_teacher_tokens.unsqueeze(0),
+                key_teacher_tokens.unsqueeze(0),
+                p=1,
+            ).squeeze(0)
+            
             # Keep a strict best-match metric, but allow a small tolerance for near-tied targets.
             min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
             exact_targets_mask = teacher_distances <= (min_teacher_dist + 1e-4)
             valid_targets_mask = teacher_distances <= (
                 min_teacher_dist * (1.0 + self.retrieval_target_margin_pct) + 1e-4
             )
-            if self.retrieval_teacher_mode == "hard":
-                valid_targets_mask = exact_targets_mask
             
-            if self.retrieval_teacher_mode == "hard":
-                teacher_probs = exact_targets_mask.float()
-                teacher_probs = teacher_probs / teacher_probs.sum(dim=-1, keepdim=True).clamp_min(1.0)
-            else:
-                teacher_logits = -teacher_distances / max(query_teacher_tokens.shape[-1], 1)
-                teacher_logits = teacher_logits / self.retrieval_teacher_temperature
-                teacher_probs = F.softmax(teacher_logits, dim=-1)
+            teacher_logits = -teacher_distances / max(query_teacher_tokens.shape[-1], 1)
+            teacher_logits = teacher_logits / self.retrieval_teacher_temperature
+            teacher_probs = F.softmax(teacher_logits, dim=-1)
             if pred_probs is None:
                 pred_probs = F.softmax(raw_logits, dim=-1)
             else:
@@ -601,7 +525,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
                     if self.retrieval_coherence_weight > 0.0:
                         token_hw = entry.get("token_hw") or attention_aux.get("token_hw")
-                        if token_hw is not None and candidate_key_indices is None:
+                        if token_hw is not None:
                             retrieval_coherence_losses.append(
                                 self._retrieval_coherence_loss(
                                     masked_pred_probs,
@@ -675,7 +599,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         refined_target: torch.Tensor,
         attention_aux: dict[str, object] | None,
     ) -> dict[str, float]:
-        attention_aux = self._transport_selection_attention_aux(attention_aux)
         if attention_aux is None or attention_aux.get("copy_mode") != "transport":
             return {}
         _, metrics = self._attention_supervision_losses(
@@ -693,7 +616,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
     ) -> tuple[torch.Tensor, dict[str, float]]:
         zero = refined_target.new_zeros(())
         metrics = {"transport_selection_loss": 0.0}
-        attention_aux = self._transport_selection_attention_aux(attention_aux)
         if attention_aux is None or attention_aux.get("copy_mode") != "transport":
             return zero, metrics
 
@@ -719,11 +641,9 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         losses = []
         for batch_idx, entry in enumerate(supervision_entries):
             query_indices = entry["query_indices"]
-            key_indices = entry.get("key_indices")
+            key_indices = entry["key_indices"]
             raw_logits = entry["raw_logits"]
-            candidate_key_indices = entry.get("candidate_key_indices")
-            candidate_valid_mask = entry.get("candidate_valid_mask")
-            if raw_logits.numel() == 0 or query_indices.numel() == 0:
+            if raw_logits.numel() == 0 or query_indices.numel() == 0 or key_indices.numel() == 0:
                 continue
 
             masked_queries = query_mask_flat[batch_idx, query_indices] > 0.5
@@ -732,35 +652,16 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
             masked_raw_logits = raw_logits[masked_queries].float()
             query_teacher_tokens = teacher_tokens[batch_idx, query_indices[masked_queries]]
-            if candidate_key_indices is not None:
-                masked_candidate_indices = candidate_key_indices[masked_queries].long()
-                candidate_teacher_tokens = teacher_tokens[batch_idx, masked_candidate_indices]
-                teacher_distances = (query_teacher_tokens.unsqueeze(1) - candidate_teacher_tokens).abs().sum(dim=-1)
-                if candidate_valid_mask is not None:
-                    masked_candidate_valid = candidate_valid_mask[masked_queries].bool()
-                    large_value = torch.finfo(teacher_distances.dtype).max
-                    teacher_distances = teacher_distances.masked_fill(~masked_candidate_valid, large_value)
-                valid_rows = torch.isfinite(teacher_distances).any(dim=-1)
-                if not valid_rows.any():
-                    continue
-                masked_raw_logits = masked_raw_logits[valid_rows]
-                query_teacher_tokens = query_teacher_tokens[valid_rows]
-                teacher_distances = teacher_distances[valid_rows]
-            else:
-                if key_indices is None or key_indices.numel() == 0:
-                    continue
-                key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
-                teacher_distances = torch.cdist(
-                    query_teacher_tokens.unsqueeze(0),
-                    key_teacher_tokens.unsqueeze(0),
-                    p=1,
-                ).squeeze(0)
+            key_teacher_tokens = teacher_tokens[batch_idx, key_indices]
+            teacher_distances = torch.cdist(
+                query_teacher_tokens.unsqueeze(0),
+                key_teacher_tokens.unsqueeze(0),
+                p=1,
+            ).squeeze(0)
             min_teacher_dist = teacher_distances.min(dim=-1, keepdim=True).values
             valid_targets_mask = teacher_distances <= (
                 min_teacher_dist * (1.0 + self.retrieval_target_margin_pct) + 1e-4
             )
-            if self.retrieval_teacher_mode == "hard":
-                valid_targets_mask = teacher_distances <= (min_teacher_dist + 1e-4)
 
             pred_probs = F.softmax(
                 masked_raw_logits / self.transport_selection_temperature,
@@ -795,13 +696,12 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             for name in self.SCHEDULED_WEIGHT_NAMES
         }
         zero = refined_target.new_zeros(())
-        reconstruction_total = (
+        total = (
             self.coarse_l2_weight * coarse_l2
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
             + scheduled_weights["perceptual_weight"] * perceptual
         )
-        total = reconstruction_total
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
             "refined_l1": refined_l1.item(),
@@ -829,15 +729,10 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             loss_dict.update(attention_metrics)
 
         loss_dict.update(self.transport_selection_metrics(refined_target, attention_aux))
-        descriptor_pretrain_active = self.transport_descriptor_pretrain_active(attention_aux)
-        if descriptor_pretrain_active:
-            total = zero
-        loss_dict["transport_descriptor_pretrain_active"] = 1.0 if descriptor_pretrain_active else 0.0
 
         if self.transport_patch_supervision_enabled():
             transport_patch_loss, transport_patch_metrics = self._transport_patch_loss(refined_target, attention_aux)
-            if not descriptor_pretrain_active:
-                total = total + self.transport_patch_weight * transport_patch_loss
+            total = total + self.transport_patch_weight * transport_patch_loss
             loss_dict["transport_patch"] = transport_patch_metrics["transport_patch"]
         if self.transport_selection_supervision_enabled():
             transport_selection_loss, transport_selection_metrics = self._transport_selection_loss(
@@ -848,8 +743,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             loss_dict["transport_selection_loss"] = transport_selection_metrics["transport_selection_loss"]
         if self.transport_validity_supervision_enabled():
             transport_validity_loss, transport_validity_metrics = self._transport_validity_loss(refined_target, attention_aux)
-            if not descriptor_pretrain_active:
-                total = total + self.transport_validity_weight * transport_validity_loss
+            total = total + self.transport_validity_weight * transport_validity_loss
             loss_dict["transport_validity"] = transport_validity_metrics["transport_validity"]
             loss_dict["transport_valid_ratio"] = transport_validity_metrics["transport_valid_ratio"]
             loss_dict["transport_fallback_ratio"] = transport_validity_metrics["transport_fallback_ratio"]
@@ -858,8 +752,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 refined_target,
                 attention_aux,
             )
-            if not descriptor_pretrain_active:
-                total = total + self.transport_offset_smoothness_weight * transport_offset_smoothness_loss
+            total = total + self.transport_offset_smoothness_weight * transport_offset_smoothness_loss
             loss_dict["transport_offset_smoothness"] = transport_offset_smoothness_metrics["transport_offset_smoothness"]
             loss_dict["transport_offset_curvature"] = transport_offset_smoothness_metrics["transport_offset_curvature"]
 

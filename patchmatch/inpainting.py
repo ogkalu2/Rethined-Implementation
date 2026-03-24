@@ -33,8 +33,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         transport_score_temperature: float = 1.0,
         transport_score_top_k: int | None = None,
         transport_score_init_scale: float = 1.0,
-        transport_score_assignment: str = "softmax",
-        transport_score_assignment_capacity: int = 1,
         transport_use_coarse_to_fine: bool = False,
         transport_coarse_ratio: int = 2,
         transport_use_confidence: bool = False,
@@ -47,7 +45,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         transport_snap_to_valid_eval: bool = True,
         transport_train_selection: str = "bilinear",
         transport_eval_selection: str = "bilinear",
-        transport_direct_scorer_supervision: bool = False,
         matching_descriptor_dim: int | None = None,
         matching_hidden_dim: int | None = None,
         match_coarse_rgb: bool = True,
@@ -220,8 +217,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_score_temperature = float(transport_score_temperature)
         self.transport_score_top_k = None if transport_score_top_k is None else int(transport_score_top_k)
         self.transport_score_init_scale = float(transport_score_init_scale)
-        self.transport_score_assignment = str(transport_score_assignment).lower()
-        self.transport_score_assignment_capacity = max(1, int(transport_score_assignment_capacity))
         self.transport_use_coarse_to_fine = bool(transport_use_coarse_to_fine)
         self.transport_coarse_ratio = int(transport_coarse_ratio)
         self.transport_use_confidence = bool(transport_use_confidence)
@@ -234,7 +229,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         self.transport_snap_to_valid_eval = bool(transport_snap_to_valid_eval)
         self.transport_train_selection = str(transport_train_selection).lower()
         self.transport_eval_selection = str(transport_eval_selection).lower()
-        self.transport_direct_scorer_supervision = bool(transport_direct_scorer_supervision)
         self.attention_top_k = None if attention_top_k is None else int(attention_top_k)
         if self.attention_top_k is not None and self.attention_top_k <= 0:
             self.attention_top_k = None
@@ -250,8 +244,6 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             self.transport_score_top_k = None
         if self.transport_score_init_scale < 0:
             raise ValueError("transport_score_init_scale must be non-negative.")
-        if self.transport_score_assignment not in {"softmax", "capacity_greedy"}:
-            raise ValueError("transport_score_assignment must be one of {'softmax', 'capacity_greedy'}.")
         if self.transport_use_coarse_to_fine and self.transport_coarse_ratio <= 1:
             raise ValueError("transport_coarse_ratio must be greater than 1 when transport_use_coarse_to_fine=True.")
         if self.transport_local_window_size <= 0 or self.transport_local_window_size % 2 == 0:
