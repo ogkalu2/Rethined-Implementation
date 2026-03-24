@@ -357,8 +357,6 @@ def train(cfg, args, dist_ctx):
                 writer.add_scalar("loss/retrieval", metrics["retrieval_loss"], step)
             if "retrieval_coherence_loss" in metrics:
                 writer.add_scalar("loss/retrieval_coherence", metrics["retrieval_coherence_loss"], step)
-            if "retrieval_top1_margin_loss" in metrics:
-                writer.add_scalar("loss/retrieval_top1_margin", metrics["retrieval_top1_margin_loss"], step)
             if "transport_patch" in metrics:
                 writer.add_scalar("loss/transport_patch", metrics["transport_patch"], step)
             if "transport_selection_loss" in metrics:

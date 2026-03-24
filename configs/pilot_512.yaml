@@ -110,8 +110,6 @@ loss:
   refined_query_patch_l1_weight: 0.25
   retrieval_loss_weight: 0.5
   retrieval_hard_ce_weight: 1.0
-  retrieval_top1_margin_weight: 0.0
-  retrieval_top1_margin: 0.0
   retrieval_coherence_weight: 0.0
   retrieval_coherence_sigma: 0.10
   retrieval_teacher_patch_padding: 8

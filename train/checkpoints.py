@@ -167,8 +167,6 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
         summary += f", r1_exact={metrics['retrieval_recall1_exact']:.3f}"
     if include_retrieval and "retrieval_coherence_loss" in metrics:
         summary += f", coh={metrics['retrieval_coherence_loss']:.3f}"
-    if include_retrieval and "retrieval_top1_margin_loss" in metrics:
-        summary += f", mrg={metrics['retrieval_top1_margin_loss']:.3f}"
     if include_retrieval and "retrieval_recall1" in metrics:
         summary += f", r1_{retrieval_margin_label}={metrics['retrieval_recall1']:.3f}"
     if include_retrieval and "retrieval_recall8" in metrics:

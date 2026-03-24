@@ -88,8 +88,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         refined_query_patch_l1_weight: float = 0.0,
         retrieval_loss_weight: float = 0.0,
         retrieval_hard_ce_weight: float = 0.0,
-        retrieval_top1_margin_weight: float = 0.0,
-        retrieval_top1_margin: float = 0.0,
         retrieval_coherence_weight: float = 0.0,
         retrieval_coherence_sigma: float = 0.1,
         retrieval_teacher_patch_padding: int = 8,
@@ -113,8 +111,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
-        self.retrieval_top1_margin_weight = float(retrieval_top1_margin_weight)
-        self.retrieval_top1_margin = float(retrieval_top1_margin)
         self.retrieval_coherence_weight = float(retrieval_coherence_weight)
         self.retrieval_coherence_sigma = float(retrieval_coherence_sigma)
         self.retrieval_teacher_patch_padding = max(0, int(retrieval_teacher_patch_padding))
@@ -131,8 +127,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.perceptual_weight = float(perceptual_weight)
         if self.retrieval_teacher_temperature <= 0:
             raise ValueError("retrieval_teacher_temperature must be positive.")
-        if self.retrieval_top1_margin < 0:
-            raise ValueError("retrieval_top1_margin must be non-negative.")
         if self.retrieval_coherence_sigma <= 0:
             raise ValueError("retrieval_coherence_sigma must be positive.")
         if self.transport_patch_weight < 0:
@@ -174,7 +168,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         return (
             self._get_scheduled_weight("retrieval_loss_weight") > 0
             or self.retrieval_hard_ce_weight > 0
-            or self.retrieval_top1_margin_weight > 0
             or self.retrieval_coherence_weight > 0
         )
 
@@ -455,7 +448,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
 
         retrieval_losses = []
         retrieval_hard_ce_losses = []
-        retrieval_top1_margin_losses = []
         retrieval_coherence_losses = []
         retrieval_recall1_exact = []
         retrieval_recall1 = []
@@ -536,22 +528,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                                 )
                             )
 
-                    if self.retrieval_top1_margin_weight > 0.0 and masked_raw_logits.shape[-1] > 1:
-                        # Align the margin with the tolerant valid-target set so near-equivalent
-                        # teacher matches do not keep the top-1 objective artificially active.
-                        has_negative = (~masked_valid_targets).any(dim=-1)
-                        if has_negative.any():
-                            pos_logits = masked_raw_logits.masked_fill(
-                                ~masked_valid_targets,
-                                torch.finfo(masked_raw_logits.dtype).min,
-                            ).max(dim=-1).values
-                            neg_logits = masked_raw_logits.masked_fill(
-                                masked_valid_targets,
-                                torch.finfo(masked_raw_logits.dtype).min,
-                            ).max(dim=-1).values
-                            per_query_margin = F.relu(neg_logits - pos_logits + self.retrieval_top1_margin)
-                            retrieval_top1_margin_losses.append(per_query_margin[has_negative].mean())
-
                 for top_k, tolerant_metric in (
                     (1, retrieval_recall1),
                     (8, retrieval_recall8),
@@ -569,8 +545,6 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             loss_terms["retrieval"] = torch.stack(retrieval_losses).mean()
         if retrieval_hard_ce_losses:
             loss_terms["retrieval_hard_ce"] = torch.stack(retrieval_hard_ce_losses).mean()
-        if retrieval_top1_margin_losses:
-            loss_terms["retrieval_top1_margin"] = torch.stack(retrieval_top1_margin_losses).mean()
         if retrieval_coherence_losses:
             loss_terms["retrieval_coherence"] = torch.stack(retrieval_coherence_losses).mean()
 
@@ -714,15 +688,12 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
                 total
                 + scheduled_weights["retrieval_loss_weight"] * attention_loss_terms.get("retrieval", zero)
                 + self.retrieval_hard_ce_weight * attention_loss_terms.get("retrieval_hard_ce", zero)
-                + self.retrieval_top1_margin_weight * attention_loss_terms.get("retrieval_top1_margin", zero)
                 + self.retrieval_coherence_weight * attention_loss_terms.get("retrieval_coherence", zero)
             )
             if "retrieval" in attention_loss_terms:
                 loss_dict["retrieval_loss"] = attention_loss_terms["retrieval"].item()
             if "retrieval_hard_ce" in attention_loss_terms:
                 loss_dict["retrieval_hard_ce_loss"] = attention_loss_terms["retrieval_hard_ce"].item()
-            if "retrieval_top1_margin" in attention_loss_terms:
-                loss_dict["retrieval_top1_margin_loss"] = attention_loss_terms["retrieval_top1_margin"].item()
             if "retrieval_coherence" in attention_loss_terms:
                 loss_dict["retrieval_coherence_loss"] = attention_loss_terms["retrieval_coherence"].item()
             loss_dict["weight/retrieval_loss"] = scheduled_weights["retrieval_loss_weight"]
