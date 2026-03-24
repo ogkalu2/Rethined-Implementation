@@ -18,6 +18,7 @@ class MultiHeadAttention(nn.Module):
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
         attention_gumbel_hard: bool = True,
+        attention_softmax_straight_through: bool = True,
     ):
         super().__init__()
         self.d_v = int(d_v)
@@ -39,6 +40,7 @@ class MultiHeadAttention(nn.Module):
         if self.attention_gumbel_tau <= 0:
             raise ValueError("attention_gumbel_tau must be positive.")
         self.attention_gumbel_hard = bool(attention_gumbel_hard)
+        self.attention_softmax_straight_through = bool(attention_softmax_straight_through)
         self.w_qs = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_ks = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(self.d_v, self.n_head * self.d_v, bias=False)
@@ -140,7 +142,7 @@ class MultiHeadAttention(nn.Module):
         attn = attn_probs
         if direct_patch_mixing and self.training:
             needs_straight_through_hardening = (
-                self.attention_selection == "softmax"
+                (self.attention_selection == "softmax" and self.attention_softmax_straight_through)
                 or (self.attention_selection == "gumbel" and not self.attention_gumbel_hard)
             )
             if needs_straight_through_hardening:
