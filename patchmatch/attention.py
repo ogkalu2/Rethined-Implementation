@@ -18,7 +18,7 @@ class MultiHeadAttention(nn.Module):
         attention_selection: str = "softmax",
         attention_gumbel_tau: float = 1.0,
         attention_gumbel_hard: bool = True,
-        attention_softmax_straight_through: bool = True,
+        attention_normalize_qk: bool = True,
     ):
         super().__init__()
         self.d_v = int(d_v)
@@ -40,7 +40,7 @@ class MultiHeadAttention(nn.Module):
         if self.attention_gumbel_tau <= 0:
             raise ValueError("attention_gumbel_tau must be positive.")
         self.attention_gumbel_hard = bool(attention_gumbel_hard)
-        self.attention_softmax_straight_through = bool(attention_softmax_straight_through)
+        self.attention_normalize_qk = bool(attention_normalize_qk)
         self.w_qs = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_ks = nn.Linear(embed_dim, self.n_head * self.d_k, bias=False)
         self.w_vs = nn.Linear(self.d_v, self.n_head * self.d_v, bias=False)
@@ -112,10 +112,11 @@ class MultiHeadAttention(nn.Module):
         batch_size, len_q, len_k = q.size(0), q.size(1), k.size(1)
         q_proj = self.w_qs(q).view(batch_size, len_q, self.n_head, self.d_k).transpose(1, 2)
         k_proj = self.w_ks(k).view(batch_size, len_k, self.n_head, self.d_k).transpose(1, 2)
-        
-        q_proj = F.normalize(q_proj.float(), p=2, dim=-1).to(q_proj.dtype)
-        k_proj = F.normalize(k_proj.float(), p=2, dim=-1).to(k_proj.dtype)
-        
+
+        if self.attention_normalize_qk:
+            q_proj = F.normalize(q_proj.float(), p=2, dim=-1).to(q_proj.dtype)
+            k_proj = F.normalize(k_proj.float(), p=2, dim=-1).to(k_proj.dtype)
+
         attn_logits_raw = torch.matmul(q_proj, k_proj.transpose(2, 3)).float()
         if self.attention_temperature != 1.0:
             attn_logits_raw = attn_logits_raw / self.attention_temperature
@@ -142,8 +143,7 @@ class MultiHeadAttention(nn.Module):
         attn = attn_probs
         if direct_patch_mixing and self.training:
             needs_straight_through_hardening = (
-                (self.attention_selection == "softmax" and self.attention_softmax_straight_through)
-                or (self.attention_selection == "gumbel" and not self.attention_gumbel_hard)
+                self.attention_selection == "gumbel" and not self.attention_gumbel_hard
             )
             if needs_straight_through_hardening:
                 hard_attn = self._hard_attention_from_logits(attn_logits).to(value_dtype)

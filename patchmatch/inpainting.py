@@ -23,7 +23,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
         attention_eval_selection: str | None = None,
         attention_gumbel_tau: float = 1.0,
         attention_gumbel_hard: bool = True,
-        attention_softmax_straight_through: bool = True,
+        attention_normalize_qk: bool = True,
         use_transport: bool = False,
         transport_hidden_channels: int = 64,
         transport_candidate_count: int = 4,
@@ -366,7 +366,7 @@ class PatchInpainting(PatchmatchHelpersMixin, PatchOpsMixin, nn.Module):
             attention_selection=self.attention_selection,
             attention_gumbel_tau=float(attention_gumbel_tau),
             attention_gumbel_hard=attention_gumbel_hard,
-            attention_softmax_straight_through=attention_softmax_straight_through,
+            attention_normalize_qk=attention_normalize_qk,
         )
         self.pre_attention_norm = nn.LayerNorm(self.patch_token_dim)
         self.positionalencoding = (
