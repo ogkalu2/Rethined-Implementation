@@ -670,7 +670,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         mask: torch.Tensor,
         attention_aux: dict[str, object] | None = None,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        coarse_l2 = F.mse_loss(coarse_raw, coarse_target)
+        coarse_l2 = masked_mse_loss(coarse_raw, coarse_target, mask)
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
         focal_frequency = self.focal_frequency_loss(refined, refined_target)
