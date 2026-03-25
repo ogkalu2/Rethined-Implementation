@@ -76,9 +76,9 @@ data:
   eval_batch_size: 2
   num_workers: 2
   mask_min_coverage: 0.10
-  mask_max_coverage: 0.40
+  mask_max_coverage: 0.30
   mask_generator:
-    style: "sparse_fashion"
+    style: "freeform"
     min_capsule_length_ratio: 0.035
     max_capsule_length_ratio: 0.16
     min_capsule_width_ratio: 0.008
