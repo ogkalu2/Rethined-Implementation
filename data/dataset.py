@@ -235,6 +235,8 @@ class InpaintingDataset(Dataset):
             "mask": mask,
             "masked_image": masked_image,
             "source": sample["source"],
+            "image_path": str(sample["image_path"]),
+            "mask_path": (str(sample["mask_path"]) if sample["mask_path"] is not None else ""),
         }
 
 

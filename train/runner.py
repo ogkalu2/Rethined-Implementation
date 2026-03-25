@@ -48,6 +48,83 @@ from .data import build_eval_loader, build_train_loader
 from .eval import render_visualization_batch, validate_model
 
 
+def _tensor_range(tensor: torch.Tensor) -> tuple[float, float]:
+    detached = tensor.detach().float()
+    finite_mask = torch.isfinite(detached)
+    if not bool(finite_mask.any()):
+        return float("nan"), float("nan")
+    finite_values = detached[finite_mask]
+    return float(finite_values.min().item()), float(finite_values.max().item())
+
+
+def _summarize_nonfinite_step(
+    *,
+    step: int,
+    accum_idx: int,
+    batch: dict,
+    batch_views: dict[str, torch.Tensor],
+    coarse_raw: torch.Tensor,
+    refined_raw: torch.Tensor,
+    g_loss: torch.Tensor,
+    g_metrics: dict[str, torch.Tensor | float],
+    device: torch.device,
+    use_amp: bool,
+) -> list[str]:
+    image_paths = batch.get("image_path") or []
+    if isinstance(image_paths, str):
+        image_paths = [image_paths]
+    mask_paths = batch.get("mask_path") or []
+    if isinstance(mask_paths, str):
+        mask_paths = [mask_paths]
+    sources = batch.get("source") or []
+    if isinstance(sources, str):
+        sources = [sources]
+
+    mask = batch_views["mask"]
+    image = batch_views["image"]
+    masked_image = batch_views["masked_image"]
+    refine_target = batch_views["refine_target"]
+    mask_coverage = mask.detach().float().mean(dim=(1, 2, 3))
+    metric_snapshot = {
+        key: metric_to_float(value)
+        for key, value in g_metrics.items()
+    }
+    nonfinite_metrics = [
+        key for key, value in metric_snapshot.items()
+        if not torch.isfinite(torch.tensor(value))
+    ]
+
+    lines = [
+        f"Skipping non-finite step {step} (microbatch {accum_idx + 1})",
+        f"  device={device.type} amp={use_amp}",
+        (
+            "  mask_coverage="
+            f"{', '.join(f'{float(value):.4f}' for value in mask_coverage.cpu())}"
+        ),
+        (
+            "  loss="
+            f"{float(g_loss.detach().float().item()) if torch.isfinite(g_loss.detach()).all() else 'non-finite'}"
+        ),
+        f"  image_range={_tensor_range(image)} masked_range={_tensor_range(masked_image)}",
+        f"  refine_target_range={_tensor_range(refine_target)}",
+        f"  coarse_range={_tensor_range(coarse_raw)} refined_range={_tensor_range(refined_raw)}",
+        (
+            "  nonfinite_metrics="
+            f"{', '.join(nonfinite_metrics) if nonfinite_metrics else '<loss only>'}"
+        ),
+    ]
+    if sources:
+        lines.append(f"  sources={', '.join(str(source) for source in sources)}")
+    if image_paths:
+        lines.append(f"  image_paths={', '.join(str(path) for path in image_paths)}")
+    nonempty_mask_paths = [str(path) for path in mask_paths if str(path)]
+    if nonempty_mask_paths:
+        lines.append(f"  mask_paths={', '.join(nonempty_mask_paths)}")
+    if use_amp and device.type == "xpu":
+        lines.append("  note=XPU AMP is active; rerun with training.mixed_precision: false to rule out precision instability.")
+    return lines
+
+
 def train(cfg, args, dist_ctx):
     device = dist_ctx.device
     if dist_ctx.is_main_process:
@@ -286,6 +363,20 @@ def train(cfg, args, dist_ctx):
                     has_nonfinite = bool(reduce_scalar(float(has_nonfinite), dist_ctx, average=False))
                 if has_nonfinite:
                     step_has_nonfinite = True
+                    if dist_ctx.is_main_process:
+                        for line in _summarize_nonfinite_step(
+                            step=step,
+                            accum_idx=accum_idx,
+                            batch=batch,
+                            batch_views=batch_views,
+                            coarse_raw=coarse_raw,
+                            refined_raw=refined_raw,
+                            g_loss=g_loss,
+                            g_metrics=g_metrics,
+                            device=device,
+                            use_amp=use_amp,
+                        ):
+                            progress_bar.write(line)
                     break
 
                 scaler.scale(g_loss / grad_accum).backward()
