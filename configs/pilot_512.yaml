@@ -108,9 +108,10 @@ loss:
   coarse_l2_weight: 1.0
   refined_l1_weight: 0.0
   refined_query_patch_l1_weight: 0.0
+  focal_frequency_weight: 1.0
+  focal_frequency_alpha: 1.0
   retrieval_loss_weight: 0.0
   retrieval_hard_ce_weight: 0.0
-  retrieval_top1_margin_weight: 0.0
   retrieval_coherence_weight: 0.0
   retrieval_coherence_sigma: 0.10
   retrieval_teacher_patch_padding: 8

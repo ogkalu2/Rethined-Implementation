@@ -159,6 +159,7 @@ def format_train_metric_snapshot(metrics, include_retrieval=True, retrieval_marg
     summary = (
         f"train i={metrics['inpainter_total']:.4f}, "
         f"l1={metrics['refined_l1']:.4f}, "
+        f"freq={metrics['focal_frequency']:.4f}, "
         f"perc={metrics['perceptual']:.4f}"
     )
     if "refined_query_patch_l1" in metrics:

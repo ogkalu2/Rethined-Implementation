@@ -325,6 +325,7 @@ def train(cfg, args, dist_ctx):
             if log_cfg.get("print_train_metrics", False):
                 postfix["i"] = f"{metrics['inpainter_total']:.4f}"
                 postfix["l1"] = f"{metrics['refined_l1']:.4f}"
+                postfix["freq"] = f"{metrics['focal_frequency']:.4f}"
                 postfix["perc"] = f"{metrics['perceptual']:.4f}"
                 if "refined_query_patch_l1" in metrics:
                     postfix["qp"] = f"{metrics['refined_query_patch_l1']:.4f}"
@@ -351,6 +352,7 @@ def train(cfg, args, dist_ctx):
         if dist_ctx.is_main_process and (step == 1 or step % log_cfg["log_interval"] == 0):
             writer.add_scalar("loss/coarse_l2", metrics["coarse_l2"], step)
             writer.add_scalar("loss/refined_l1", metrics["refined_l1"], step)
+            writer.add_scalar("loss/focal_frequency", metrics["focal_frequency"], step)
             if "refined_query_patch_l1" in metrics:
                 writer.add_scalar("loss/refined_query_patch_l1", metrics["refined_query_patch_l1"], step)
             if "retrieval_loss" in metrics:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from losses.frequency import FocalFrequencyLoss
 from losses.perceptual import PerceptualLoss
 from losses.transport import TransportLossMixin
 
@@ -86,6 +87,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         coarse_l2_weight: float = 1.0,
         refined_l1_weight: float = 1.0,
         refined_query_patch_l1_weight: float = 0.0,
+        focal_frequency_weight: float = 0.0,
+        focal_frequency_alpha: float = 1.0,
         retrieval_loss_weight: float = 0.0,
         retrieval_hard_ce_weight: float = 0.0,
         retrieval_coherence_weight: float = 0.0,
@@ -109,6 +112,8 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.coarse_l2_weight = float(coarse_l2_weight)
         self.refined_l1_weight = float(refined_l1_weight)
         self.refined_query_patch_l1_weight = float(refined_query_patch_l1_weight)
+        self.focal_frequency_weight = float(focal_frequency_weight)
+        self.focal_frequency_alpha = float(focal_frequency_alpha)
         self.retrieval_loss_weight = float(retrieval_loss_weight)
         self.retrieval_hard_ce_weight = float(retrieval_hard_ce_weight)
         self.retrieval_coherence_weight = float(retrieval_coherence_weight)
@@ -127,6 +132,10 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         self.perceptual_weight = float(perceptual_weight)
         if self.retrieval_teacher_temperature <= 0:
             raise ValueError("retrieval_teacher_temperature must be positive.")
+        if self.focal_frequency_weight < 0:
+            raise ValueError("focal_frequency_weight must be non-negative.")
+        if self.focal_frequency_alpha < 0:
+            raise ValueError("focal_frequency_alpha must be non-negative.")
         if self.retrieval_coherence_sigma <= 0:
             raise ValueError("retrieval_coherence_sigma must be positive.")
         if self.transport_patch_weight < 0:
@@ -143,6 +152,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             raise ValueError("transport_offset_edge_scale must be non-negative.")
 
         self.perceptual_loss = PerceptualLoss()
+        self.focal_frequency_loss = FocalFrequencyLoss(alpha=self.focal_frequency_alpha)
         self.current_training_step = 0
         self._base_weight_values = {
             name: float(getattr(self, name))
@@ -663,6 +673,7 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
         coarse_l2 = masked_mse_loss(coarse_raw, coarse_target, mask)
         refined_l1 = masked_l1_loss(refined, refined_target, mask)
         refined_query_patch_l1 = self._query_patch_l1_loss(refined, refined_target, attention_aux)
+        focal_frequency = self.focal_frequency_loss(refined, refined_target)
         perceptual = self.perceptual_loss(refined, refined_target)
 
         scheduled_weights = {
@@ -674,12 +685,14 @@ class InpaintingLoss(TransportLossMixin, nn.Module):
             self.coarse_l2_weight * coarse_l2
             + self.refined_l1_weight * refined_l1
             + self.refined_query_patch_l1_weight * refined_query_patch_l1
+            + self.focal_frequency_weight * focal_frequency
             + scheduled_weights["perceptual_weight"] * perceptual
         )
         loss_dict = {
             "coarse_l2": coarse_l2.item(),
             "refined_l1": refined_l1.item(),
             "refined_query_patch_l1": refined_query_patch_l1.item(),
+            "focal_frequency": focal_frequency.item(),
             "perceptual": perceptual.item(),
         }
         if self.retrieval_supervision_enabled():
