@@ -57,6 +57,16 @@ def _tensor_range(tensor: torch.Tensor) -> tuple[float, float]:
     return float(finite_values.min().item()), float(finite_values.max().item())
 
 
+def _find_nonfinite_named_parameters(model: torch.nn.Module, limit: int = 8) -> list[str]:
+    bad_names = []
+    for name, param in model.named_parameters():
+        if not torch.isfinite(param.detach()).all():
+            bad_names.append(name)
+            if len(bad_names) >= limit:
+                break
+    return bad_names
+
+
 def _summarize_nonfinite_step(
     *,
     step: int,
@@ -403,9 +413,25 @@ def train(cfg, args, dist_ctx):
             continue
 
         scaler.unscale_(optimizer_g)
-        torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip_g)
+        grad_norm = torch.nn.utils.clip_grad_norm_(raw_model.parameters(), grad_clip_g)
+        grad_norm_value = float(grad_norm.detach().float().item()) if isinstance(grad_norm, torch.Tensor) else float(grad_norm)
+        if not torch.isfinite(torch.tensor(grad_norm_value)):
+            optimizer_g.zero_grad(set_to_none=True)
+            raise RuntimeError(
+                f"Gradient norm became non-finite at step {step} before optimizer step. "
+                "Lower the learning rate or disable mixed precision."
+            )
         scaler.step(optimizer_g)
         scaler.update()
+        bad_param_names = _find_nonfinite_named_parameters(raw_model)
+        if bad_param_names:
+            optimizer_g.zero_grad(set_to_none=True)
+            raise RuntimeError(
+                f"Model parameters became non-finite immediately after optimizer step {step}. "
+                f"First affected parameters: {', '.join(bad_param_names)}. "
+                "Resume from the last good checkpoint and consider lowering the learning rate "
+                "or disabling mixed precision."
+            )
         optimizer_g.zero_grad(set_to_none=True)
 
         metrics = {key: value / grad_accum for key, value in metric_sums.items()}

@@ -103,7 +103,8 @@ def gaussian_prefilter_downsample(image: torch.Tensor, model_image_size: int, bl
         return image
     if blur_layer is not None:
         image = blur_layer(image)
-    return F.interpolate(image, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
+    image = F.interpolate(image, size=(model_image_size, model_image_size), mode="bicubic", align_corners=False)
+    return image.clamp_(0.0, 1.0)
 
 
 def prepare_multiscale_batch(batch, device, model_image_size: int, blur_layer=None):
@@ -123,6 +124,7 @@ def prepare_multiscale_batch(batch, device, model_image_size: int, blur_layer=No
             mode="bicubic",
             align_corners=False,
         )
+        refine_target = refine_target.clamp_(0.0, 1.0)
         image = gaussian_prefilter_downsample(image_hr, model_image_size, blur_layer=blur_layer)
         mask = F.interpolate(mask_hr, size=(model_image_size, model_image_size), mode="nearest")
         mask = (mask > 0.5).to(image.dtype)
