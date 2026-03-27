@@ -13,7 +13,7 @@ model:
     attention_temperature: 0.5
     attention_top_k: null
     attention_selection: "softmax"
-    attention_eval_selection: "softmax"
+    attention_eval_selection: "argmax"
     attention_gumbel_tau: 1.0
     attention_normalize_qk: true
     use_transport: false
